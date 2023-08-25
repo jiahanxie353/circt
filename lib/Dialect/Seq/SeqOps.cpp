@@ -321,8 +321,9 @@ static ParseResult parseCompReg(OpAsmParser &parser, OperationState &result) {
   result.addTypes({ty});
 
   Type i1 = IntegerType::get(result.getContext(), 1);
+  Type clock = seq::ClockType::get(result.getContext());
   SmallVector<Type, 5> operandTypes;
-  operandTypes.append({ty, i1});
+  operandTypes.append({ty, clock});
   if constexpr (ClockEnabled)
     operandTypes.push_back(i1);
   if (operands.size() > 2 + ceOperandOffset)
@@ -896,6 +897,12 @@ LogicalResult ToClockOp::canonicalize(ToClockOp op, PatternRewriter &rewriter) {
   return failure();
 }
 
+OpFoldResult ToClockOp::fold(FoldAdaptor adaptor) {
+  if (auto fromClock = getInput().getDefiningOp<FromClockOp>())
+    return fromClock.getInput();
+  return {};
+}
+
 LogicalResult FromClockOp::canonicalize(FromClockOp op,
                                         PatternRewriter &rewriter) {
   if (auto toClock = op.getInput().getDefiningOp<ToClockOp>()) {
@@ -903,6 +910,12 @@ LogicalResult FromClockOp::canonicalize(FromClockOp op,
     return success();
   }
   return failure();
+}
+
+OpFoldResult FromClockOp::fold(FoldAdaptor adaptor) {
+  if (auto toClock = getInput().getDefiningOp<ToClockOp>())
+    return toClock.getInput();
+  return {};
 }
 
 //===----------------------------------------------------------------------===//

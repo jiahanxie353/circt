@@ -220,8 +220,8 @@ instantiateSystemVerilogMemory(ServiceImplementReqOp implReq,
 
   // Now construct the memory writes.
   b.create<sv::AlwaysFFOp>(
-      sv::EventControl::AtPosEdge, clk, ResetType::SyncReset,
-      sv::EventControl::AtPosEdge, rst, [&] {
+      sv::EventControl::AtPosEdge, b.create<seq::FromClockOp>(clk),
+      ResetType::SyncReset, sv::EventControl::AtPosEdge, rst, [&] {
         for (auto [go, address, data] : writeGoAddressData) {
           Value a = address, d = data; // So the lambda can capture.
           // If we're told to go, do the write.

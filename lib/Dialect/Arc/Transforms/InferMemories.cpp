@@ -148,6 +148,8 @@ void InferMemoriesPass::runOnOperation() {
         return signalPassFailure();
       }
 
+      Value seqClock = builder.createOrFold<seq::ToClockOp>(clock);
+
       // Add port taps.
       if (tapPorts) {
         tapPrefix.resize(tapPrefixBaseLen);
@@ -158,8 +160,8 @@ void InferMemoriesPass::runOnOperation() {
       }
 
       // Apply the latency before the underlying storage is accessed.
-      address = applyLatency(clock, address, readPreLatency);
-      enable = applyLatency(clock, enable, readPreLatency);
+      address = applyLatency(seqClock, address, readPreLatency);
+      enable = applyLatency(seqClock, enable, readPreLatency);
 
       // Read the underlying storage. (The result of a disabled read port is
       // undefined, currently we define it to be zero.)
@@ -169,7 +171,7 @@ void InferMemoriesPass::runOnOperation() {
 
       // Apply the latency after the underlying storage was accessed. (If the
       // latency is 0, the memory read is combinatorial without any buffer.)
-      readOp = applyLatency(clock, readOp, readPostLatency);
+      readOp = applyLatency(seqClock, readOp, readPostLatency);
       data.replaceAllUsesWith(readOp);
     }
 
@@ -192,6 +194,8 @@ void InferMemoriesPass::runOnOperation() {
         return signalPassFailure();
       }
 
+      Value seqClock = builder.createOrFold<seq::ToClockOp>(clock);
+
       // Add port taps.
       if (tapPorts) {
         tapPrefix.resize(tapPrefixBaseLen);
@@ -210,8 +214,8 @@ void InferMemoriesPass::runOnOperation() {
       Value readEnable = builder.create<comb::AndOp>(enable, notWriteMode);
 
       // Apply the latency before the underlying storage is accessed.
-      Value readAddress = applyLatency(clock, address, readPreLatency);
-      readEnable = applyLatency(clock, readEnable, readPreLatency);
+      Value readAddress = applyLatency(seqClock, address, readPreLatency);
+      readEnable = applyLatency(seqClock, readEnable, readPreLatency);
 
       // Read the underlying storage. (The result of a disabled read port is
       // undefined, currently we define it to be zero.)
@@ -235,7 +239,7 @@ void InferMemoriesPass::runOnOperation() {
 
       // Apply the latency after the underlying storage was accessed. (If the
       // latency is 0, the memory read is combinatorial without any buffer.)
-      readOp = applyLatency(clock, readOp, readPostLatency);
+      readOp = applyLatency(seqClock, readOp, readPostLatency);
       readData.replaceAllUsesWith(readOp);
 
       auto writeEnable = builder.create<comb::AndOp>(enable, writeMode);

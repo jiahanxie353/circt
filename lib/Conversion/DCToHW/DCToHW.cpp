@@ -254,7 +254,8 @@ struct RTLBuilder {
            "No global reset provided to this RTLBuilder - a reset "
            "signal must be provided to the reg(...) function.");
 
-    return b.create<seq::CompRegOp>(loc, in.getType(), in, resolvedClk, name,
+    auto seqClk = b.create<seq::ToClockOp>(resolvedClk.getLoc(), resolvedClk);
+    return b.create<seq::CompRegOp>(loc, in.getType(), in, seqClk, name,
                                     resolvedRst, rstValue, hw::InnerSymAttr());
   }
 

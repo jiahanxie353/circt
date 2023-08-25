@@ -16,11 +16,11 @@ hw.globalRef @ref4 [#hw.innerNameRef<@InnerPartLeafLoc::@inner>, #hw.innerNameRe
   "loc" = #msft.physloc<M20K, 0, 0, 0>
 }
 
-msft.module @top {} (%clk : i1) -> (out1: i2, out2: i2, out3: i2) {
+msft.module @top {} (%clk : !seq.clock) -> (out1: i2, out2: i2, out3: i2) {
   msft.partition @part1, "dp"
 
-  %res1, %res4 = msft.instance @b @B(%clk) { circt.globalRef = [#hw.globalNameRef<@ref1>, #hw.globalNameRef<@ref2>]} : (i1) -> (i2, i2)
-  %res3 = msft.instance @b2 @B2(%clk) { circt.globalRef = [#hw.globalNameRef<@ref3>]} : (i1) -> (i2)
+  %res1, %res4 = msft.instance @b @B(%clk) { circt.globalRef = [#hw.globalNameRef<@ref1>, #hw.globalNameRef<@ref2>]} : (!seq.clock) -> (i2, i2)
+  %res3 = msft.instance @b2 @B2(%clk) { circt.globalRef = [#hw.globalNameRef<@ref3>]} : (!seq.clock) -> (i2)
 
   %c0 = hw.constant 0 : i2
   %res2 = msft.instance @unit1 @Extern(%c0) { targetDesignPartition = @top::@part1 }: (i2) -> (i2)
@@ -33,7 +33,7 @@ msft.module @top {} (%clk : i1) -> (out1: i2, out2: i2, out3: i2) {
 // CHECK:  hw.globalRef @ref3 [#hw.innerNameRef<@top::@part1>, #hw.innerNameRef<@dp::@b2.unit1>] {loc = #msft.physloc<M20K, 0, 0, 0>}
 // CHECK:  hw.globalRef @ref4 [#hw.innerNameRef<@InnerPartLeafLoc::@part>, #hw.innerNameRef<@InnerLeafPartition::@inner>, #hw.innerNameRef<@Inner::@leaf>] {loc = #msft.physloc<M20K, 0, 0, 0>}
 
-// CHECK-LABEL:  msft.module @dp {} (%b.seq.compreg.clk: i1) -> (b.unit2.b.unit2.foo_x: i2, unit1.unit1.foo_x: i2) {
+// CHECK-LABEL:  msft.module @dp {} (%b.seq.compreg.clk: !seq.clock) -> (b.unit2.b.unit2.foo_x: i2, unit1.unit1.foo_x: i2) {
 // CHECK:    %b.unit1.foo_x = msft.instance @b.unit1 @Extern(%c1_i2)  {circt.globalRef = [#hw.globalNameRef<@ref1>], targetDesignPartition = @top::@part1} : (i2) -> i2
 // CHECK:    %b.seq.compreg = seq.compreg %b.unit1.foo_x, %b.seq.compreg.clk {targetDesignPartition = @top::@part1} : i2
 // CHECK:    %b.c.unit3.foo_x = msft.instance @b.c.unit3 @Extern(%b.seq.compreg)  {circt.globalRef = [#hw.globalNameRef<@ref2>], targetDesignPartition = @top::@part1} : (i2) -> i2
@@ -44,8 +44,8 @@ msft.module @top {} (%clk : i1) -> (out1: i2, out2: i2, out3: i2) {
 // CHECK:    %c0_i2 = hw.constant 0 : i2
 // CHECK:    msft.output %b.unit2.foo_x, %unit1.foo_x : i2, i2
 
-// CHECK-LABEL:  msft.module @top {} (%clk: i1) -> (out1: i2, out2: i2, out3: i2) {
-// CHECK:    %part1.b.unit2.b.unit2.foo_x, %part1.unit1.unit1.foo_x = msft.instance @part1 @dp(%clk) {circt.globalRef = [#hw.globalNameRef<@ref1>, #hw.globalNameRef<@ref2>, #hw.globalNameRef<@ref3>]} : (i1) -> (i2, i2)
+// CHECK-LABEL:  msft.module @top {} (%clk: !seq.clock) -> (out1: i2, out2: i2, out3: i2) {
+// CHECK:    %part1.b.unit2.b.unit2.foo_x, %part1.unit1.unit1.foo_x = msft.instance @part1 @dp(%clk) {circt.globalRef = [#hw.globalNameRef<@ref1>, #hw.globalNameRef<@ref2>, #hw.globalNameRef<@ref3>]} : (!seq.clock) -> (i2, i2)
 // CHECK:    %b.y = msft.instance @b @B() : () -> i2
 // CHECK:    msft.instance @b2 @B2() : () -> ()
 // CHECK:    msft.output %part1.b.unit2.b.unit2.foo_x, %part1.unit1.unit1.foo_x, %b.y : i2, i2, i2
@@ -62,7 +62,7 @@ msft.module @top {} (%clk : i1) -> (out1: i2, out2: i2, out3: i2) {
 
 msft.module.extern @Extern (%foo_a: i2) -> (foo_x: i2)
 
-msft.module @B {} (%clk : i1) -> (x: i2, y: i2)  {
+msft.module @B {} (%clk : !seq.clock) -> (x: i2, y: i2)  {
   %c1 = hw.constant 1 : i2
   %0 = msft.instance @unit1 @Extern(%c1) { targetDesignPartition = @top::@part1, circt.globalRef = [#hw.globalNameRef<@ref1>]}: (i2) -> (i2)
   %1 = seq.compreg %0, %clk { targetDesignPartition = @top::@part1 } : i2
@@ -74,7 +74,7 @@ msft.module @B {} (%clk : i1) -> (x: i2, y: i2)  {
   msft.output %2, %c1: i2, i2
 }
 
-msft.module @B2 {} (%clk : i1) -> (x: i2) {
+msft.module @B2 {} (%clk : !seq.clock) -> (x: i2) {
   %c1 = hw.constant 1 : i2
   %0 = msft.instance @unit1 @Extern(%c1) { targetDesignPartition = @top::@part1, circt.globalRef = [#hw.globalNameRef<@ref3>]}: (i2) -> (i2)
   msft.output %0 : i2
@@ -85,7 +85,7 @@ msft.module @C {} (%in : i2) -> (out: i2)  {
   msft.output %0 : i2
 }
 
-msft.module @TopComplex {} (%clk : i1, %arr_in: !hw.array<4xi5>, %datain: i5, %valid: i1) -> (out2: !hw.struct<data: i5, valid: i1>, out2: i5) {
+msft.module @TopComplex {} (%clk : !seq.clock, %arr_in: !hw.array<4xi5>, %datain: i5, %valid: i1) -> (out2: !hw.struct<data: i5, valid: i1>, out2: i5) {
   msft.partition @part2, "dp_complex"
 
   %mut_arr = msft.instance @b @Array(%arr_in) : (!hw.array<4xi5>) -> (!hw.array<4xi5>)
@@ -153,7 +153,7 @@ msft.module @Struct {} (%in: !hw.struct<data: i5, valid: i1>) -> (out: !hw.struc
 // CHECK:    %c-1_i2 = hw.constant -1 : i2
 // CHECK:    msft.output %0, %5 : i5, !hw.struct<data: i5, valid: i1>
 
-// CHECK-LABEL:  msft.module @TopComplex {} (%clk: i1, %arr_in: !hw.array<4xi5>, %datain: i5, %valid: i1) -> (out2: !hw.struct<data: i5, valid: i1>, out2: i5) {
+// CHECK-LABEL:  msft.module @TopComplex {} (%clk: !seq.clock, %arr_in: !hw.array<4xi5>, %datain: i5, %valid: i1) -> (out2: !hw.struct<data: i5, valid: i1>, out2: i5) {
 // CHECK:    %part2.comb.add, %part2.hw.struct_create = msft.instance @part2 @dp_complex(%datain, %arr_in, %valid)  {circt.globalRef = []} : (i5, !hw.array<4xi5>, i1) -> (i5, !hw.struct<data: i5, valid: i1>)
 // CHECK:    msft.instance @b @Array()  : () -> ()
 // CHECK:    msft.instance @structMod @Struct()  : () -> ()
@@ -165,15 +165,15 @@ msft.module @Struct {} (%in: !hw.struct<data: i5, valid: i1>) -> (out: !hw.struc
 // CHECK-LABEL:  msft.module @Struct {} () {
 // CHECK:    msft.output
 
-msft.module @InnerPartLeafLoc {} (%clk : i1) -> (out1: i2, out2: i2) {
+msft.module @InnerPartLeafLoc {} (%clk : !seq.clock) -> (out1: i2, out2: i2) {
   msft.partition @part, "InnerLeafPartition"
 
-  %res1, %res2 = msft.instance @inner @Inner(%clk) { targetDesignPartition = @InnerPartLeafLoc::@part, circt.globalRef = [#hw.globalNameRef<@ref4>] } : (i1) -> (i2, i2)
+  %res1, %res2 = msft.instance @inner @Inner(%clk) { targetDesignPartition = @InnerPartLeafLoc::@part, circt.globalRef = [#hw.globalNameRef<@ref4>] } : (!seq.clock) -> (i2, i2)
 
   msft.output %res1, %res2 : i2, i2
 }
 
-msft.module @Inner {} (%clk: i1) -> (out1: i2, out2: i2) {
+msft.module @Inner {} (%clk: !seq.clock) -> (out1: i2, out2: i2) {
   %c0 = hw.constant 0 : i2
 
   %0 = msft.instance @leaf @Extern(%c0) { circt.globalRef = [#hw.globalNameRef<@ref4>] }: (i2) -> (i2)

@@ -70,8 +70,13 @@ def HandshakeLowerExtmemToHW : Pass<"handshake-lower-extmem-to-hw", "mlir::Modul
     level interface).
   }];
   let constructor = "circt::handshake::createHandshakeLowerExtmemToHWPass()";
-  let dependentDialects = ["circt::hw::HWDialect", "circt::esi::ESIDialect",
-    "circt::comb::CombDialect", "mlir::arith::ArithDialect"];
+  let dependentDialects = [
+    "circt::comb::CombDialect",
+    "circt::esi::ESIDialect",
+    "circt::hw::HWDialect",
+    "circt::seq::SeqDialect",
+    "mlir::arith::ArithDialect",
+  ];
   let options = [
     Option<"createESIWrapper", "wrap-esi", "bool", "false",
       "Create an ESI wrapper for the module. Any extmem will be served by an esi.mem.ram service">,

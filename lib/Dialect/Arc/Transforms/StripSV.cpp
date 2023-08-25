@@ -46,17 +46,15 @@ void StripSVPass::runOnOperation() {
           !llvm::equal(extModOp.getOutputNames(), expectedClockGateOutputs)) {
         extModOp.emitError("clock gate module `")
             << extModOp.getModuleName() << "` has incompatible port names "
-            << extModOp.getInputNames() << " -> "
-            << extModOp.getOutputNames();
+            << extModOp.getInputNames() << " -> " << extModOp.getOutputNames();
         return signalPassFailure();
       }
       if (!llvm::equal(extModOp.getInputTypes(),
-              ArrayRef<Type>{i1Type, i1Type, i1Type}) ||
+                       ArrayRef<Type>{i1Type, i1Type, i1Type}) ||
           !llvm::equal(extModOp.getOutputTypes(), ArrayRef<Type>{i1Type})) {
         extModOp.emitError("clock gate module `")
             << extModOp.getModuleName() << "` has incompatible port types "
-            << extModOp.getInputTypes() << " -> "
-            << extModOp.getOutputTypes();
+            << extModOp.getInputTypes() << " -> " << extModOp.getOutputTypes();
         return signalPassFailure();
       }
       clockGateModuleNames.insert(extModOp.getModuleNameAttr());
@@ -137,8 +135,10 @@ void StripSVPass::runOnOperation() {
         else
           next = reg.getNext();
 
+        Value clock =
+            builder.createOrFold<seq::ToClockOp>(reg.getLoc(), reg.getClk());
         Value compReg = builder.create<seq::CompRegOp>(
-            reg.getLoc(), next.getType(), next, reg.getClk(), reg.getNameAttr(),
+            reg.getLoc(), next.getType(), next, clock, reg.getNameAttr(),
             Value{}, Value{}, reg.getInnerSymAttr());
         reg.replaceAllUsesWith(compReg);
         opsToDelete.push_back(reg);

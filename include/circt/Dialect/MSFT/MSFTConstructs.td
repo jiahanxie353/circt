@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 include "circt/Dialect/HW/HWTypes.td"
+include "circt/Dialect/Seq/SeqTypes.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/IR/SymbolInterfaces.td"
 
@@ -59,7 +60,7 @@ def ChannelOp: MSFTOp<"constructs.channel",
     is always used.
   }];
 
-  let arguments = (ins AnyType:$input, I1:$clk, StrAttr:$sym_name,
+  let arguments = (ins AnyType:$input, ClockType:$clk, StrAttr:$sym_name,
                        UI64Attr:$defaultStages);
   let results = (outs AnyType:$output);
 
@@ -90,7 +91,7 @@ def LinearOp : MSFTOp<"hlc.linear", [
     ```
   }];
 
-  let arguments = (ins I1:$clock);
+  let arguments = (ins ClockType:$clock);
   let results = (outs Variadic<AnyType>:$outs);
   let regions = (region SizedRegion<1>:$datapath);
 

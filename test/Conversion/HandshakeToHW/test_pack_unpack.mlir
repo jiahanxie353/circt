@@ -21,7 +21,7 @@ handshake.func @test_pack(%arg0: i64, %arg1: i32, %ctrl: none, ...) -> (tuple<i6
 
 // CHECK-LABEL:   hw.module @handshake_unpack_in_tuple_ui64_ui32_out_ui64_ui32(
 // CHECK-SAME:                                                                 %[[VAL_0:.*]]: !esi.channel<!hw.struct<field0: i64, field1: i32>>,
-// CHECK-SAME:                                                                 %[[VAL_1:.*]]: i1,
+// CHECK-SAME:                                                                 %[[VAL_1:.*]]: !seq.clock,
 // CHECK-SAME:                                                                 %[[VAL_2:.*]]: i1) -> (out0: !esi.channel<i64>, out1: !esi.channel<i32>) {
 // CHECK:           %[[VAL_3:.*]], %[[VAL_4:.*]] = esi.unwrap.vr %[[VAL_0]], %[[VAL_5:.*]] : !hw.struct<field0: i64, field1: i32>
 // CHECK:           %[[VAL_6:.*]], %[[VAL_7:.*]] = esi.wrap.vr %[[VAL_8:.*]], %[[VAL_9:.*]] : i64

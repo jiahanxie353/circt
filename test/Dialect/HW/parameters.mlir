@@ -183,7 +183,7 @@ hw.module @parameterizedTypesInstance
 hw.module @parameterizedCombSeq<param: i32>
 // CHECK-SAME: %a: !hw.int<#hw.param.decl.ref<"param">>
   (%a: !hw.int<#hw.param.decl.ref<"param">>,
-    %clk : i1) {
+    %clk : !seq.clock) {
 
   // CHECK: %0 = comb.add %a, %a : !hw.int<#hw.param.decl.ref<"param">>
   %0 = comb.add %a, %a : !hw.int<#hw.param.decl.ref<"param">>

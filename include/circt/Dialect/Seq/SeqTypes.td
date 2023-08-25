@@ -10,6 +10,10 @@
 //
 //===----------------------------------------------------------------------===//
 
+#ifndef CIRCT_DIALECT_SEQ_SEQTYPES
+#define CIRCT_DIALECT_SEQ_SEQTYPES
+
+include "circt/Dialect/Seq/SeqDialect.td"
 include "mlir/IR/BuiltinTypeInterfaces.td"
 
 class SeqType<string name, list<Trait> traits = []> : TypeDef<SeqDialect, name, traits> { }
@@ -88,3 +92,5 @@ def ClockType : SeqType<"Clock"> {
   }];
   let mnemonic = "clock";
 }
+
+#endif // CIRCT_DIALECT_SEQ_SEQTYPES

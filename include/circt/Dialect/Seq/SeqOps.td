@@ -33,7 +33,7 @@ def CompRegOp : SeqOp<"compreg",
   let summary = "Register a value, storing it for one cycle";
   let description = "See the Seq dialect rationale for a longer description";
 
-  let arguments = (ins AnyType:$input, I1:$clk, StrAttr:$name,
+  let arguments = (ins AnyType:$input, ClockType:$clk, StrAttr:$name,
     Optional<I1>:$reset, Optional<AnyType>:$resetValue,
     OptionalAttr<InnerSymAttr>:$inner_sym);
   let results = (outs AnyType:$data);
@@ -69,8 +69,8 @@ def CompRegClockEnabledOp : SeqOp<"compreg.ce",
   let summary = "When enabled, register a value";
   let description = "See the Seq dialect rationale for a longer description";
 
-  let arguments = (ins AnyType:$input, I1:$clk, I1:$clockEnable, StrAttr:$name,
-    Optional<I1>:$reset, Optional<AnyType>:$resetValue,
+  let arguments = (ins AnyType:$input, ClockType:$clk, I1:$clockEnable,
+    StrAttr:$name, Optional<I1>:$reset, Optional<AnyType>:$resetValue,
     OptionalAttr<InnerSymAttr>:$inner_sym);
   let results = (outs AnyType:$data);
   let hasCustomAssemblyFormat = 1;
@@ -192,7 +192,7 @@ def FIFOOp : SeqOp<"fifo", [
   }];
 
   let arguments = (ins
-    HWIntegerType:$input, I1:$rdEn, I1:$wrEn, I1:$clk, I1:$rst,
+    HWIntegerType:$input, I1:$rdEn, I1:$wrEn, ClockType:$clk, I1:$rst,
     ConfinedAttr<I64Attr, [IntMinValue<1>]>:$depth,
     OptionalAttr<ConfinedAttr<I64Attr, [IntMinValue<0>]>>:$almostFullThreshold,
     OptionalAttr<ConfinedAttr<I64Attr, [IntMinValue<0>]>>:$almostEmptyThreshold
@@ -219,7 +219,7 @@ def HLMemOp : SeqOp<"hlmem", [
   let summary = "Instantiate a high-level memory.";
   let description = "See the Seq dialect rationale for a longer description";
 
-  let arguments = (ins I1:$clk, I1:$rst, SymbolNameAttr:$sym_name);
+  let arguments = (ins ClockType:$clk, I1:$rst, SymbolNameAttr:$sym_name);
   let results = (outs HLMemType:$handle);
 
   let extraClassDeclaration = [{
@@ -544,6 +544,7 @@ def ToClockOp : SeqOp<"to_clock", [Pure]> {
 
   let assemblyFormat = "$input attr-dict";
 
+  let hasFolder = 1;
   let hasCanonicalizeMethod = 1;
 }
 
@@ -555,5 +556,6 @@ def FromClockOp : SeqOp<"from_clock", [Pure]> {
 
   let assemblyFormat = "$input attr-dict";
 
+  let hasFolder = 1;
   let hasCanonicalizeMethod = 1;
 }

@@ -4,12 +4,13 @@ hw.generator.schema @FIRRTLMem, "FIRRTL_Memory", ["depth", "numReadPorts", "numW
 
 
 // CHECK-LABEL: hw.module @TestWOMemory(
-hw.module @TestWOMemory(%clock: i1, %addr: i10, %enable: i1, %data: i8) {
+hw.module @TestWOMemory(%clock: !seq.clock, %addr: i10, %enable: i1, %data: i8) {
   // CHECK-NOT: hw.instance
   // CHECK-NEXT: [[FOO:%.+]] = arc.memory <1024 x i8, i10> {name = "foo"}
   // CHECK-NEXT: arc.memory_write_port [[FOO]], @mem_write{{.*}}(%addr, %data, %enable) clock %clock enable lat 1 : <1024 x i8, i10>, i10, i8, i1
   // CHECK-NEXT: hw.output
-  hw.instance "foo" @WOMemory(W0_addr: %addr: i10, W0_en: %enable: i1, W0_clk: %clock: i1, W0_data: %data: i8) -> ()
+  %0 = seq.from_clock %clock
+  hw.instance "foo" @WOMemory(W0_addr: %addr: i10, W0_en: %enable: i1, W0_clk: %0: i1, W0_data: %data: i8) -> ()
 }
 // CHECK-NEXT: }
 // CHECK-NOT: hw.module.generated @WOMemory, @FIRRTLMem
@@ -17,7 +18,7 @@ hw.module.generated @WOMemory, @FIRRTLMem(%W0_addr: i10, %W0_en: i1, %W0_clk: i1
 
 
 // CHECK-LABEL: hw.module @TestWOMemoryWithMask(
-hw.module @TestWOMemoryWithMask(%clock: i1, %addr: i10, %enable: i1, %data: i16, %mask: i2) {
+hw.module @TestWOMemoryWithMask(%clock: !seq.clock, %addr: i10, %enable: i1, %data: i16, %mask: i2) {
   // CHECK-NOT: hw.instance
   // CHECK-NEXT: [[FOO:%.+]] = arc.memory <1024 x i16, i10> {name = "foo"}
   // CHECK-NEXT: [[MASK_BIT0:%.+]] = comb.extract %mask from 0 : (i2) -> i1
@@ -27,7 +28,8 @@ hw.module @TestWOMemoryWithMask(%clock: i1, %addr: i10, %enable: i1, %data: i16,
   // CHECK-NEXT: [[MASK:%.+]] = comb.concat [[MASK_BYTE1]], [[MASK_BYTE0]]
   // CHECK-NEXT: arc.memory_write_port [[FOO]], @mem_write{{.*}}(%addr, %data, %enable, [[MASK]]) clock %clock enable mask lat 1 : <1024 x i16, i10>, i10, i16, i1, i16
   // CHECK-NEXT: hw.output
-  hw.instance "foo" @WOMemoryWithMask(W0_addr: %addr: i10, W0_en: %enable: i1, W0_clk: %clock: i1, W0_data: %data: i16, W0_mask: %mask: i2) -> ()
+  %0 = seq.from_clock %clock
+  hw.instance "foo" @WOMemoryWithMask(W0_addr: %addr: i10, W0_en: %enable: i1, W0_clk: %0: i1, W0_data: %data: i16, W0_mask: %mask: i2) -> ()
 }
 // CHECK-NEXT: }
 // CHECK-NOT: hw.module.generated @WOMemoryWithMask, @FIRRTLMem
@@ -35,15 +37,16 @@ hw.module.generated @WOMemoryWithMask, @FIRRTLMem(%W0_addr: i10, %W0_en: i1, %W0
 
 
 // CHECK-LABEL: hw.module @TestROMemory(
-hw.module @TestROMemory(%clock: i1, %addr: i10, %enable: i1) -> (data: i8) {
+hw.module @TestROMemory(%clock: !seq.clock, %addr: i10, %enable: i1) -> (data: i8) {
   // CHECK-NOT: hw.instance
   // CHECK-NEXT: [[FOO:%.+]] = arc.memory <1024 x i8, i10> {name = "foo"}
   // CHECK-NEXT: [[RDATA:%.+]] = arc.memory_read_port [[FOO]][%addr] : <1024 x i8, i10>
   // CHECK-NEXT: [[ZERO:%.+]] = hw.constant 0 : i8
   // CHECK-NEXT: [[MUX:%.+]] = comb.mux %enable, [[RDATA]], [[ZERO]] : i8
   // CHECK-NEXT: hw.output [[MUX]]
-  %0 = hw.instance "foo" @ROMemory(R0_addr: %addr: i10, R0_en: %enable: i1, R0_clk: %clock: i1) -> (R0_data: i8)
-  hw.output %0 : i8
+  %0 = seq.from_clock %clock
+  %1 = hw.instance "foo" @ROMemory(R0_addr: %addr: i10, R0_en: %enable: i1, R0_clk: %0: i1) -> (R0_data: i8)
+  hw.output %1 : i8
 }
 // CHECK-NEXT: }
 // CHECK-NOT: hw.module.generated @ROMemory, @FIRRTLMem
@@ -51,7 +54,7 @@ hw.module.generated @ROMemory, @FIRRTLMem(%R0_addr: i10, %R0_en: i1, %R0_clk: i1
 
 
 // CHECK-LABEL: hw.module @TestROMemoryWithLatency(
-hw.module @TestROMemoryWithLatency(%clock: i1, %addr: i10, %enable: i1) -> (data: i8) {
+hw.module @TestROMemoryWithLatency(%clock: !seq.clock, %addr: i10, %enable: i1) -> (data: i8) {
   // CHECK-NOT: hw.instance
   // CHECK-NEXT: [[FOO:%.+]] = arc.memory <1024 x i8, i10> {name = "foo"}
   // CHECK-NEXT: [[ADDR0:%.+]] = seq.compreg %addr, %clock
@@ -64,8 +67,9 @@ hw.module @TestROMemoryWithLatency(%clock: i1, %addr: i10, %enable: i1) -> (data
   // CHECK-NEXT: [[ZERO:%.+]] = hw.constant 0 : i8
   // CHECK-NEXT: [[D1:%.+]] = comb.mux [[EN2]], [[D0]], [[ZERO]] : i8
   // CHECK-NEXT: hw.output [[D1]]
-  %0 = hw.instance "foo" @ROMemoryWithLatency(R0_addr: %addr: i10, R0_en: %enable: i1, R0_clk: %clock: i1) -> (R0_data: i8)
-  hw.output %0 : i8
+  %0 = seq.from_clock %clock
+  %1 = hw.instance "foo" @ROMemoryWithLatency(R0_addr: %addr: i10, R0_en: %enable: i1, R0_clk: %0: i1) -> (R0_data: i8)
+  hw.output %1 : i8
 }
 // CHECK-NEXT: }
 // CHECK-NOT: hw.module.generated @ROMemoryWithLatency, @FIRRTLMem
@@ -73,7 +77,7 @@ hw.module.generated @ROMemoryWithLatency, @FIRRTLMem(%R0_addr: i10, %R0_en: i1, 
 
 
 // CHECK-LABEL: hw.module @TestRWMemory(
-hw.module @TestRWMemory(%clock: i1, %addr: i10, %enable: i1, %wmode: i1, %wdata: i8) -> (rdata: i8) {
+hw.module @TestRWMemory(%clock: !seq.clock, %addr: i10, %enable: i1, %wmode: i1, %wdata: i8) -> (rdata: i8) {
   // CHECK-NOT: hw.instance
   // CHECK-NEXT: [[FOO:%.+]] = arc.memory <1024 x i8, i10> {name = "foo"}
   // CHECK-NEXT: [[TRUE:%.+]] = hw.constant true
@@ -85,8 +89,9 @@ hw.module @TestRWMemory(%clock: i1, %addr: i10, %enable: i1, %wmode: i1, %wdata:
   // CHECK-NEXT: [[WENABLE:%.+]] = comb.and %enable, %wmode
   // CHECK-NEXT: arc.memory_write_port [[FOO]], @mem_write{{.*}}(%addr, %wdata, [[WENABLE]]) clock %clock enable lat 1 : <1024 x i8, i10>, i10, i8, i1
   // CHECK-NEXT: hw.output [[MUX]]
-  %0 = hw.instance "foo" @RWMemory(RW0_addr: %addr: i10, RW0_en: %enable: i1, RW0_clk: %clock: i1, RW0_wmode: %wmode: i1, RW0_wdata: %wdata: i8) -> (RW0_rdata: i8)
-  hw.output %0 : i8
+  %0 = seq.from_clock %clock
+  %1 = hw.instance "foo" @RWMemory(RW0_addr: %addr: i10, RW0_en: %enable: i1, RW0_clk: %0: i1, RW0_wmode: %wmode: i1, RW0_wdata: %wdata: i8) -> (RW0_rdata: i8)
+  hw.output %1 : i8
 }
 // CHECK-NEXT: }
 // CHECK-NOT: hw.module.generated @RWMemory, @FIRRTLMem

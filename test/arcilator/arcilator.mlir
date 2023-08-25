@@ -20,7 +20,7 @@
 // CHECK-NOT: hw.module @Top
 // CHECK-LABEL: arc.model "Top" {
 // CHECK-NEXT: ^bb0(%arg0: !arc.storage<6>):
-hw.module @Top(%clock: i1, %i0: i4, %i1: i4) -> (out: i4) {
+hw.module @Top(%clock: !seq.clock, %i0: i4, %i1: i4) -> (out: i4) {
   // CHECK-DAG: arc.root_input "clock", %arg0 {offset = 0
   // CHECK-DAG: arc.root_input "i0", %arg0 {offset = 1
   // CHECK-DAG: arc.root_input "i1", %arg0 {offset = 2

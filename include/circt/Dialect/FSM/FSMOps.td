@@ -13,6 +13,7 @@ include "mlir/IR/OpAsmInterface.td"
 include "mlir/IR/SymbolInterfaces.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "circt/Support/InstanceGraphInterface.td"
+include "circt/Dialect/Seq/SeqTypes.td"
 
 def HasCustomSSAName : DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>;
 
@@ -149,7 +150,7 @@ def HWInstanceOp : FSMOp<"hw_instance", [
   }];
 
   let arguments = (ins StrAttr:$sym_name, FlatSymbolRefAttr:$machine,
-                       Variadic<AnyType>:$inputs, I1:$clock, I1:$reset);
+                       Variadic<AnyType>:$inputs, ClockType:$clock, I1:$reset);
   let results = (outs Variadic<AnyType>:$outputs);
 
   let assemblyFormat = [{
