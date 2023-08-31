@@ -187,7 +187,7 @@ public:
         if (hasStall) {
           dataReg = builder.create<seq::CompRegClockEnabledOp>(
               stageOp->getLoc(), regIn, args.clock, stageValidAndNotStalled,
-              regName);
+              regName.strref());
         } else {
           dataReg = builder.create<seq::CompRegOp>(stageOp->getLoc(), regIn,
                                                    args.clock, regName);

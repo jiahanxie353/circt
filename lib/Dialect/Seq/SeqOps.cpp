@@ -330,16 +330,15 @@ static ParseResult parseCompReg(OpAsmParser &parser, OperationState &result) {
   return parser.resolveOperands(operands, operandTypes, loc, result.operands);
 }
 
-static void printClockEnable(::mlir::OpAsmPrinter &p, CompRegOp op) {}
-
-static void printClockEnable(::mlir::OpAsmPrinter &p,
-                             CompRegClockEnabledOp op) {
+template <typename TRegOp>
+static void printClockEnable(::mlir::OpAsmPrinter &p, TRegOp op) {
   p << ", " << op.getClockEnable();
 }
+static void printClockEnable(::mlir::OpAsmPrinter &p, CompRegOp op) {}
 
 template <class Op>
-static void printCompReg(::mlir::OpAsmPrinter &p, Op op) {
-  SmallVector<StringRef> elidedAttrs;
+static void printCompReg(::mlir::OpAsmPrinter &p, Op op,
+                         SmallVector<StringRef> elidedAttrs = {}) {
   if (auto sym = op.getInnerSymAttr()) {
     elidedAttrs.push_back("inner_sym");
     p << ' ' << "sym ";
@@ -369,10 +368,17 @@ void CompRegOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
 
 std::optional<size_t> CompRegOp::getTargetResultIndex() { return 0; }
 
-LogicalResult CompRegOp::verify() {
-  if ((getReset() == nullptr) ^ (getResetValue() == nullptr))
-    return emitOpError(
+template <typename TOp>
+LogicalResult verifyResets(TOp op) {
+  if ((op.getReset() == nullptr) ^ (op.getResetValue() == nullptr))
+    return op->emitOpError(
         "either reset and resetValue or neither must be specified");
+  return success();
+}
+
+LogicalResult CompRegOp::verify() {
+  if (failed(verifyResets(*this)))
+    return failure();
   return success();
 }
 
@@ -395,9 +401,8 @@ std::optional<size_t> CompRegClockEnabledOp::getTargetResultIndex() {
 }
 
 LogicalResult CompRegClockEnabledOp::verify() {
-  if ((getReset() == nullptr) ^ (getResetValue() == nullptr))
-    return emitOpError(
-        "either reset and resetValue or neither must be specified");
+  if (failed(verifyResets(*this)))
+    return failure();
   return success();
 }
 
@@ -408,6 +413,43 @@ ParseResult CompRegClockEnabledOp::parse(OpAsmParser &parser,
 
 void CompRegClockEnabledOp::print(::mlir::OpAsmPrinter &p) {
   printCompReg(p, *this);
+}
+
+//===----------------------------------------------------------------------===//
+// ShiftRegOp
+//===----------------------------------------------------------------------===//
+
+ParseResult ShiftRegOp::parse(OpAsmParser &parser, OperationState &result) {
+  // Parse size
+  IntegerAttr size;
+  if (parser.parseLSquare() ||
+      parser.parseAttribute<IntegerAttr>(size, "size", result.attributes) ||
+      parser.parseRSquare())
+    return failure();
+
+  // Rest of parsing is identical to a clock-enabled comp reg op.
+  return parseCompReg<true>(parser, result);
+}
+
+void ShiftRegOp::print(::mlir::OpAsmPrinter &p) {
+  // Print size
+  p << " [" << getSize() << ']';
+
+  printCompReg(p, *this, {"size"});
+}
+
+void ShiftRegOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+  // If the wire has an optional 'name' attribute, use it.
+  if (!getName().empty())
+    setNameFn(getResult(), getName());
+}
+
+std::optional<size_t> ShiftRegOp::getTargetResultIndex() { return 0; }
+
+LogicalResult ShiftRegOp::verify() {
+  if (failed(verifyResets(*this)))
+    return failure();
+  return success();
 }
 
 //===----------------------------------------------------------------------===//

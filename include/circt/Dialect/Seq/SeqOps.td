@@ -78,19 +78,52 @@ def CompRegClockEnabledOp : SeqOp<"compreg.ce",
 
   let builders = [
     OpBuilder<(ins "Value":$input, "Value":$clk, "Value":$ce,
-                   "StringRef":$name), [{
+                   "Twine":$name), [{
       auto nameAttr = StringAttr::get($_builder.getContext(), name);
       return build($_builder, $_state, input.getType(), input, clk, ce,
                    nameAttr, Value(), Value(), hw::InnerSymAttr::get(nameAttr));
     }]>,
     OpBuilder<(ins "Value":$input, "Value":$clk, "Value":$ce,
-                   "Value":$reset, "Value":$rstValue, "StringRef":$name),
+                   "Value":$reset, "Value":$rstValue, "Twine":$name),
     [{
       auto nameAttr = StringAttr::get($_builder.getContext(), name);
       return build($_builder, $_state, input.getType(), input, clk, ce,
                    nameAttr, reset, rstValue, hw::InnerSymAttr::get(nameAttr));
     }]>,
   ];
+}
+
+def ShiftRegOp : SeqOp<"shiftreg", [
+  Pure,
+  Clocked,
+  Resettable,
+  AllTypesMatch<["input", "data"]>,
+  SameVariadicOperandSize,
+  DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>,
+  DeclareOpInterfaceMethods<InnerSymbol, ["getTargetResultIndex"]>
+]> {
+  let summary = "Shift register";
+  let description = [{
+    The `seq.shiftreg` op represents a shift register. It takes the input
+    value and shifts it every cycle when `clockEnable` is asserted.
+    The `reset` and `resetValue` operands are optional and if present, every
+    entry in the shift register will be initialized to `resetValue` on the
+    rising edge of the `reset` signal.
+  }];
+
+  let arguments = (ins
+    ConfinedAttr<I64Attr, [IntMinValue<1>]>:$size,
+    AnyType:$input,
+    I1:$clk,
+    I1:$clockEnable,
+    StrAttr:$name,
+    Optional<I1>:$reset,
+    Optional<AnyType>:$resetValue,
+    OptionalAttr<InnerSymAttr>:$inner_sym
+  );
+  let results = (outs AnyType:$data);
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//

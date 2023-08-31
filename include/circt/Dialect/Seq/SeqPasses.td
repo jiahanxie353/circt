@@ -51,4 +51,10 @@ def ExternalizeClockGate: Pass<"externalize-clock-gate", "mlir::ModuleOp"> {
   ];
 }
 
+def LowerSeqShiftReg : Pass<"lower-seq-shiftreg", "hw::HWModuleOp"> {
+  let summary = "Lower seq.shiftreg ops";
+  let constructor = "circt::seq::createLowerSeqShiftRegPass()";
+  let dependentDialects = ["circt::hw::HWDialect"];
+}
+
 #endif // CIRCT_DIALECT_SEQ_SEQPASSES
