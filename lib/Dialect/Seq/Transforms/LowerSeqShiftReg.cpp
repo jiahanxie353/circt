@@ -29,7 +29,7 @@ public:
                   ConversionPatternRewriter &rewriter) const final {
     Value in = adaptor.getInput();
     Type dataType = in.getType();
-    for (size_t i = 0; i < op.getSize(); ++i)
+    for (size_t i = 0; i < op.getNumElements(); ++i)
       in = rewriter.create<seq::CompRegClockEnabledOp>(
           op.getLoc(), dataType, in, adaptor.getClk(), adaptor.getClockEnable(),
           rewriter.getStringAttr(op.getName() + "_sh" + Twine(i + 1)),

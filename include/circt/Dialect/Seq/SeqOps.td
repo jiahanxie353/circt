@@ -112,7 +112,7 @@ def ShiftRegOp : SeqOp<"shiftreg", [
   }];
 
   let arguments = (ins
-    ConfinedAttr<I64Attr, [IntMinValue<1>]>:$size,
+    ConfinedAttr<I64Attr, [IntMinValue<1>]>:$numElements,
     AnyType:$input,
     I1:$clk,
     I1:$clockEnable,

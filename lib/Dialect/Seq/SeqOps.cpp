@@ -373,6 +373,10 @@ LogicalResult verifyResets(TOp op) {
   if ((op.getReset() == nullptr) ^ (op.getResetValue() == nullptr))
     return op->emitOpError(
         "either reset and resetValue or neither must be specified");
+  bool hasReset = op.getReset() != nullptr;
+  if (hasReset && op.getResetValue().getType() != op.getInput().getType())
+    return op->emitOpError("reset value must be the same type as the input");
+
   return success();
 }
 
@@ -420,10 +424,11 @@ void CompRegClockEnabledOp::print(::mlir::OpAsmPrinter &p) {
 //===----------------------------------------------------------------------===//
 
 ParseResult ShiftRegOp::parse(OpAsmParser &parser, OperationState &result) {
-  // Parse size
-  IntegerAttr size;
+  // Parse numElements
+  IntegerAttr numElements;
   if (parser.parseLSquare() ||
-      parser.parseAttribute<IntegerAttr>(size, "size", result.attributes) ||
+      parser.parseAttribute<IntegerAttr>(numElements, "numElements",
+                                         result.attributes) ||
       parser.parseRSquare())
     return failure();
 
@@ -433,9 +438,9 @@ ParseResult ShiftRegOp::parse(OpAsmParser &parser, OperationState &result) {
 
 void ShiftRegOp::print(::mlir::OpAsmPrinter &p) {
   // Print size
-  p << " [" << getSize() << ']';
+  p << " [" << getNumElements() << ']';
 
-  printCompReg(p, *this, {"size"});
+  printCompReg(p, *this, {"numElements"});
 }
 
 void ShiftRegOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
