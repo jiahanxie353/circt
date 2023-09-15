@@ -20,6 +20,7 @@
 #include "ExportVerilogInternals.h"
 #include "circt/Dialect/Comb/CombDialect.h"
 #include "circt/Dialect/Comb/CombVisitors.h"
+#include "circt/Dialect/Debug/DebugDialect.h"
 #include "circt/Dialect/HW/HWAttributes.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
@@ -1012,12 +1013,13 @@ public:
                                const LoweringOptions &options,
                                const HWSymbolCache &symbolCache,
                                const GlobalNameTable &globalNames,
+                               const DebugAnalysis &debugAnalysis,
                                llvm::formatted_raw_ostream &os,
                                StringAttr fileName, OpLocMap &verilogLocMap)
       : designOp(designOp), shared(shared), options(options),
         symbolCache(symbolCache), globalNames(globalNames), os(os),
-        verilogLocMap(verilogLocMap), pp(os, options.emittedLineLength),
-        fileName(fileName) {
+        debugAnalysis(debugAnalysis), verilogLocMap(verilogLocMap),
+        pp(os, options.emittedLineLength), fileName(fileName) {
     pp.setListener(&saver);
   }
   /// This is the root mlir::ModuleOp that holds the whole design being emitted.
@@ -1039,6 +1041,10 @@ public:
   /// current location(line,column) on the stream. This is required to record
   /// the verilog output location information corresponding to any op.
   llvm::formatted_raw_ostream &os;
+
+  /// This marks debug-only operations and values such that we can avoid
+  /// emitting them.
+  const DebugAnalysis &debugAnalysis;
 
   bool encounteredError = false;
   unsigned currentIndent = 0;
@@ -3504,7 +3510,7 @@ void NameCollector::collectNames(Block &block) {
     // anyway.
     if (isa<InstanceOp, InterfaceInstanceOp>(op))
       continue;
-    if (isa<ltl::LTLDialect>(op.getDialect()))
+    if (isa<ltl::LTLDialect, debug::DebugDialect>(op.getDialect()))
       continue;
 
     if (!isVerilogExpression(&op)) {
@@ -5084,8 +5090,8 @@ void StmtEmitter::emitStatement(Operation *op) {
     return;
 
   // Ignore LTL expressions as they are emitted as part of verification
-  // statements.
-  if (isa<ltl::LTLDialect>(op->getDialect()))
+  // statements. Ignore debug ops as they are emitted as part of debug info.
+  if (isa<ltl::LTLDialect, debug::DebugDialect>(op->getDialect()))
     return;
 
   // Handle HW statements, SV statements.
@@ -6145,7 +6151,8 @@ void SharedEmitterState::emitOps(EmissionList &thingsToEmit,
     // on the stream.
     OpLocMap verilogLocMap(os);
     VerilogEmitterState state(designOp, *this, options, symbolCache,
-                              globalNames, os, fileName, verilogLocMap);
+                              globalNames, debugAnalysis, os, fileName,
+                              verilogLocMap);
     size_t lineOffset = 0;
     for (auto &entry : thingsToEmit) {
       entry.verilogLocs.setStream(os);
@@ -6184,7 +6191,7 @@ void SharedEmitterState::emitOps(EmissionList &thingsToEmit,
     // Each `thingToEmit` (op) uses a unique map to store verilog locations.
     stringOrOp.verilogLocs.setStream(rs);
     VerilogEmitterState state(designOp, *this, options, symbolCache,
-                              globalNames, rs, fileName,
+                              globalNames, debugAnalysis, rs, fileName,
                               stringOrOp.verilogLocs);
     emitOperation(state, op);
     stringOrOp.setString(buffer);
@@ -6208,7 +6215,8 @@ void SharedEmitterState::emitOps(EmissionList &thingsToEmit,
 
     // If this wasn't emitted to a string (e.g. it is a bind) do so now.
     VerilogEmitterState state(designOp, *this, options, symbolCache,
-                              globalNames, os, fileName, entry.verilogLocs);
+                              globalNames, debugAnalysis, os, fileName,
+                              entry.verilogLocs);
     emitOperation(state, op);
     state.addVerilogLocToOps(0, fileName);
   }
@@ -6221,8 +6229,10 @@ void SharedEmitterState::emitOps(EmissionList &thingsToEmit,
 static LogicalResult exportVerilogImpl(ModuleOp module, llvm::raw_ostream &os) {
   LoweringOptions options(module);
   GlobalNameTable globalNames = legalizeGlobalNames(module, options);
+  DebugAnalysis debugAnalysis(module);
 
-  SharedEmitterState emitter(module, options, std::move(globalNames));
+  SharedEmitterState emitter(module, options, std::move(globalNames),
+                             debugAnalysis);
   emitter.gatherFiles(false);
 
   if (emitter.options.emitReplicatedOpsToHeader)
@@ -6263,11 +6273,13 @@ static LogicalResult exportVerilogImpl(ModuleOp module, llvm::raw_ostream &os) {
 
 LogicalResult circt::exportVerilog(ModuleOp module, llvm::raw_ostream &os) {
   LoweringOptions options(module);
+  DebugAnalysis debugAnalysis(module);
   SmallVector<HWModuleOp> modulesToPrepare;
   module.walk([&](HWModuleOp op) { modulesToPrepare.push_back(op); });
   if (failed(failableParallelForEach(
-          module->getContext(), modulesToPrepare,
-          [&](auto op) { return prepareHWModule(op, options); })))
+          module->getContext(), modulesToPrepare, [&](auto op) {
+            return prepareHWModule(op, options, debugAnalysis);
+          })))
     return failure();
   return exportVerilogImpl(module, os);
 }
@@ -6362,8 +6374,10 @@ static LogicalResult exportSplitVerilogImpl(ModuleOp module,
   // end up in the output.
   LoweringOptions options(module);
   GlobalNameTable globalNames = legalizeGlobalNames(module, options);
+  DebugAnalysis debugAnalysis(module);
 
-  SharedEmitterState emitter(module, options, std::move(globalNames));
+  SharedEmitterState emitter(module, options, std::move(globalNames),
+                             debugAnalysis);
   emitter.gatherFiles(true);
 
   if (emitter.options.emitReplicatedOpsToHeader) {
@@ -6422,11 +6436,13 @@ static LogicalResult exportSplitVerilogImpl(ModuleOp module,
 
 LogicalResult circt::exportSplitVerilog(ModuleOp module, StringRef dirname) {
   LoweringOptions options(module);
+  DebugAnalysis debugAnalysis(module);
   SmallVector<HWModuleOp> modulesToPrepare;
   module.walk([&](HWModuleOp op) { modulesToPrepare.push_back(op); });
   if (failed(failableParallelForEach(
-          module->getContext(), modulesToPrepare,
-          [&](auto op) { return prepareHWModule(op, options); })))
+          module->getContext(), modulesToPrepare, [&](auto op) {
+            return prepareHWModule(op, options, debugAnalysis);
+          })))
     return failure();
 
   return exportSplitVerilogImpl(module, dirname);
