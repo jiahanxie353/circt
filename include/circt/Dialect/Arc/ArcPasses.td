@@ -15,7 +15,7 @@ include "mlir/Pass/PassBase.td"
 def AddTaps : Pass<"arc-add-taps", "mlir::ModuleOp"> {
   let summary = "Add taps to ports and wires such that they remain observable";
   let constructor = "circt::arc::createAddTapsPass()";
-  let dependentDialects = ["arc::ArcDialect"];
+  let dependentDialects = ["arc::ArcDialect", "seq::SeqDialect"];
   let options = [
     Option<"tapPorts", "ports", "bool", "true", "Make module ports observable">,
     Option<"tapWires", "wires", "bool", "true", "Make wires observable">,
@@ -144,7 +144,7 @@ def LegalizeStateUpdate : Pass<"arc-legalize-state-update", "mlir::ModuleOp"> {
 def LowerClocksToFuncs : Pass<"arc-lower-clocks-to-funcs", "mlir::ModuleOp"> {
   let summary = "Lower clock trees into functions";
   let constructor = "circt::arc::createLowerClocksToFuncsPass()";
-  let dependentDialects = ["mlir::func::FuncDialect"];
+  let dependentDialects = ["mlir::func::FuncDialect", "mlir::scf::SCFDialect"];
 }
 
 def LowerLUT : Pass<"arc-lower-lut", "arc::DefineOp"> {
@@ -158,7 +158,7 @@ def LowerState : Pass<"arc-lower-state", "mlir::ModuleOp"> {
   let constructor = "circt::arc::createLowerStatePass()";
   let dependentDialects = [
     "arc::ArcDialect", "mlir::scf::SCFDialect", "mlir::func::FuncDialect",
-    "mlir::LLVM::LLVMDialect", "comb::CombDialect"
+    "mlir::LLVM::LLVMDialect", "comb::CombDialect", "seq::SeqDialect"
   ];
 }
 

@@ -41,6 +41,27 @@ using namespace hw;
 
 namespace {
 
+struct ModelOpLowering : public OpConversionPattern<arc::ModelOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(arc::ModelOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const final {
+    {
+      IRRewriter::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToEnd(&op.getBodyBlock());
+      rewriter.create<func::ReturnOp>(op.getLoc());
+    }
+    auto funcName = rewriter.getStringAttr(op.getName() + "_eval");
+    auto funcType =
+        rewriter.getFunctionType(op.getBody().getArgumentTypes(), {});
+    auto func =
+        rewriter.create<mlir::func::FuncOp>(op.getLoc(), funcName, funcType);
+    rewriter.inlineRegionBefore(op.getRegion(), func.getBody(), func.end());
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 struct DefineOpLowering : public OpConversionPattern<arc::DefineOp> {
   using OpConversionPattern::OpConversionPattern;
   LogicalResult
@@ -413,10 +434,11 @@ static void populateOpConversion(RewritePatternSet &patterns,
     CallOpLowering,
     ClockGateOpLowering,
     DefineOpLowering,
+    FuncCallOpLowering,
     MemoryReadOpLowering,
     MemoryWriteOpLowering,
+    ModelOpLowering,
     OutputOpLowering,
-    FuncCallOpLowering,
     ReturnOpLowering,
     StateOpLowering,
     StateReadOpLowering,
@@ -443,15 +465,6 @@ struct LowerArcToLLVMPass : public LowerArcToLLVMBase<LowerArcToLLVMPass> {
 } // namespace
 
 void LowerArcToLLVMPass::runOnOperation() {
-  // Remove the models since we only care about the clock functions at this
-  // point.
-  // NOTE: In the future we may want to have an earlier pass lower the model
-  // into a separate `*_eval` function that checks for rising edges on clocks
-  // and then calls the appropriate function. At that point we won't have to
-  // delete models here anymore.
-  for (auto op : llvm::make_early_inc_range(getOperation().getOps<ModelOp>()))
-    op.erase();
-
   if (failed(lowerToMLIR()))
     return signalPassFailure();
 
