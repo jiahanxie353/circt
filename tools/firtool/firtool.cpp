@@ -35,6 +35,7 @@
 #include "circt/Support/LoweringOptionsParser.h"
 #include "circt/Support/Passes.h"
 #include "circt/Support/Version.h"
+#include "circt/Target/DebugInfo.h"
 #include "circt/Transforms/Passes.h"
 #include "mlir/Bytecode/BytecodeReader.h"
 #include "mlir/Bytecode/BytecodeWriter.h"
@@ -177,6 +178,9 @@ static cl::opt<std::string>
                 cl::init(""), cl::value_desc("filename"),
                 cl::cat(mainCategory));
 
+static cl::opt<bool> emitHGLDD("emit-hgldd", cl::desc("Emit HGLDD debug info"),
+                               cl::init(false), cl::cat(mainCategory));
+
 static cl::opt<bool>
     emitBytecode("emit-bytecode",
                  cl::desc("Emit bytecode when generating MLIR output"),
@@ -214,6 +218,28 @@ static LogicalResult printOp(Operation *op, raw_ostream &os) {
   op->print(os);
   return success();
 }
+
+/// Wrapper pass to call the `emitHGLDD` translation.
+struct EmitHGLDDPass
+    : public PassWrapper<EmitHGLDDPass, OperationPass<mlir::ModuleOp>> {
+  llvm::raw_ostream &os;
+  EmitHGLDDPass(llvm::raw_ostream &os) : os(os) {}
+  void runOnOperation() override {
+    markAllAnalysesPreserved();
+    if (failed(debug::emitHGLDD(getOperation(), "", os)))
+      return signalPassFailure();
+  }
+};
+
+/// Wrapper pass to call the `emitSplitHGLDD` translation.
+struct EmitSplitHGLDDPass
+    : public PassWrapper<EmitSplitHGLDDPass, OperationPass<mlir::ModuleOp>> {
+  void runOnOperation() override {
+    markAllAnalysesPreserved();
+    if (failed(debug::emitSplitHGLDD(getOperation(), "")))
+      return signalPassFailure();
+  }
+};
 
 /// Process a single buffer of the input.
 static LogicalResult processBuffer(
@@ -330,11 +356,15 @@ static LogicalResult processBuffer(
       if (failed(firtool::populateExportVerilog(pm, firtoolOptions,
                                                 (*outputFile)->os())))
         return failure();
+      if (emitHGLDD)
+        pm.addPass(std::make_unique<EmitHGLDDPass>((*outputFile)->os()));
       break;
     case OutputSplitVerilog:
       if (failed(firtool::populateExportSplitVerilog(
               pm, firtoolOptions, firtoolOptions.outputFilename)))
         return failure();
+      if (emitHGLDD)
+        pm.addPass(std::make_unique<EmitSplitHGLDDPass>());
       break;
     case OutputIRVerilog:
       // Run the ExportVerilog pass to get its lowering, but discard the output.
