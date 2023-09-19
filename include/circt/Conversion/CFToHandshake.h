@@ -69,7 +69,7 @@ public:
   LogicalResult addBranchOps(ConversionPatternRewriter &rewriter);
   LogicalResult replaceCallOps(ConversionPatternRewriter &rewriter);
 
-  template <typename TTerm>
+  template <typename TSrcTerm, typename TDstTerm>
   LogicalResult setControlOnlyPath(ConversionPatternRewriter &rewriter) {
     // Creates start and end points of the control-only path
 
@@ -81,11 +81,11 @@ public:
 
     // Replace original return ops with new returns with additional control
     // input
-    for (auto retOp : llvm::make_early_inc_range(r.getOps<TTerm>())) {
+    for (auto retOp : llvm::make_early_inc_range(r.getOps<TSrcTerm>())) {
       rewriter.setInsertionPoint(retOp);
       SmallVector<Value, 8> operands(retOp->getOperands());
       operands.push_back(startCtrl);
-      rewriter.replaceOpWithNewOp<handshake::ReturnOp>(retOp, operands);
+      rewriter.replaceOpWithNewOp<TDstTerm>(retOp, operands);
     }
 
     // Store the number of block arguments in each block
@@ -162,7 +162,7 @@ template <typename T, typename... TArgs, typename... TArgs2>
 LogicalResult runPartialLowering(
     T &instance,
     LogicalResult (T::*memberFunc)(ConversionPatternRewriter &, TArgs2...),
-    TArgs &...args) {
+    TArgs &... args) {
   return partiallyLowerRegion(
       [&](Region &, ConversionPatternRewriter &rewriter) -> LogicalResult {
         return (instance.*memberFunc)(rewriter, args...);
@@ -173,8 +173,9 @@ LogicalResult runPartialLowering(
 // Helper to check the validity of the dataflow conversion
 // Driver that applies the partial lowerings expressed in HandshakeLowering to
 // the region encapsulated in it. The region is assumed to have a terminator of
-// type TTerm. See HandshakeLowering for the different lowering steps.
-template <typename TTerm>
+// type TSrcTerm, and will replace it with TDstTerm. See HandshakeLowering for
+// the different lowering steps.
+template <typename TSrcTerm, typename TDstTerm>
 LogicalResult lowerRegion(HandshakeLowering &hl, bool sourceConstants,
                           bool disableTaskPipelining) {
   //  Perform initial dataflow conversion. This process allows for the use of
@@ -184,8 +185,8 @@ LogicalResult lowerRegion(HandshakeLowering &hl, bool sourceConstants,
   if (failed(
           runPartialLowering(hl, &HandshakeLowering::replaceMemoryOps, memOps)))
     return failure();
-  if (failed(runPartialLowering(hl,
-                                &HandshakeLowering::setControlOnlyPath<TTerm>)))
+  if (failed(runPartialLowering(
+          hl, &HandshakeLowering::setControlOnlyPath<TSrcTerm, TDstTerm>)))
     return failure();
   if (failed(runPartialLowering(hl, &HandshakeLowering::addMergeOps)))
     return failure();

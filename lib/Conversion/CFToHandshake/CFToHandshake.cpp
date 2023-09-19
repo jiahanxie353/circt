@@ -1707,8 +1707,9 @@ static LogicalResult lowerFuncOp(func::FuncOp funcOp, MLIRContext *ctx,
 
   if (!newFuncOp.isExternal()) {
     HandshakeLowering fol(newFuncOp.getBody());
-    returnOnError(lowerRegion<func::ReturnOp>(fol, sourceConstants,
-                                              disableTaskPipelining));
+    if (failed((lowerRegion<func::ReturnOp, handshake::ReturnOp>(
+            fol, sourceConstants, disableTaskPipelining))))
+      return failure();
   }
 
   return success();

@@ -151,4 +151,15 @@ def IbisInlineSBlocks : Pass<"ibis-inline-sblocks", "ibis::MethodOp"> {
   let dependentDialects = ["mlir::cf::ControlFlowDialect"];
 }
 
+def IbisConvertCFToHandshake : Pass<"ibis-convert-cf-to-handshake", "ibis::MethodOp"> {
+  let summary = "Converts an ibis.method from controlflow to handshake";
+  let description = [{
+    Converts an ibis.method from using `cf` operations and MLIR blocks to using
+    handshake dataflow operations.
+  }];
+
+  let constructor = "circt::ibis::createConvertCFToHandshakePass()";
+  let dependentDialects = ["circt::handshake::HandshakeDialect", "mlir::cf::ControlFlowDialect"];
+}
+
 #endif // CIRCT_DIALECT_IBIS_PASSES_TD

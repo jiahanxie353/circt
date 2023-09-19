@@ -8,12 +8,14 @@ add_circt_dialect_library(CIRCTIbisTransforms
   IbisArgifyBlocksPass.cpp
   IbisReblockPass.cpp
   IbisInlineSBlocksPass.cpp
+  IbisConvertCFToHandshake.cpp
 
   DEPENDS
   CIRCTIbisTransformsIncGen
 
   LINK_LIBS PUBLIC
   CIRCTDC
+  CIRCTHandshake
   CIRCTIbis
   CIRCTHW
   CIRCTSupport

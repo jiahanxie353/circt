@@ -21,6 +21,7 @@ include "mlir/IR/BuiltinAttributeInterfaces.td"
 include "circt/Dialect/HW/HWOpInterfaces.td"
 include "circt/Dialect/Ibis/IbisInterfaces.td"
 include "circt/Dialect/Ibis/IbisTypes.td"
+include "circt/Dialect/Handshake/HandshakeInterfaces.td"
 
 include "circt/Support/InstanceGraphInterface.td"
 
@@ -141,7 +142,9 @@ def MethodOp : IbisOp<"method", [
       Symbol, FunctionOpInterface,
       AutomaticAllocationScope,
       DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmBlockArgumentNames"]>,
-      HasParent<"ClassOp">]> {
+      HasParent<"ClassOp">,
+      FineGrainedDataflowRegionOpInterface
+  ]> {
 
   let summary = "Ibis method";
   let description = [{
