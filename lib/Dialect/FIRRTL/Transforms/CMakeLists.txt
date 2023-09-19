@@ -30,6 +30,7 @@ add_circt_dialect_library(CIRCTFIRRTLTransforms
   LowerOpenAggs.cpp
   LowerTypes.cpp
   LowerXMR.cpp
+  MaterializeDebugInfo.cpp
   MemToRegOfVec.cpp
   MergeConnections.cpp
   ModuleInliner.cpp
@@ -55,6 +56,7 @@ add_circt_dialect_library(CIRCTFIRRTLTransforms
 
   LINK_LIBS PUBLIC
   CIRCTFIRRTL
+  CIRCTDebug
   CIRCTHW
   CIRCTOM
   CIRCTSV
