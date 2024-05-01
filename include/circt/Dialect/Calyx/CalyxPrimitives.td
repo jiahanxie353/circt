@@ -331,6 +331,48 @@ class CombinationalArithBinaryLibraryOp<string mnemonic> :
   let results = (outs AnyType:$left, AnyType:$right, AnyType:$out);
 }
 
+class ArithBinaryFloatingPointLibraryOp<string mnemonic> : ArithBinaryLibraryOp<mnemonic, [
+  SameTypeConstraint<"left", "out">]> {}
+
+def AddFNOp : ArithBinaryFloatingPointLibraryOp<"addFN"> {
+  let results = (outs I1:$clk, I1:$reset, I1:$go, I1:$control, I1:$subOp,
+    AnyFloat:$left, AnyFloat:$right, AnySignlessInteger:$roundingMode, AnyFloat:$out,
+    AnySignlessInteger:$execptionalFlags, I1:$done);
+
+  let extraClassDefinition = [{
+    SmallVector<StringRef> $cppClass::portNames() {
+      return {clkPort, resetPort, goPort, "control", "subOp",
+              "left", "right", "roundingMode", "out", "execptionalFlags", donePort
+      };
+    }
+
+    SmallVector<Direction> $cppClass::portDirections() {
+      return {Input, Input, Input, Input, Input, Input, Input, Input, Output, Output, Output};
+      }
+
+    void $cppClass::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+      getCellAsmResultNames(setNameFn, *this, this->portNames());
+      }
+
+    bool $cppClass::isCombinational() { return false; }
+
+    SmallVector<DictionaryAttr> $cppClass::portAttributes() {
+      IntegerAttr isSet = IntegerAttr::get(IntegerType::get(getContext(), 1), 1);
+      NamedAttrList go, clk, reset, done;
+      go.append(goPort, isSet);
+      clk.append(clkPort, isSet);
+      reset.append(resetPort, isSet);
+      done.append(donePort, isSet);
+      return {clk.getDictionary(getContext()), reset.getDictionary(getContext()),
+              go.getDictionary(getContext()), DictionaryAttr::get(getContext()),
+              DictionaryAttr::get(getContext()), DictionaryAttr::get(getContext()),
+              DictionaryAttr::get(getContext()), DictionaryAttr::get(getContext()),
+              DictionaryAttr::get(getContext()), done.getDictionary(getContext()), DictionaryAttr::get(getContext())
+      };
+    }
+  }];
+}
+
 def AddLibOp  : CombinationalArithBinaryLibraryOp<"add"> {}
 def SubLibOp  : CombinationalArithBinaryLibraryOp<"sub"> {}
 def ShruLibOp : CombinationalArithBinaryLibraryOp<"shru"> {}
