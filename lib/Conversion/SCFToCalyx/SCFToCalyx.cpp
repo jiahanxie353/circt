@@ -898,13 +898,25 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      arith::ConstantOp constOp) const {
-  /// Move constant operations to the compOp body as hw::ConstantOp's.
-  APInt value;
-  calyx::matchConstantOp(constOp, value);
-  auto hwConstOp = rewriter.replaceOpWithNewOp<hw::ConstantOp>(constOp, value);
-  hwConstOp->moveAfter(getComponent().getBodyBlock(),
-                       getComponent().getBodyBlock()->begin());
-  return success();
+  Type constType = constOp.getType();
+  if (constType.isa<IntegerType>()) {
+    /// Move constant operations to the compOp body as hw::ConstantOp's.
+    APInt value;
+    calyx::matchConstantOp(constOp, value);
+    auto hwConstOp =
+        rewriter.replaceOpWithNewOp<hw::ConstantOp>(constOp, value);
+    hwConstOp->moveAfter(getComponent().getBodyBlock(),
+                         getComponent().getBodyBlock()->begin());
+    return success();
+  } else if (constType.isa<FloatType>()) {
+    auto floatAttr = dyn_cast<FloatAttr>(constOp.getValueAttr());
+    auto calyxConstOp =
+        rewriter.replaceOpWithNewOp<calyx::ConstantOp>(constOp, floatAttr);
+    calyxConstOp->moveAfter(getComponent().getBodyBlock(),
+                            getComponent().getBodyBlock()->begin());
+    return success();
+  } else
+    return failure();
 }
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
