@@ -216,10 +216,11 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
                              memref::AllocOp, memref::AllocaOp, memref::LoadOp,
                              memref::StoreOp,
                              /// standard arithmetic
-                             AddIOp, AddFOp, SubIOp, CmpIOp, ShLIOp, ShRUIOp,
-                             ShRSIOp, AndIOp, XOrIOp, OrIOp, ExtUIOp, ExtSIOp,
-                             TruncIOp, MulIOp, MulFOp, DivUIOp, DivSIOp,
-                             RemUIOp, RemSIOp, SelectOp, IndexCastOp, CallOp>(
+                             AddIOp, AddFOp, SubIOp, CmpIOp, CmpFOp, ShLIOp,
+                             ShRUIOp, ShRSIOp, AndIOp, XOrIOp, OrIOp, ExtUIOp,
+                             ExtSIOp, TruncIOp, MulIOp, MulFOp, DivUIOp,
+                             DivSIOp, RemUIOp, RemSIOp, SelectOp, IndexCastOp,
+                             CallOp>(
                   [&](auto op) { return buildOp(rewriter, op).succeeded(); })
               .template Case<FuncOp, scf::ConditionOp>([&](auto) {
                 /// Skip: these special cases will be handled separately.
@@ -261,6 +262,7 @@ private:
   LogicalResult buildOp(PatternRewriter &rewriter, OrIOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, XOrIOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, CmpIOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter, CmpFOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, TruncIOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, ExtUIOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, ExtSIOp op) const;
@@ -997,6 +999,51 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   }
   llvm_unreachable("unsupported comparison predicate");
 }
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     CmpFOp op) const {
+  bool isSigned = true; // Right now I can't come up with any case where we need
+                        // unsigned floating point comparison
+  switch (op.getPredicate()) {
+  case CmpFPredicate::UEQ:
+  case CmpFPredicate::OEQ:
+    return buildLibraryOp<calyx::CombGroupOp, calyx::EqLibOp>(rewriter, op);
+  case CmpFPredicate::UNE:
+  case CmpFPredicate::ONE:
+    return buildLibraryOp<calyx::CombGroupOp, calyx::NeqLibOp>(rewriter, op);
+  case CmpFPredicate::UGE:
+  case CmpFPredicate::OGE:
+    return isSigned
+               ? buildLibraryOp<calyx::CombGroupOp, calyx::SgeLibOp>(rewriter,
+                                                                     op)
+               : buildLibraryOp<calyx::CombGroupOp, calyx::GeLibOp>(rewriter,
+                                                                    op);
+  case CmpFPredicate::ULT:
+  case CmpFPredicate::OLT:
+    return isSigned
+               ? buildLibraryOp<calyx::CombGroupOp, calyx::SltLibOp>(rewriter,
+                                                                     op)
+               : buildLibraryOp<calyx::CombGroupOp, calyx::LtLibOp>(rewriter,
+                                                                    op);
+  case CmpFPredicate::UGT:
+  case CmpFPredicate::OGT:
+    return isSigned
+               ? buildLibraryOp<calyx::CombGroupOp, calyx::SgtLibOp>(rewriter,
+                                                                     op)
+               : buildLibraryOp<calyx::CombGroupOp, calyx::GtLibOp>(rewriter,
+                                                                    op);
+  case CmpFPredicate::ULE:
+  case CmpFPredicate::OLE:
+    return isSigned
+               ? buildLibraryOp<calyx::CombGroupOp, calyx::SleLibOp>(rewriter,
+                                                                     op)
+               : buildLibraryOp<calyx::CombGroupOp, calyx::LeLibOp>(rewriter,
+                                                                    op);
+  default:
+    llvm_unreachable("unexpected comparison predicate");
+  }
+}
+
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      TruncIOp op) const {
   return buildLibraryOp<calyx::CombGroupOp, calyx::SliceLibOp>(
@@ -1779,10 +1826,10 @@ public:
     // Only accept std operations which we've added lowerings for
     target.addIllegalDialect<FuncDialect>();
     target.addIllegalDialect<ArithDialect>();
-    target.addLegalOp<AddIOp, AddFOp, SelectOp, SubIOp, CmpIOp, ShLIOp, ShRUIOp,
-                      ShRSIOp, AndIOp, XOrIOp, OrIOp, ExtUIOp, TruncIOp,
-                      CondBranchOp, BranchOp, MulIOp, MulFOp, DivUIOp, DivSIOp,
-                      RemUIOp, RemSIOp, ReturnOp, arith::ConstantOp,
+    target.addLegalOp<AddIOp, AddFOp, SelectOp, SubIOp, CmpIOp, CmpFOp, ShLIOp,
+                      ShRUIOp, ShRSIOp, AndIOp, XOrIOp, OrIOp, ExtUIOp,
+                      TruncIOp, CondBranchOp, BranchOp, MulIOp, MulFOp, DivUIOp,
+                      DivSIOp, RemUIOp, RemSIOp, ReturnOp, arith::ConstantOp,
                       IndexCastOp, FuncOp, ExtSIOp, CallOp>();
 
     RewritePatternSet legalizePatterns(&getContext());
