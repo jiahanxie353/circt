@@ -218,8 +218,8 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
                              /// standard arithmetic
                              AddIOp, AddFOp, SubIOp, CmpIOp, ShLIOp, ShRUIOp,
                              ShRSIOp, AndIOp, XOrIOp, OrIOp, ExtUIOp, ExtSIOp,
-                             TruncIOp, MulIOp, DivUIOp, DivSIOp, RemUIOp,
-                             RemSIOp, SelectOp, IndexCastOp, CallOp>(
+                             TruncIOp, MulIOp, MulFOp, DivUIOp, DivSIOp,
+                             RemUIOp, RemSIOp, SelectOp, IndexCastOp, CallOp>(
                   [&](auto op) { return buildOp(rewriter, op).succeeded(); })
               .template Case<FuncOp, scf::ConditionOp>([&](auto) {
                 /// Skip: these special cases will be handled separately.
@@ -249,6 +249,7 @@ private:
   LogicalResult buildOp(PatternRewriter &rewriter, AddFOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, SubIOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, MulIOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter, MulFOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, DivUIOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, DivSIOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, RemUIOp op) const;
@@ -383,7 +384,7 @@ private:
   }
 
   /// buildLibraryBinaryFloatingPointOp will build a
-  /// TCalyxLibBinaryFloatingPointOp, to deal with AddFNOp
+  /// TCalyxLibBinaryFloatingPointOp, to deal with AddFNOp and MulFNOp
   template <typename TOpType, typename TSrcOp>
   LogicalResult buildLibraryBinaryFloatingPointOp(PatternRewriter &rewriter,
                                                   TSrcOp op, TOpType opFN,
@@ -421,9 +422,9 @@ private:
     // The group is done when the register write is complete.
     rewriter.create<calyx::GroupDoneOp>(loc, reg.getDone());
 
-    if (isa<calyx::AddFNOp>(opFN)) {
+    if constexpr (std::is_same<calyx::AddFNOp, TOpType>::value) {
       hw::ConstantOp subOp;
-      if (isa<arith::AddFOp>(op)) {
+      if constexpr (std::is_same<arith::AddFOp, TSrcOp>::value) {
         subOp = createConstant(loc, rewriter, getComponent(), 1, 0);
       } else {
         subOp = createConstant(loc, rewriter, getComponent(), 1, 1);
@@ -628,6 +629,21 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   return buildLibraryBinaryPipeOp<calyx::MultPipeLibOp>(
       rewriter, mul, mulPipe,
       /*out=*/mulPipe.getOut());
+}
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     MulFOp mulf) const {
+  Location loc = mulf.getLoc();
+  Type width = mulf.getResult().getType();
+  IntegerType one = rewriter.getI1Type(), three = rewriter.getIntegerType(3),
+              five = rewriter.getIntegerType(5);
+  auto mulFN =
+      getState<ComponentLoweringState>()
+          .getNewLibraryOpInstance<calyx::MulFNOp>(
+              rewriter, loc,
+              {one, one, one, one, width, width, three, width, five, one});
+  return buildLibraryBinaryFloatingPointOp<calyx::MulFNOp>(
+      rewriter, mulf, mulFN, mulFN.getOut());
 }
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
@@ -1753,9 +1769,9 @@ public:
     target.addIllegalDialect<ArithDialect>();
     target.addLegalOp<AddIOp, AddFOp, SelectOp, SubIOp, CmpIOp, ShLIOp, ShRUIOp,
                       ShRSIOp, AndIOp, XOrIOp, OrIOp, ExtUIOp, TruncIOp,
-                      CondBranchOp, BranchOp, MulIOp, DivUIOp, DivSIOp, RemUIOp,
-                      RemSIOp, ReturnOp, arith::ConstantOp, IndexCastOp, FuncOp,
-                      ExtSIOp, CallOp>();
+                      CondBranchOp, BranchOp, MulIOp, MulFOp, DivUIOp, DivSIOp,
+                      RemUIOp, RemSIOp, ReturnOp, arith::ConstantOp,
+                      IndexCastOp, FuncOp, ExtSIOp, CallOp>();
 
     RewritePatternSet legalizePatterns(&getContext());
     legalizePatterns.add<DummyPattern>(&getContext());
