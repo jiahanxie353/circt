@@ -146,6 +146,10 @@ private:
           static constexpr std::string_view sFloatingPoint = "float/addFN";
           return {sFloatingPoint};
         })
+        .Case<MulFNOp>([&](auto op) -> FailureOr<StringRef> {
+          static constexpr std::string_view sFloatingPoint = "float/mulFN";
+          return {sFloatingPoint};
+        })
         .Default([&](auto op) {
           auto diag = op->emitOpError() << "not supported for emission";
           return diag;
@@ -665,7 +669,8 @@ void Emitter::emitComponent(ComponentInterface op) {
                 SubLibOp, ShruLibOp, RshLibOp, SrshLibOp, LshLibOp, AndLibOp,
                 NotLibOp, OrLibOp, XorLibOp, WireLibOp>(
               [&](auto op) { emitLibraryPrimTypedByFirstInputPort(op); })
-          .Case<AddFNOp>([&](auto op) { emitLibraryFloatingPoint(op); })
+          .Case<AddFNOp, MulFNOp>(
+              [&](auto op) { emitLibraryFloatingPoint(op); })
           .Case<MuxLibOp>(
               [&](auto op) { emitLibraryPrimTypedByFirstOutputPort(op); })
           .Case<MultPipeLibOp>(
