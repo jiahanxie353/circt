@@ -251,6 +251,34 @@ public:
       : calyx::ComponentLoweringStateInterface(component) {}
 };
 
+class TransformOpGroups : public calyx::FuncOpPartialLoweringPattern {
+  using FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern;
+
+  LogicalResult
+  partiallyLowerFuncToComp(FuncOp funcOp,
+                           PatternRewriter &rewriter) const override {
+    /// We walk the operations of the funcOp to ensure that all def's have
+    /// been visited before their uses.
+    bool opBuiltSuccessfully = true;
+    funcOp.walk([&](Operation *_op) {
+      opBuiltSuccessfully &=
+          TypeSwitch<mlir::Operation *, bool>(_op)
+              .template Case<arith::MaximumFOp>([&](auto op) {
+                return transformOp(rewriter, op).succeeded();
+              })
+              .Default([&](auto op) { return true; });
+
+      return opBuiltSuccessfully ? WalkResult::advance()
+                                 : WalkResult::interrupt();
+    });
+
+    return success(opBuiltSuccessfully);
+  }
+
+private:
+  LogicalResult transformOp(PatternRewriter &rewriter, MaximumFOp op) const;
+};
+
 //===----------------------------------------------------------------------===//
 // Conversion patterns
 //===----------------------------------------------------------------------===//
@@ -588,15 +616,27 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
     // But since the value of write_data doesn't matter, we just create bitvector with 0's.
     if (memoryInterface.isSeqMem()) {
       auto memOperand = llvm::cast<MemRefType>(loadOp.getOperand(0).getType());
-      auto floatType = cast<FloatType>(memOperand.getElementType());
-      auto wrZeroFlt = rewriter.getFloatAttr(memOperand.getElementType(), APFloat::getZero(floatType.getFloatSemantics()));
-      auto calyxFloat = rewriter.create<calyx::ConstantOp>(loadOp.getLoc(), wrZeroFlt);
-      rewriter.create<calyx::AssignOp>(loadOp.getLoc(), memoryInterface.writeData(), calyxFloat);
+      Value writeZero;
+      if (auto floatType = cast<FloatType>(memOperand.getElementType())) {
+        auto wrZeroFlt = rewriter.getFloatAttr(
+            memOperand.getElementType(),
+            APFloat::getZero(floatType.getFloatSemantics()));
+        writeZero =
+            rewriter.create<calyx::ConstantOp>(loadOp.getLoc(), wrZeroFlt);
+      } else {
+        auto wrZeroInt = rewriter.getIntegerAttr(
+            memOperand.getElementType(),
+            APInt::getZero(
+                memOperand.getElementType().getIntOrFloatBitWidth()));
+        writeZero = rewriter.create<hw::ConstantOp>(loadOp.getLoc(), wrZeroInt);
+      }
+      rewriter.create<calyx::AssignOp>(loadOp.getLoc(),
+                                       memoryInterface.writeData(), writeZero);
     }
    
     regWriteEn = memoryInterface.done();
     if (calyx::noStoresToMemory(memref) &&
-        calyx::singleLoadFromMemory(memref)) {
+        calyx::singleLoadFromMemory(memref) && !memoryInterface.isSeqMem()) {
       // Single load from memory; we do not need to write the output to a
       // register. The readData value will be held until contentEn is asserted
       // again
@@ -1137,6 +1177,27 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   }
 }
 
+LogicalResult TransformOpGroups::transformOp(PatternRewriter &rewriter,
+                                             MaximumFOp maxFOp) const {
+  rewriter.setInsertionPointAfter(maxFOp);
+  auto cmpFOp = rewriter.create<CmpFOp>(maxFOp.getLoc(), CmpFPredicate::OGT,
+                                        maxFOp.getLhs(), maxFOp.getRhs());
+  auto ifOp = rewriter.create<scf::IfOp>(
+      maxFOp.getLoc(), maxFOp.getResult().getType(), cmpFOp.getResult(), true);
+
+  auto &thenBlock = ifOp.getThenRegion();
+  auto &elseBlock = ifOp.getElseRegion();
+
+  rewriter.setInsertionPointToStart(&thenBlock.front());
+  rewriter.create<scf::YieldOp>(maxFOp.getLoc(), maxFOp.getLhs());
+
+  rewriter.setInsertionPointToStart(&elseBlock.front());
+  rewriter.create<scf::YieldOp>(maxFOp.getLoc(), maxFOp.getRhs());
+
+  rewriter.replaceOp(maxFOp, ifOp.getResults()[0]);
+  return success();
+}
+
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      TruncIOp op) const {
   return buildLibraryOp<calyx::CombGroupOp, calyx::SliceLibOp>(
@@ -1599,7 +1660,6 @@ class BuildIfGroups : public calyx::FuncOpPartialLoweringPattern {
             scfIfOp.getLoc(), rewriter, getComponent(), res.getType(),
             getState<ComponentLoweringState>().getUniqueName(
                 "if_res" + res.getResultNumber()));
-        reg.dump();
         getState<ComponentLoweringState>().setResultRegs(scfIfOp, reg,
                                                          res.getResultNumber());
       }
@@ -2022,11 +2082,12 @@ public:
     // Only accept std operations which we've added lowerings for
     target.addIllegalDialect<FuncDialect>();
     target.addIllegalDialect<ArithDialect>();
-    target.addLegalOp<AddIOp, AddFOp, SelectOp, SubIOp, CmpIOp, CmpFOp, ShLIOp,
-                      ShRUIOp, ShRSIOp, AndIOp, XOrIOp, OrIOp, ExtUIOp,
-                      TruncIOp, CondBranchOp, BranchOp, MulIOp, MulFOp, DivUIOp,
-                      DivSIOp, RemUIOp, RemSIOp, ReturnOp, arith::ConstantOp,
-                      IndexCastOp, FuncOp, ExtSIOp, CallOp>();
+    target
+        .addLegalOp<AddIOp, AddFOp, SelectOp, SubIOp, CmpIOp, CmpFOp,
+                    MaximumFOp, ShLIOp, ShRUIOp, ShRSIOp, AndIOp, XOrIOp, OrIOp,
+                    ExtUIOp, TruncIOp, CondBranchOp, BranchOp, MulIOp, MulFOp,
+                    DivUIOp, DivSIOp, RemUIOp, RemSIOp, ReturnOp,
+                    arith::ConstantOp, IndexCastOp, FuncOp, ExtSIOp, CallOp>();
 
     RewritePatternSet legalizePatterns(&getContext());
     legalizePatterns.add<DummyPattern>(&getContext());
@@ -2117,6 +2178,9 @@ void SCFToCalyxPass::runOnOperation() {
   DenseMap<FuncOp, calyx::ComponentOp> funcMap;
   SmallVector<LoweringPattern, 8> loweringPatterns;
   calyx::PatternApplicationState patternState;
+
+  addOncePattern<TransformOpGroups>(loweringPatterns, patternState, funcMap,
+                                    *loweringState);
 
   /// Creates a new Calyx component for each FuncOp in the inpurt module.
   addOncePattern<FuncOpConversion>(loweringPatterns, patternState, funcMap,
