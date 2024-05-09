@@ -308,7 +308,7 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
                              ShRUIOp, ShRSIOp, AndIOp, XOrIOp, OrIOp, ExtUIOp,
                              ExtSIOp, TruncIOp, MulIOp, MulFOp, DivUIOp,
                              DivSIOp, RemUIOp, RemSIOp, SelectOp, IndexCastOp,
-                             CallOp>(
+                             CallOp, memref::GetGlobalOp>(
                   [&](auto op) { return buildOp(rewriter, op).succeeded(); })
               .template Case<FuncOp, scf::ConditionOp>([&](auto) {
                 /// Skip: these special cases will be handled separately.
@@ -360,6 +360,8 @@ private:
   LogicalResult buildOp(PatternRewriter &rewriter, memref::AllocaOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, memref::LoadOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, memref::StoreOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter,
+                        memref::GetGlobalOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, scf::WhileOp whileOp) const;
   LogicalResult buildOp(PatternRewriter &rewriter, scf::ForOp forOp) const;
   LogicalResult buildOp(PatternRewriter &rewriter, scf::IfOp ifOp) const;
@@ -845,6 +847,12 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      memref::AllocaOp allocOp) const {
   return buildAllocOp(getState<ComponentLoweringState>(), rewriter, allocOp);
+}
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     memref::GetGlobalOp getGlobalOp) const {
+  return buildAllocOp(getState<ComponentLoweringState>(), rewriter,
+                      getGlobalOp);
 }
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
@@ -2082,12 +2090,12 @@ public:
     // Only accept std operations which we've added lowerings for
     target.addIllegalDialect<FuncDialect>();
     target.addIllegalDialect<ArithDialect>();
-    target
-        .addLegalOp<AddIOp, AddFOp, SelectOp, SubIOp, CmpIOp, CmpFOp,
-                    MaximumFOp, ShLIOp, ShRUIOp, ShRSIOp, AndIOp, XOrIOp, OrIOp,
-                    ExtUIOp, TruncIOp, CondBranchOp, BranchOp, MulIOp, MulFOp,
-                    DivUIOp, DivSIOp, RemUIOp, RemSIOp, ReturnOp,
-                    arith::ConstantOp, IndexCastOp, FuncOp, ExtSIOp, CallOp>();
+    target.addLegalOp<AddIOp, AddFOp, SelectOp, SubIOp, CmpIOp, CmpFOp,
+                      MaximumFOp, ShLIOp, ShRUIOp, ShRSIOp, AndIOp, XOrIOp,
+                      OrIOp, ExtUIOp, TruncIOp, CondBranchOp, BranchOp, MulIOp,
+                      MulFOp, DivUIOp, DivSIOp, RemUIOp, RemSIOp, ReturnOp,
+                      arith::ConstantOp, IndexCastOp, FuncOp, ExtSIOp, CallOp,
+                      memref::GetGlobalOp>();
 
     RewritePatternSet legalizePatterns(&getContext());
     legalizePatterns.add<DummyPattern>(&getContext());
