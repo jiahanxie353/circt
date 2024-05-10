@@ -263,7 +263,7 @@ class TransformOpGroups : public calyx::FuncOpPartialLoweringPattern {
     funcOp.walk([&](Operation *_op) {
       opBuiltSuccessfully &=
           TypeSwitch<mlir::Operation *, bool>(_op)
-              .template Case<arith::MaximumFOp>([&](auto op) {
+              .template Case<arith::MaximumFOp, memref::CopyOp>([&](auto op) {
                 return transformOp(rewriter, op).succeeded();
               })
               .Default([&](auto op) { return true; });
@@ -277,6 +277,7 @@ class TransformOpGroups : public calyx::FuncOpPartialLoweringPattern {
 
 private:
   LogicalResult transformOp(PatternRewriter &rewriter, MaximumFOp op) const;
+  LogicalResult transformOp(PatternRewriter &rewriter, memref::CopyOp op) const;
 };
 
 //===----------------------------------------------------------------------===//
@@ -667,7 +668,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
     // but it will usually be better because combinational reads on memories
     // can significantly decrease the maximum achievable frequency.
     calyx::RegisterOp reg;
-    if (loadOp.getMemRefType().isa<IntegerType>())
+    if (isa<IntegerType>(loadOp.getMemRefType()))
       reg = createRegister(
           loadOp.getLoc(), rewriter, getComponent(),
           loadOp.getMemRefType().getElementTypeBitWidth(),
@@ -719,6 +720,36 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
         createConstant(storeOp.getLoc(), rewriter, getComponent(), 1, 1));
   }
   rewriter.create<calyx::GroupDoneOp>(storeOp.getLoc(), memoryInterface.done());
+
+  return success();
+}
+
+LogicalResult TransformOpGroups::transformOp(PatternRewriter &rewriter,
+                                             memref::CopyOp copyOp) const {
+  rewriter.setInsertionPoint(copyOp);
+  auto loc = copyOp.getLoc();
+  auto src = copyOp.getSource();
+  auto dst = copyOp.getTarget();
+  auto memrefType = cast<MemRefType>(src.getType());
+
+  auto rank = memrefType.getRank();
+  auto step = rewriter.create<arith::ConstantIndexOp>(loc, 1).getResult();
+  auto lb = rewriter.create<arith::ConstantIndexOp>(loc, 0).getResult();
+
+  std::vector<mlir::Value> indices;
+  for (auto rk = 0; rk < rank; rk++) {
+    auto n = memrefType.getShape()[rk];
+    auto ub = rewriter.create<arith::ConstantIndexOp>(loc, n).getResult();
+    auto loop = rewriter.create<scf::ForOp>(loc, lb, ub, step,
+                                            llvm::SmallVector<Value>());
+    indices.push_back(loop.getInductionVar());
+    rewriter.setInsertionPointToStart(loop.getBody());
+  }
+
+  auto loadOp = rewriter.create<memref::LoadOp>(loc, src, indices);
+  rewriter.create<memref::StoreOp>(loc, loadOp.getResult(), dst, indices);
+
+  rewriter.eraseOp(copyOp);
 
   return success();
 }
@@ -822,7 +853,7 @@ static LogicalResult buildAllocOp(ComponentLoweringState &componentState,
     addrSizes.push_back(1);
   }
   calyx::SeqMemoryOp memoryOp;
-  if (memtype.getElementType().isa<IntegerType>())
+  if (isa<IntegerType>(memtype.getElementType()))
     memoryOp = rewriter.create<calyx::SeqMemoryOp>(
         allocOp.getLoc(), componentState.getUniqueName("mem"),
         memtype.getElementType().getIntOrFloatBitWidth(), sizes, addrSizes);
@@ -1042,7 +1073,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      arith::ConstantOp constOp) const {
   Type constType = constOp.getType();
-  if (constType.isa<IntegerType>()) {
+  if (isa<IntegerType>(constType)) {
     /// Move constant operations to the compOp body as hw::ConstantOp's.
     APInt value;
     calyx::matchConstantOp(constOp, value);
@@ -1051,7 +1082,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
     hwConstOp->moveAfter(getComponent().getBodyBlock(),
                          getComponent().getBodyBlock()->begin());
     return success();
-  } else if (constType.isa<FloatType>()) {
+  } else if (isa<FloatType>(constType)) {
     auto floatAttr = dyn_cast<FloatAttr>(constOp.getValueAttr());
     auto calyxConstOp =
         rewriter.replaceOpWithNewOp<calyx::ConstantOp>(constOp, floatAttr);
