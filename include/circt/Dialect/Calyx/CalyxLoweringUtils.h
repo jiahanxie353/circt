@@ -16,6 +16,7 @@
 
 #include "circt/Dialect/Calyx/CalyxHelpers.h"
 #include "circt/Dialect/Calyx/CalyxOps.h"
+#include "circt/Dialect/Calyx/json.hpp"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Support/LLVM.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -32,6 +33,8 @@
 
 namespace circt {
 namespace calyx {
+
+using json = nlohmann::json;
 
 void appendPortsForExternalMemref(PatternRewriter &rewriter, StringRef memName,
                                   Value memref, unsigned memoryID,
@@ -426,7 +429,14 @@ public:
     return builder.create<TLibraryOp>(loc, getUniqueName(name), resTypes);
   }
 
+  json &getExtMemData() { return extMemData; }
+
+  const json &getExtMemData() const { return extMemData; }
+
+  void setExtMemData(const json &data) { extMemData = data; }
+
 private:
+  json extMemData;
   /// The component which this lowering state is associated to.
   calyx::ComponentOp component;
 

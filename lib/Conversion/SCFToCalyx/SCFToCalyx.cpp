@@ -15,6 +15,7 @@
 #include "circt/Dialect/Calyx/CalyxHelpers.h"
 #include "circt/Dialect/Calyx/CalyxLoweringUtils.h"
 #include "circt/Dialect/Calyx/CalyxOps.h"
+#include "circt/Dialect/Calyx/json.hpp"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Support/LLVM.h"
@@ -31,8 +32,9 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include <fstream>
 
-#include <variant>
+using json = nlohmann::json;
 
 using namespace llvm;
 using namespace mlir;
@@ -324,6 +326,13 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
                                  : WalkResult::interrupt();
     });
 
+    std::ofstream outFile("data.json");
+    if (outFile.is_open()) {
+      outFile << getState<ComponentLoweringState>().getExtMemData().dump(2);
+      outFile.close();
+    } else {
+      llvm::errs() << "Unable to open file for writing\n";
+    }
     return success(opBuiltSuccessfully);
   }
 
@@ -867,6 +876,70 @@ static LogicalResult buildAllocOp(ComponentLoweringState &componentState,
                     IntegerAttr::get(rewriter.getI1Type(), llvm::APInt(1, 1)));
   componentState.registerMemoryInterface(allocOp.getResult(),
                                          calyx::MemoryInterface(memoryOp));
+
+  if (isa<memref::GetGlobalOp>(allocOp)) {
+    auto getGlobalOp = cast<memref::GetGlobalOp>(allocOp);
+    auto shape = getGlobalOp.getType().getShape();
+    std::vector<int> dimensions;
+    for (auto dim : shape) {
+      dimensions.push_back(dim);
+    }
+
+    // Flatten the values in the attribute
+    auto *symbolTableOp =
+        getGlobalOp->template getParentWithTrait<mlir::OpTrait::SymbolTable>();
+    auto globalOp = dyn_cast_or_null<memref::GlobalOp>(
+        SymbolTable::lookupSymbolIn(symbolTableOp, getGlobalOp.getNameAttr()));
+    auto cstAttr = llvm::dyn_cast_or_null<DenseElementsAttr>(
+        globalOp.getConstantInitValue());
+    std::vector<float> flattenedVals;
+    for (auto attr : cstAttr.template getValues<Attribute>()) {
+      if (auto fltAttr = dyn_cast<mlir::FloatAttr>(attr)) {
+        flattenedVals.push_back(fltAttr.getValueAsDouble());
+      }
+    }
+
+    json *extMemData = &componentState.getExtMemData();
+    json result = json::array();
+
+    // Helper function to get the correct indices
+    auto getIndices = [&dimensions](int flatIndex) {
+      std::vector<int> indices(dimensions.size(), 0);
+      for (int i = dimensions.size() - 1; i >= 0; --i) {
+        indices[i] = flatIndex % dimensions[i];
+        flatIndex /= dimensions[i];
+      }
+      return indices;
+    };
+
+    // Put the flattened values in the multi-dimensional structure
+    for (size_t i = 0; i < flattenedVals.size(); ++i) {
+      std::vector<int> indices = getIndices(i);
+      json *nested = &result;
+      for (size_t j = 0; j < indices.size() - 1; ++j) {
+        while (nested->size() <= static_cast<json::size_type>(indices[j])) {
+          nested->push_back(json::array());
+        }
+        nested = &(*nested)[indices[j]];
+      }
+      nested->push_back(flattenedVals[i]);
+    }
+
+    (*extMemData)[memoryOp.getName()]["data"] = result;
+    auto width = memtype.getElementType().getIntOrFloatBitWidth();
+
+    std::string numType;
+    if (memtype.getElementType().isInteger())
+      numType = "bitnum";
+    else
+      numType = "floating_point";
+
+    (*extMemData)[memoryOp.getName()]["format"] = {
+        {"numeric_type", numType}, {"is_signed", true}, {"width", width}};
+
+    rewriter.eraseOp(globalOp);
+  }
+
   return success();
 }
 
