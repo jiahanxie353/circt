@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "PassDetail.h"
+#include "circt/Support/LLVM.h"
 #include "circt/Transforms/Passes.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
@@ -24,7 +25,9 @@
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/MathExtras.h"
+#include <cstdint>
 
 using namespace mlir;
 using namespace circt;
@@ -99,6 +102,56 @@ static bool hasMultiDimMemRef(ValueRange values) {
 }
 
 namespace {
+struct GlobalOpConversion : public OpConversionPattern<memref::GlobalOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(memref::GlobalOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    MemRefType type = op.getType();
+    if (isUniDimensional(type) || !type.hasStaticShape())
+      return failure();
+    MemRefType newType = MemRefType::get(
+        SmallVector<int64_t>{type.getNumElements()}, type.getElementType());
+    auto cstAttr = llvm::dyn_cast_or_null<DenseElementsAttr>(op.getConstantInitValue());
+    std::vector<float> flattenedVals;
+    for (auto attr : cstAttr.template getValues<Attribute>()) {
+      if (auto fltAttr = dyn_cast<mlir::FloatAttr>(attr)) {
+        flattenedVals.push_back(fltAttr.getValueAsDouble());
+      }
+    }
+    llvm::ArrayRef<float> flattenedValsRef(flattenedVals);
+    auto newTypeAttr = TypeAttr::get(newType);
+    auto newNameAttr = rewriter.getStringAttr(llvm::formatv("@__constant_{0}xf32", flattenedVals.size()));
+    RankedTensorType tensorType = RankedTensorType::get({static_cast<int64_t>(flattenedVals.size())}, rewriter.getF32Type());
+    auto newInitValue = DenseElementsAttr::get(tensorType, flattenedValsRef);
+
+    rewriter.replaceOpWithNewOp<memref::GlobalOp>(op, newNameAttr, op.getSymVisibilityAttr(), newTypeAttr, newInitValue, op.getConstantAttr(), op.getAlignmentAttr());
+    return success();
+  }
+};
+
+struct GetGlobalOpConversion : public OpConversionPattern<memref::GetGlobalOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(memref::GetGlobalOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto *symbolTableOp = op->getParentWithTrait<mlir::OpTrait::SymbolTable>();
+    auto globalOp = dyn_cast_or_null<memref::GlobalOp>(
+        SymbolTable::lookupSymbolIn(symbolTableOp, op.getNameAttr()));
+
+    MemRefType type = globalOp.getType();
+    if (isUniDimensional(type) || !type.hasStaticShape())
+      return failure();
+    MemRefType newType = MemRefType::get(
+        SmallVector<int64_t>{type.getNumElements()}, type.getElementType());
+    auto newName =  llvm::formatv("@__constant_{0}xf32", type.getNumElements());
+    rewriter.replaceOpWithNewOp<memref::GetGlobalOp>(op, newType, rewriter.getStringAttr(newName));
+
+    return success();
+  }
+};
 
 struct LoadOpConversion : public OpConversionPattern<memref::LoadOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -249,6 +302,12 @@ static void populateFlattenMemRefsLegality(ConversionTarget &target) {
       [](memref::StoreOp op) { return op.getIndices().size() == 1; });
   target.addDynamicallyLegalOp<memref::LoadOp>(
       [](memref::LoadOp op) { return op.getIndices().size() == 1; });
+  target.addDynamicallyLegalOp<memref::GetGlobalOp>(
+      [](memref::GetGlobalOp op) { return isUniDimensional(op.getType()); }
+  );
+  target.addDynamicallyLegalOp<memref::GlobalOp>(
+      [](memref::GlobalOp op) { return isUniDimensional(op.getType()); }
+  );
 
   addGenericLegalityConstraint<mlir::cf::CondBranchOp, mlir::cf::BranchOp,
                                func::CallOp, func::ReturnOp, memref::DeallocOp,
@@ -258,13 +317,13 @@ static void populateFlattenMemRefsLegality(ConversionTarget &target) {
     auto argsConverted = llvm::none_of(op.getBlocks(), [](auto &block) {
       return hasMultiDimMemRef(block.getArguments());
     });
-
+    
     auto resultsConverted = llvm::all_of(op.getResultTypes(), [](Type type) {
       if (auto memref = dyn_cast<MemRefType>(type))
         return isUniDimensional(memref);
       return true;
     });
-
+    
     return argsConverted && resultsConverted;
   });
 }
@@ -279,7 +338,6 @@ static Value materializeSubViewFlattening(OpBuilder &builder, MemRefType type,
   MemRefType sourceType = cast<MemRefType>(inputs[0].getType());
   int64_t memSize = sourceType.getNumElements();
   unsigned dims = sourceType.getShape().size();
-
   // Build offset, sizes and strides
   SmallVector<OpFoldResult> sizes(dims, builder.getIndexAttr(0));
   SmallVector<OpFoldResult> offsets(dims, builder.getIndexAttr(1));
@@ -307,7 +365,6 @@ static void populateTypeConversionPatterns(TypeConverter &typeConverter) {
 struct FlattenMemRefPass : public FlattenMemRefBase<FlattenMemRefPass> {
 public:
   void runOnOperation() override {
-
     auto *ctx = &getContext();
     TypeConverter typeConverter;
     populateTypeConversionPatterns(typeConverter);
@@ -315,6 +372,7 @@ public:
     RewritePatternSet patterns(ctx);
     SetVector<StringRef> rewrittenCallees;
     patterns.add<LoadOpConversion, StoreOpConversion, AllocOpConversion,
+                 GetGlobalOpConversion, GlobalOpConversion,
                  OperandConversionPattern<func::ReturnOp>,
                  OperandConversionPattern<memref::DeallocOp>,
                  CondBranchOpConversion,
@@ -326,7 +384,6 @@ public:
 
     ConversionTarget target(*ctx);
     populateFlattenMemRefsLegality(target);
-
     if (applyPartialConversion(getOperation(), target, std::move(patterns))
             .failed()) {
       signalPassFailure();

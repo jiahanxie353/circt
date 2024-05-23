@@ -825,7 +825,7 @@ void Emitter::emitMemory(MemoryOp memory) {
     return;
   }
   indent() << getAttributes(memory, /*atFormat=*/true) << memory.instanceName()
-           << space() << equals() << space() << "std_mem_d"
+           << space() << equals() << space() << "comb_mem_d"
            << std::to_string(dimension) << LParen() << memory.getWidth()
            << comma();
   for (Attribute size : memory.getSizes()) {

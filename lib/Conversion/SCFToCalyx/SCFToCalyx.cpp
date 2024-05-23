@@ -861,13 +861,13 @@ static LogicalResult buildAllocOp(ComponentLoweringState &componentState,
     sizes.push_back(1);
     addrSizes.push_back(1);
   }
-  calyx::SeqMemoryOp memoryOp;
+  calyx::MemoryOp memoryOp;
   if (isa<IntegerType>(memtype.getElementType()))
-    memoryOp = rewriter.create<calyx::SeqMemoryOp>(
+    memoryOp = rewriter.create<calyx::MemoryOp>(
         allocOp.getLoc(), componentState.getUniqueName("mem"),
         memtype.getElementType().getIntOrFloatBitWidth(), sizes, addrSizes);
   else
-    memoryOp = rewriter.create<calyx::SeqMemoryOp>(
+    memoryOp = rewriter.create<calyx::MemoryOp>(
         allocOp.getLoc(), componentState.getUniqueName("mem"),
         memtype.getElementType(), sizes, addrSizes);
   // Externalize memories by default. This makes it easier for the native
@@ -2297,7 +2297,7 @@ void SCFToCalyxPass::runOnOperation() {
   /// Creates a new Calyx component for each FuncOp in the inpurt module.
   addOncePattern<FuncOpConversion>(loweringPatterns, patternState, funcMap,
                                    *loweringState);
-
+  
   /// This pass inlines scf.ExecuteRegionOp's by adding control-flow.
   addGreedyPattern<InlineExecuteRegionOpPattern>(loweringPatterns);
 
@@ -2308,7 +2308,7 @@ void SCFToCalyxPass::runOnOperation() {
   /// This pattern creates registers for all basic-block arguments.
   addOncePattern<calyx::BuildBasicBlockRegs>(loweringPatterns, patternState,
                                              funcMap, *loweringState);
-
+  
   addOncePattern<calyx::BuildCallInstance>(loweringPatterns, patternState,
                                            funcMap, *loweringState);
 
@@ -2339,7 +2339,7 @@ void SCFToCalyxPass::runOnOperation() {
   /// values in the source program.
   addOncePattern<BuildOpGroups>(loweringPatterns, patternState, funcMap,
                                 *loweringState);
-
+  
   /// This pattern traverses the CFG of the program and generates a control
   /// schedule based on the calyx::GroupOp's which were registered for each
   /// basic block in the source function.

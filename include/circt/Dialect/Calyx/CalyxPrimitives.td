@@ -165,7 +165,14 @@ def MemoryOp : CalyxPrimitive<"memory", []> {
       "int64_t":$width,
       "ArrayRef<int64_t>":$sizes,
       "ArrayRef<int64_t>":$addrSizes
+    )>,
+    OpBuilder<(ins
+      "StringRef":$sym_name,
+      "Type":$type,
+      "ArrayRef<int64_t>":$sizes,
+      "ArrayRef<int64_t>":$addrSizes
     )>
+
   ];
 
   let extraClassDeclaration = [{
@@ -179,8 +186,9 @@ def MemoryOp : CalyxPrimitive<"memory", []> {
     Value writeData() { return getResult(getNumDimensions()); }
     Value writeEn()   { return getResult(getNumDimensions() + 1); }
     Value clk()       { return getResult(getNumDimensions() + 2); }
-    Value readData()  { return getResult(getNumDimensions() + 3); }
-    Value done()      { return getResult(getNumDimensions() + 4); }
+    Value reset()     { return getResult(getNumDimensions() + 3); }
+    Value readData()  { return getResult(getNumDimensions() + 4); }
+    Value done()      { return getResult(getNumDimensions() + 5); }
   }];
 
   let extraClassDefinition = [{
