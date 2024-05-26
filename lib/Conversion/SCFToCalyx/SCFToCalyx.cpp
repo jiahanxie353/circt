@@ -506,7 +506,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
     // can significantly decrease the maximum achievable frequency.
     auto reg = createRegister(
         loadOp.getLoc(), rewriter, getComponent(),
-        loadOp.getMemRefType().getElementTypeBitWidth(),
+        loadOp.getMemRefType().getElementType(),
         getState<ComponentLoweringState>().getUniqueName("load"));
     rewriter.setInsertionPointToEnd(group.getBodyBlock());
     rewriter.create<calyx::AssignOp>(loadOp.getLoc(), reg.getIn(),
@@ -668,7 +668,7 @@ static LogicalResult buildAllocOp(ComponentLoweringState &componentState,
   }
   auto memoryOp = rewriter.create<calyx::SeqMemoryOp>(
       allocOp.getLoc(), componentState.getUniqueName("mem"),
-      memtype.getElementType().getIntOrFloatBitWidth(), sizes, addrSizes);
+      memtype.getElementType(), sizes, addrSizes);
   // Externalize memories by default. This makes it easier for the native
   // compiler to provide initialized memories.
   memoryOp->setAttr("external",
