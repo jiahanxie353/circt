@@ -152,7 +152,7 @@ def MemoryOp : CalyxPrimitive<"memory", []> {
   );
 
   let results = (outs
-    Variadic<AnySignlessInteger>:$results
+    Variadic<AnyTypeOf<[AnySignlessInteger, AnyFloat]>>:$results
   );
 
   let assemblyFormat = [{
@@ -222,7 +222,7 @@ def SeqMemoryOp : CalyxPrimitive<"seq_mem", []> {
   );
 
   let results = (outs
-    Variadic<AnySignlessInteger>:$results
+    Variadic<AnyTypeOf<[AnySignlessInteger, AnyFloat]>>:$results
   );
 
   let assemblyFormat = [{
@@ -234,7 +234,7 @@ def SeqMemoryOp : CalyxPrimitive<"seq_mem", []> {
   let builders = [
     OpBuilder<(ins
       "StringRef":$sym_name,
-      "int64_t":$width,
+      "Type":$type,
       "ArrayRef<int64_t>":$sizes,
       "ArrayRef<int64_t>":$addrSizes
     )>
