@@ -279,7 +279,7 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
                              AndIOp, XOrIOp, OrIOp, ExtUIOp, ExtSIOp, TruncIOp,
                              MulIOp, DivUIOp, DivSIOp, RemUIOp, RemSIOp,
                              /// floating point
-                             AddFOp, MulFOp,
+                             AddFOp, MulFOp, CmpFOp,
                              /// other
                              SelectOp, IndexCastOp, CallOp>(
                   [&](auto op) { return buildOp(rewriter, op).succeeded(); })
@@ -316,6 +316,7 @@ private:
   LogicalResult buildOp(PatternRewriter &rewriter, RemSIOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, AddFOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, MulFOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter, CmpFOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, ShRUIOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, ShRSIOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, ShLIOp op) const;
@@ -707,6 +708,32 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
               {one, one, one, one, width, width, three, width, five, one});
   return buildLibraryBinaryPipeOp<calyx::MulFNOp>(rewriter, mulf, mulFN,
                                                   mulFN.getOut());
+}
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     CmpFOp op) const {
+  switch (op.getPredicate()) {
+  case CmpFPredicate::UEQ:
+  case CmpFPredicate::OEQ:
+    return buildLibraryOp<calyx::CombGroupOp, calyx::EqLibOp>(rewriter, op);
+  case CmpFPredicate::UNE:
+  case CmpFPredicate::ONE:
+    return buildLibraryOp<calyx::CombGroupOp, calyx::NeqLibOp>(rewriter, op);
+  case CmpFPredicate::UGE:
+  case CmpFPredicate::OGE:
+    return buildLibraryOp<calyx::CombGroupOp, calyx::SgeLibOp>(rewriter, op);
+  case CmpFPredicate::ULT:
+  case CmpFPredicate::OLT:
+    return buildLibraryOp<calyx::CombGroupOp, calyx::SltLibOp>(rewriter, op);
+  case CmpFPredicate::UGT:
+  case CmpFPredicate::OGT:
+    return buildLibraryOp<calyx::CombGroupOp, calyx::SgtLibOp>(rewriter, op);
+  case CmpFPredicate::ULE:
+  case CmpFPredicate::OLE:
+    return buildLibraryOp<calyx::CombGroupOp, calyx::SleLibOp>(rewriter, op);
+  default:
+    llvm_unreachable("unexpected comparison predicate");
+  }
 }
 
 template <typename TAllocOp>
@@ -1905,7 +1932,7 @@ public:
                       ShRSIOp, AndIOp, XOrIOp, OrIOp, ExtUIOp, TruncIOp,
                       CondBranchOp, BranchOp, MulIOp, DivUIOp, DivSIOp, RemUIOp,
                       RemSIOp, ReturnOp, arith::ConstantOp, IndexCastOp, FuncOp,
-                      ExtSIOp, CallOp, AddFOp, MulFOp>();
+                      ExtSIOp, CallOp, AddFOp, MulFOp, CmpFOp>();
 
     RewritePatternSet legalizePatterns(&getContext());
     legalizePatterns.add<DummyPattern>(&getContext());
