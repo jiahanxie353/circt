@@ -181,9 +181,9 @@ struct GlobalOpConversion : public OpConversionPattern<memref::GlobalOp> {
     }
 
     auto newTypeAttr = TypeAttr::get(newType);
-    std::string constName = op.getConstantAttrName().str();
-    auto newNameAttr = rewriter.getStringAttr(llvm::formatv(
-        "{0}_{1}x{2}", constName, flattenedVals.size(), type.getElementType()));
+    auto newNameAttr = rewriter.getStringAttr(
+        llvm::formatv("{0}_{1}x{2}", op.getConstantAttrName(),
+                      flattenedVals.size(), type.getElementType()));
     RankedTensorType tensorType = RankedTensorType::get(
         {static_cast<int64_t>(flattenedVals.size())}, type.getElementType());
     auto newInitValue = DenseElementsAttr::get(tensorType, flattenedVals);
