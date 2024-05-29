@@ -120,6 +120,8 @@ struct MemoryInterface {
   std::optional<Value> doneOpt();
   ValueRange addrPorts();
 
+  bool isSeqMem();
+
 private:
   std::variant<calyx::MemoryOp, calyx::SeqMemoryOp, MemoryPortsImpl> impl;
 };
