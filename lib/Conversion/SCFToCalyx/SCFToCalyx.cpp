@@ -555,7 +555,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      zeroI1);
     regWriteEn = memoryInterface.done();
     if (calyx::noStoresToMemory(memref) &&
-        calyx::singleLoadFromMemory(memref)) {
+        calyx::singleLoadFromMemory(memref) && !memoryInterface.isSeqMem()) {
       // Single load from memory; we do not need to write the output to a
       // register. The readData value will be held until contentEn is asserted
       // again

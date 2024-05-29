@@ -169,6 +169,10 @@ MemoryInterface::MemoryInterface(const MemoryPortsImpl &ports) : impl(ports) {
 MemoryInterface::MemoryInterface(calyx::MemoryOp memOp) : impl(memOp) {}
 MemoryInterface::MemoryInterface(calyx::SeqMemoryOp memOp) : impl(memOp) {}
 
+bool MemoryInterface::isSeqMem() {
+  return std::holds_alternative<calyx::SeqMemoryOp>(impl);
+}
+
 Value MemoryInterface::readData() {
   auto readData = readDataOpt();
   assert(readData.has_value() && "Memory does not have readData");
