@@ -549,6 +549,31 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      memoryInterface.contentEn(), oneI1);
     rewriter.create<calyx::AssignOp>(loadOp.getLoc(), memoryInterface.writeEn(),
                                      zeroI1);
+
+    // Writing to calyx.seq_mem even when content_en = 1 and write_en = 0.
+    // This is because calyx.seq_mem has write_together attribute for write_en
+    // and write_data. But since the value of write_data doesn't matter, we just
+    // create bitvector with 0's.
+    if (memoryInterface.isSeqMem()) {
+      auto memOperand = llvm::cast<MemRefType>(loadOp.getOperand(0).getType());
+      Value writeZero;
+      if (auto floatType = cast<FloatType>(memOperand.getElementType())) {
+        auto wrZeroFlt = rewriter.getFloatAttr(
+            memOperand.getElementType(),
+            APFloat::getZero(floatType.getFloatSemantics()));
+        writeZero =
+            rewriter.create<calyx::ConstantOp>(loadOp.getLoc(), wrZeroFlt);
+      } else {
+        auto wrZeroInt = rewriter.getIntegerAttr(
+            memOperand.getElementType(),
+            APInt::getZero(
+                memOperand.getElementType().getIntOrFloatBitWidth()));
+        writeZero = rewriter.create<hw::ConstantOp>(loadOp.getLoc(), wrZeroInt);
+      }
+      rewriter.create<calyx::AssignOp>(loadOp.getLoc(),
+                                       memoryInterface.writeData(), writeZero);
+    }
+
     regWriteEn = memoryInterface.done();
     if (calyx::noStoresToMemory(memref) &&
         calyx::singleLoadFromMemory(memref) && !memoryInterface.isSeqMem()) {
