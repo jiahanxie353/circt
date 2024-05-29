@@ -432,6 +432,16 @@ public:
 
   const json &getExtMemData() const { return extMemData; }
 
+  void setDataField(StringRef name, const json::array_t &data) {
+    extMemData[name]["data"] = data;
+  }
+
+  void setFormat(StringRef name, std::string numType, bool isSigned,
+                 unsigned width) {
+    extMemData[name]["format"] = {
+        {"numeric_type", numType}, {"is_signed", true}, {"width", width}};
+  }
+
 private:
   /// The component which this lowering state is associated to.
   calyx::ComponentOp component;
