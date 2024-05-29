@@ -30,6 +30,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
+#include <fstream>
 
 #include <variant>
 
@@ -299,6 +300,14 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
       return opBuiltSuccessfully ? WalkResult::advance()
                                  : WalkResult::interrupt();
     });
+
+    std::ofstream outFile("data.json");
+    if (outFile.is_open()) {
+      outFile << getState<ComponentLoweringState>().getExtMemData().dump(2);
+      outFile.close();
+    } else {
+      llvm::errs() << "Unable to open file for writing\n";
+    }
 
     return success(opBuiltSuccessfully);
   }
