@@ -185,4 +185,11 @@ def GoInsertion : Pass<"calyx-go-insertion", "calyx::ComponentOp"> {
   let constructor = "circt::calyx::createGoInsertionPass()";
 }
 
+def SubConditionals : Pass<"calyx-sub-conditionals", "mlir::func::FuncOp"> {
+  let summary = "TODO";
+  let description = [{TODO}];
+  let constructor = "circt::calyx::createSubConditionalsPass()";
+  let dependentDialects = ["mlir::arith::ArithDialect"];
+}
+
 #endif // CIRCT_DIALECT_CALYX_CALYXPASSES_TD
