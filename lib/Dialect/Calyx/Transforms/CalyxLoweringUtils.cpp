@@ -60,14 +60,14 @@ void appendPortsForExternalMemref(PatternRewriter &rewriter, StringRef memName,
       memrefType.getElementType(), calyx::Direction::Input,
       DictionaryAttr::get(rewriter.getContext(),
                           {getMemoryInterfaceAttr("read_data")})});
-
+ 
   // Done
   inPorts.push_back(
       calyx::PortInfo{rewriter.getStringAttr(memName + "_done"),
                       rewriter.getI1Type(), calyx::Direction::Input,
                       DictionaryAttr::get(rewriter.getContext(),
                                           {getMemoryInterfaceAttr("done")})});
-
+  
   // Write data
   outPorts.push_back(calyx::PortInfo{
       rewriter.getStringAttr(memName + "_write_data"),
@@ -130,10 +130,14 @@ bool noStoresToMemory(Value memoryReference) {
 }
 
 Value getComponentOutput(calyx::ComponentOp compOp, unsigned outPortIdx) {
-  size_t index = compOp.getInputPortInfo().size() + outPortIdx;
-  assert(index < compOp.getNumArguments() &&
+  size_t index = /* compOp.getInputPortInfo().size() + */outPortIdx;
+  llvm::errs() << "compOp getInputPortInfo size: " << compOp.getInputPortInfo().size() << "\n";
+  llvm::errs() << "compOp getNumArguments: " << compOp.getNumArguments() << "\n";
+  llvm::errs() << "compOp entryBlock num args: " << compOp.getBlocks().front().getNumArguments() << "\n";
+  assert(index < (/*compOp.getNumArguments() + */compOp.getNumResults()) &&
          "Exceeded number of arguments in the Component");
-  return compOp.getArgument(index);
+  //return compOp.getArgument(index - compOp.getNumArguments());
+  return compOp.getResult(index);
 }
 
 Type convIndexType(OpBuilder &builder, Type type) {

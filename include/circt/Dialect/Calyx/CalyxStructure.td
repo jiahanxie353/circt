@@ -75,7 +75,7 @@ def ComponentOp : CalyxOp<"component", [
     ArrayAttr:$portAttributes,
     APIntAttr:$portDirections
   );
-  let results = (outs);
+  let results = (outs Variadic<AnyType>: $results);
   let regions = (region SizedRegion<1>: $body);
 
   let builders = [
@@ -89,6 +89,15 @@ def ComponentOp : CalyxOp<"component", [
       // Implement RegionKindInterface.
       static RegionKind getRegionKind(unsigned index) { return RegionKind::Graph;}
 
+      /// Returns all types (arguments and results) of this function.
+      SmallVector<Type, 8> getPortTypes();
+      
+      /// Returns all results of the component  
+      /// SmallVector<Value, 8> getResults();
+      
+      /// Returns the number of results of this function.
+      unsigned getNumResults() { return getResultTypes().size(); }
+      
       /// Returns the argument types of this function.
       ArrayRef<Type> getArgumentTypes() { return getFunctionType().getInputs(); }
 
@@ -110,6 +119,12 @@ def ComponentOp : CalyxOp<"component", [
                              "' attribute of function type");
         return success();
       }
+    
+      /// Gets the input port names of a Calyx component.
+      ArrayAttr getInputPortNames();
+
+      /// Gets the output port names of a Calyx component.
+      ArrayAttr getOutputPortNames();
 
       /// Returns the WiresOp of a Calyx Component.
       WiresOp getWiresOp();

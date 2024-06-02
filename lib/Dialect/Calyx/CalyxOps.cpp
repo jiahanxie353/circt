@@ -15,6 +15,7 @@
 #include "circt/Dialect/HW/HWAttributes.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
+#include "circt/Support/LLVM.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -565,12 +566,14 @@ static void buildComponentLike(OpBuilder &builder, OperationState &result,
     (isInput ? portIOAttributes.first : portIOAttributes.second)
         .push_back(port.attributes);
   }
+  auto inputTypes = portIOTypes.first;
+  auto outputTypes = portIOTypes.second;
   auto portTypes = concat(portIOTypes.first, portIOTypes.second);
   auto portNames = concat(portIONames.first, portIONames.second);
   auto portAttributes = concat(portIOAttributes.first, portIOAttributes.second);
 
   // Build the function type of the component.
-  auto functionType = builder.getFunctionType(portTypes, {});
+  auto functionType = builder.getFunctionType(inputTypes, outputTypes);
   if (combinational) {
     result.addAttribute(CombComponentOp::getFunctionTypeAttrName(result.name),
                         TypeAttr::get(functionType));
@@ -592,10 +595,14 @@ static void buildComponentLike(OpBuilder &builder, OperationState &result,
   Region *region = result.addRegion();
   Block *body = new Block();
   region->push_back(body);
-
+  
   // Add all ports to the body.
-  body->addArguments(portTypes, SmallVector<Location, 4>(
-                                    portTypes.size(), builder.getUnknownLoc()));
+  body->addArguments(inputTypes, SmallVector<Location, 4>(
+                                    inputTypes.size(), builder.getUnknownLoc()));
+  // Store the output types separately to handle results.
+  for (Type resultType : outputTypes) {
+    result.addTypes(resultType);
+  }
 
   // Insert the WiresOp and ControlOp.
   IRRewriter::InsertionGuard guard(builder);
@@ -635,6 +642,52 @@ static Value getBlockArgumentWithName(StringRef name, ComponentOp op) {
   return Value{};
 }
 
+//SmallVector<Value, 8> ComponentOp::getResults() {
+//  SmallVector<Value, 8> results;
+//  for (auto result : getOperation()->getResults()) {
+//    results.push_back(result);
+//  }
+//  return results;
+//}
+
+
+ArrayAttr ComponentOp::getInputPortNames() {
+  ArrayAttr portNamesAttr = getPortNames();
+  APInt portDirectionsAttr = getPortDirections();
+  SmallVector<Attribute> inputPortNames;
+
+  for (size_t i = 0, e = portNamesAttr.size(); i != e; ++i) {
+    if (direction::get(portDirectionsAttr[i]) == Direction::Input) {
+      inputPortNames.push_back(portNamesAttr[i]);
+    }
+  }
+
+  return ArrayAttr::get(portNamesAttr.getContext(), inputPortNames);
+}
+
+ArrayAttr ComponentOp::getOutputPortNames() {
+  ArrayAttr portNamesAttr = getPortNames();
+  APInt portDirectionsAttr = getPortDirections();
+  SmallVector<Attribute> outputPortNames;
+
+  for (size_t i = 0, e = portNamesAttr.size(); i != e; ++i) {
+    if (direction::get(portDirectionsAttr[i]) == Direction::Output) {
+      outputPortNames.push_back(portNamesAttr[i]);
+    }
+  }
+
+  return ArrayAttr::get(portNamesAttr.getContext(), outputPortNames);
+}
+
+SmallVector<Type, 8> calyx::ComponentOp::getPortTypes() {
+  SmallVector<Type, 8> res;
+  auto inputPortTypes = getArgumentTypes();
+  auto outputPortTypes = getResultTypes();
+  res.append(inputPortTypes.begin(), inputPortTypes.end());
+  res.append(outputPortTypes.begin(), outputPortTypes.end());
+  return res;
+}
+
 WiresOp calyx::ComponentOp::getWiresOp() {
   return getControlOrWiresFrom<WiresOp>(*this);
 }
@@ -660,7 +713,7 @@ Value calyx::ComponentOp::getResetPort() {
 }
 
 SmallVector<PortInfo> ComponentOp::getPortInfo() {
-  auto portTypes = getArgumentTypes();
+  auto portTypes = getPortTypes();
   ArrayAttr portNamesAttr = getPortNames(), portAttrs = getPortAttributes();
   APInt portDirectionsAttr = getPortDirections();
 
@@ -1462,9 +1515,10 @@ static LogicalResult verifyAssignOpValue(AssignOp op, bool isDestination) {
     return verifyPortDirection(op, value, isDestination);
 
   // A destination may also be the Go or Done hole of a GroupOp.
-  if (isDestination && !isa<GroupGoOp, GroupDoneOp>(value.getDefiningOp()))
+  if (isDestination && !isa<GroupGoOp, GroupDoneOp>(value.getDefiningOp())) {
     return op->emitOpError(
         "has an invalid destination port. It must be drive-able.");
+  }
   else if (isSource)
     return verifyNotComplexSource(op);
 
@@ -1545,8 +1599,10 @@ void AssignOp::print(OpAsmPrinter &p) {
 /// invalid IR.
 ComponentInterface InstanceOp::getReferencedComponent() {
   auto module = (*this)->getParentOfType<ModuleOp>();
-  if (!module)
+  if (!module) {
+    llvm::errs() << "not module, return null\n";
     return nullptr;
+  }
 
   return module.lookupSymbol<ComponentInterface>(getComponentName());
 }
@@ -2796,6 +2852,7 @@ getHwModuleExtGoOrDonePortNumber(hw::HWModuleExternOp &moduleExternOp,
 }
 
 LogicalResult InvokeOp::verify() {
+  llvm::errs() << "verifying invokeOp\n";
   ComponentOp componentOp = (*this)->getParentOfType<ComponentOp>();
   StringRef callee = getCallee();
   Operation *operation = componentOp.lookupSymbol(callee);
@@ -2816,6 +2873,8 @@ LogicalResult InvokeOp::verify() {
             RemSPipeLibOp, RemUPipeLibOp>(
           [&](auto op) { goPortNum = 1, donePortNum = 1; })
       .Case<InstanceOp>([&](auto op) {
+        llvm::errs() << "referenced comp: \n";
+        llvm::errs() << op.getReferencedComponent() << "\n";
         auto portInfo = op.getReferencedComponent().getPortInfo();
         for (PortInfo info : portInfo) {
           if (info.hasAttribute(goPort))
