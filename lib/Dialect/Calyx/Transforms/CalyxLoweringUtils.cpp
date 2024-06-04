@@ -131,9 +131,6 @@ bool noStoresToMemory(Value memoryReference) {
 
 Value getComponentOutput(calyx::ComponentOp compOp, unsigned outPortIdx) {
   size_t index = /* compOp.getInputPortInfo().size() + */outPortIdx;
-  llvm::errs() << "compOp getInputPortInfo size: " << compOp.getInputPortInfo().size() << "\n";
-  llvm::errs() << "compOp getNumArguments: " << compOp.getNumArguments() << "\n";
-  llvm::errs() << "compOp entryBlock num args: " << compOp.getBlocks().front().getNumArguments() << "\n";
   assert(index < (/*compOp.getNumArguments() + */compOp.getNumResults()) &&
          "Exceeded number of arguments in the Component");
   //return compOp.getArgument(index - compOp.getNumArguments());
@@ -759,7 +756,8 @@ BuildBasicBlockRegs::partiallyLowerFuncToComp(mlir::func::FuncOp funcOp,
 LogicalResult
 BuildReturnRegs::partiallyLowerFuncToComp(mlir::func::FuncOp funcOp,
                                           PatternRewriter &rewriter) const {
-
+  llvm::errs() << "funcOp result types size: " << funcOp.getResultTypes().size() << "\n";
+  llvm::errs() << "compOp results size: " << getComponent().getResults().size() << "\n";
   for (auto argType : enumerate(funcOp.getResultTypes())) {
     auto convArgType = calyx::convIndexType(rewriter, argType.value());
     assert((isa<IntegerType>(convArgType) || isa<FloatType>(convArgType)) &&
@@ -771,6 +769,9 @@ BuildReturnRegs::partiallyLowerFuncToComp(mlir::func::FuncOp funcOp,
 
     rewriter.setInsertionPointToStart(
         getComponent().getWiresOp().getBodyBlock());
+    llvm::errs() << "getFuncOpResultMapping(argType.index): " << getState().getFuncOpResultMapping(argType.index()) << "\n";
+    llvm::errs() << "getComponentOutput: \n";
+    calyx::getComponentOutput(getComponent(), getState().getFuncOpResultMapping(argType.index())).dump();
     rewriter.create<calyx::AssignOp>(
         funcOp->getLoc(),
         calyx::getComponentOutput(

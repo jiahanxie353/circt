@@ -480,7 +480,6 @@ private:
     IRRewriter::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToEnd(group.getBody());
     auto addrPorts = memoryInterface.addrPorts();
-    llvm::errs() << "Assigning address ports\n";
     if (addressValues.empty()) {
       assert(
           addrPorts.size() == 1 &&
@@ -495,8 +494,9 @@ private:
              "Mismatch between number of address ports of the provided memory "
              "and address assignment values");
       for (auto address : enumerate(addressValues)) {
-        llvm::errs() << "addrPorts[addr]: \n";
-        addrPorts[address.index()].dump();
+        llvm::errs() << "addrPorts[addr] getDefiningOp: \n";
+        addrPorts[address.index()].getDefiningOp()->dump();
+        addrPorts[address.index()].getType().dump();
         llvm::errs() << "address value: \n";
         address.value().dump();
         rewriter.create<calyx::AssignOp>(loc, addrPorts[address.index()],
@@ -511,12 +511,10 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   Value memref = loadOp.getMemref();
   auto memoryInterface =
       getState<ComponentLoweringState>().getMemoryInterface(memref);
-  llvm::errs() << "memoryInterface readData: \n";
-  memoryInterface.readData().dump();
-  llvm::errs() << "memoryInterface addrPorts: \n";
-  for (auto port : memoryInterface.addrPorts())
-    port.dump();
   auto group = createGroupForOp<calyx::GroupOp>(rewriter, loadOp);
+  llvm::errs() << "loadOp getIndices:\n";
+  for (auto id : loadOp.getIndices())
+    id.dump();
   assignAddressPorts(rewriter, loadOp.getLoc(), group, memoryInterface,
                      loadOp.getIndices());
 
@@ -1421,13 +1419,9 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
       unsigned inPortsIt = extMemPortIndices.getSecond().first;
       unsigned outPortsIt = extMemPortIndices.getSecond().second;
       extMemPorts.readData = compOp.getArgument(inPortsIt++);
-      llvm::errs() << "extMemPorts readData: \n";
-      extMemPorts.readData->dump();
       extMemPorts.done = compOp.getArgument(inPortsIt);
       auto results = compOp.getResults();
       extMemPorts.writeData = results[outPortsIt++];
-      llvm::errs() << "extMemPorts writeData type: \n";
-      extMemPorts.writeData->getType().dump();
       unsigned nAddresses =
           cast<MemRefType>(extMemPortIndices.getFirst().getType())
               .getShape()
@@ -1456,63 +1450,61 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
       SmallVector<Type, 4> resultTypes(compOp.getResultTypes().begin(), compOp.getResultTypes().end());
        
       /// Create an instance of the original component.
-      auto instance = calyx::createInstance(funcOp.getLoc(), rewriter, wrapperCompOp, resultTypes, funcName, componentSymbolRefAttr.getAttr());
-      llvm::errs() << "instace parent: \n";
-      instance.getOperation()->getParentOp()->getName();
-      instance.getOperation()->getParentOp()->dump();
-      SmallVector<Value, 8> invokePorts;
+      //auto instance = calyx::createInstance(funcOp.getLoc(), rewriter, wrapperCompOp, resultTypes, funcName, componentSymbolRefAttr.getAttr());
+      //SmallVector<Value, 8> invokePorts;
+      
       /// Create external memory instances and connect them to the load instance.
-      for (auto extMemPortIndices : extMemoryCompPortIndices) {
-        auto memtype = cast<MemRefType>(extMemPortIndices.getFirst().getType());
-        SmallVector<int64_t> addrSizes;
-        SmallVector<int64_t> sizes;
-        for (int64_t dim : memtype.getShape()) {
-          sizes.push_back(dim);
-          addrSizes.push_back(calyx::handleZeroWidth(dim));
-        }
-        // If memref has no size (e.g., memref<i32>) create a 1 dimensional memory of
-        // size 1.
-        if (sizes.empty() && addrSizes.empty()) {
-          sizes.push_back(1);
-          addrSizes.push_back(1);
-        }
-        rewriter.setInsertionPointToStart(wrapperCompOp.getBodyBlock());
-        auto memoryOp = rewriter.create<calyx::SeqMemoryOp>(
-            funcOp.getLoc(), rewriter.getStringAttr("x"),
-          memtype.getElementType(), sizes, addrSizes);
-        memoryOp->setAttr("external",
-                          IntegerAttr::get(rewriter.getI1Type(), llvm::APInt(1, 1)));
-        
-        auto &ports = extMemPortIndices.getSecond();
-        llvm::errs() << "ports first: " << ports.first;
-        for (unsigned i = ports.first; i < ports.first; ++i) {
-          llvm::errs() << "compOp.getArgument(i): \n";
-          compOp.getArgument(i).dump();
-          compOp.getArgument(i).getType().dump();
-          invokePorts.push_back(compOp.getArgument(i));
-        }
-      }
+     // for (auto extMemPortIndices : extMemoryCompPortIndices) {
+     //   auto memtype = cast<MemRefType>(extMemPortIndices.getFirst().getType());
+     //   SmallVector<int64_t> addrSizes;
+     //   SmallVector<int64_t> sizes;
+     //   for (int64_t dim : memtype.getShape()) {
+     //     sizes.push_back(dim);
+     //     addrSizes.push_back(calyx::handleZeroWidth(dim));
+     //   }
+     //   // If memref has no size (e.g., memref<i32>) create a 1 dimensional memory of
+     //   // size 1.
+     //   if (sizes.empty() && addrSizes.empty()) {
+     //     sizes.push_back(1);
+     //     addrSizes.push_back(1);
+     //   }
+     //   rewriter.setInsertionPointToStart(wrapperCompOp.getBodyBlock());
+     //   auto memoryOp = rewriter.create<calyx::SeqMemoryOp>(
+     //       funcOp.getLoc(), rewriter.getStringAttr("x"),
+     //     memtype.getElementType(), sizes, addrSizes);
+     //   memoryOp->setAttr("external",
+     //                     IntegerAttr::get(rewriter.getI1Type(), llvm::APInt(1, 1)));
+     //   
+     //   auto &ports = extMemPortIndices.getSecond();
+     //   llvm::errs() << "ports first: " << ports.first;
+     //   for (unsigned i = ports.first; i < ports.first; ++i) {
+     //     llvm::errs() << "compOp.getArgument(i): \n";
+     //     compOp.getArgument(i).dump();
+     //     compOp.getArgument(i).getType().dump();
+     //     invokePorts.push_back(compOp.getArgument(i));
+     //   }
+     // }
 
-      SmallVector<Value, 8> invokeInputs;
-      for (auto extMemPortIndices : extMemoryCompPortIndices) {
-        auto memType = cast<MemRefType>(extMemPortIndices.getFirst().getType());
-        unsigned addrWidth = llvm::Log2_64_Ceil(memType.getNumElements());
-        llvm::errs() << "addrWidth: " << addrWidth << "\n";
-        llvm::errs() << "extMemPortIndices getSecond second: " << extMemPortIndices.getSecond().second << "\n";
-        for (unsigned i = 0; i < addrWidth; ++i) {
-          llvm::errs() << "compOp getArgument extMemPortIndices second + i: \n";
-          compOp.getArgument(extMemPortIndices.getSecond().second + i).dump();
-          compOp.getArgument(extMemPortIndices.getSecond().second + i).getType().dump();
-          invokeInputs.push_back(compOp.getArgument(extMemPortIndices.getSecond().second + i));
-        }
-      }
+     // SmallVector<Value, 8> invokeInputs;
+     // for (auto extMemPortIndices : extMemoryCompPortIndices) {
+     //   auto memType = cast<MemRefType>(extMemPortIndices.getFirst().getType());
+     //   unsigned addrWidth = llvm::Log2_64_Ceil(memType.getNumElements());
+     //   llvm::errs() << "addrWidth: " << addrWidth << "\n";
+     //   llvm::errs() << "extMemPortIndices getSecond second: " << extMemPortIndices.getSecond().second << "\n";
+     //   for (unsigned i = 0; i < addrWidth; ++i) {
+     //     llvm::errs() << "compOp getArgument extMemPortIndices second + i: \n";
+     //     compOp.getArgument(extMemPortIndices.getSecond().second + i).dump();
+     //     compOp.getArgument(extMemPortIndices.getSecond().second + i).getType().dump();
+     //     invokeInputs.push_back(compOp.getArgument(extMemPortIndices.getSecond().second + i));
+     //   }
+     // }
       rewriter.setInsertionPointToStart(wrapperCompOp.getControlOp().getBodyBlock());
-      auto topLevelSeqOp = rewriter.create<calyx::SeqOp>(funcOp.getLoc());
-      rewriter.setInsertionPointToStart(topLevelSeqOp.getBodyBlock());
-      rewriter.create<calyx::InvokeOp>(
-          funcOp.getLoc(), instance.getSymNameAttr(), invokePorts,
-          invokeInputs, ArrayAttr::get(rewriter.getContext(), {}),
-          ArrayAttr::get(rewriter.getContext(), {}));
+      rewriter.create<calyx::SeqOp>(funcOp.getLoc());
+      //rewriter.setInsertionPointToStart(topLevelSeqOp.getBodyBlock());
+      //rewriter.create<calyx::InvokeOp>(
+      //    funcOp.getLoc(), instance.getSymNameAttr(), invokePorts,
+      //    invokeInputs, ArrayAttr::get(rewriter.getContext(), {}),
+      //    ArrayAttr::get(rewriter.getContext(), {}));
     }
     return success();
   }
