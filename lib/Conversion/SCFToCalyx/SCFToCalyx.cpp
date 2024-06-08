@@ -1338,17 +1338,8 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
     /// which port index each function argument will eventually map to.
     SmallVector<calyx::PortInfo> inPorts, outPorts;
     FunctionType funcType = funcOp.getFunctionType();
-    unsigned extMemCounter = 0;
     for (auto arg : enumerate(funcOp.getArguments())) {
-      if (isa<MemRefType>(arg.value().getType())) {
-        /// External memories
-        auto memName =
-            "ext_mem" + std::to_string(extMemoryCompPortIndices.size());
-        extMemoryCompPortIndices[arg.value()] = {inPorts.size(),
-                                                 outPorts.size()};
-        calyx::appendPortsForExternalMemref(rewriter, memName, arg.value(),
-                                            extMemCounter++, inPorts, outPorts);
-      } else {
+      if (!isa<MemRefType>(arg.value().getType())) {
         /// Single-port arguments
         std::string inName;
         if (auto portNameAttr = funcOp.getArgAttrOfType<StringAttr>(
@@ -1391,43 +1382,48 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
     std::string funcName = "func_" + funcOp.getSymName().str();
     rewriter.modifyOpInPlace(funcOp, [&]() { funcOp.setSymName(funcName); });
 
-    /// Mark this component as the toplevel.
-    compOp->setAttr("toplevel", rewriter.getUnitAttr());
+    /// Mark this component as the toplevel if it's the top-level function of
+    /// the module.
+    if (compOp.getName() == loweringState().getTopLevelFunction())
+      compOp->setAttr("toplevel", rewriter.getUnitAttr());
 
     /// Store the function-to-component mapping.
     functionMapping[funcOp] = compOp;
     auto *compState = loweringState().getState<ComponentLoweringState>(compOp);
     compState->setFuncOpResultMapping(funcOpResultMapping);
 
+    unsigned extMemCounter = 0;
+    for (auto arg : enumerate(funcOp.getArguments())) {
+      if (isa<MemRefType>(arg.value().getType())) {
+        std::string memName =
+            llvm::join_items("_", "arg_mem", std::to_string(extMemCounter++));
+
+        rewriter.setInsertionPointToStart(compOp.getBodyBlock());
+        MemRefType memtype = cast<MemRefType>(arg.value().getType());
+        SmallVector<int64_t> addrSizes;
+        SmallVector<int64_t> sizes;
+        for (int64_t dim : memtype.getShape()) {
+          sizes.push_back(dim);
+          addrSizes.push_back(calyx::handleZeroWidth(dim));
+        }
+        if (sizes.empty() && addrSizes.empty()) {
+          sizes.push_back(1);
+          addrSizes.push_back(1);
+        }
+        auto memOp = rewriter.create<calyx::SeqMemoryOp>(
+            funcOp.getLoc(), memName,
+            memtype.getElementType().getIntOrFloatBitWidth(), sizes, addrSizes);
+        // we don't set the memory to "external", which implies it's a reference
+
+        compState->registerMemoryInterface(arg.value(),
+                                           calyx::MemoryInterface(memOp));
+      }
+    }
+
     /// Rewrite funcOp SSA argument values to the CompOp arguments.
     for (auto &mapping : funcOpArgRewrites)
       mapping.getFirst().replaceAllUsesWith(
           compOp.getArgument(mapping.getSecond()));
-
-    /// Register external memories
-    for (auto extMemPortIndices : extMemoryCompPortIndices) {
-      /// Create a mapping for the in- and output ports using the Calyx memory
-      /// port structure.
-      calyx::MemoryPortsImpl extMemPorts;
-      unsigned inPortsIt = extMemPortIndices.getSecond().first;
-      unsigned outPortsIt = extMemPortIndices.getSecond().second +
-                            compOp.getInputPortInfo().size();
-      extMemPorts.readData = compOp.getArgument(inPortsIt++);
-      extMemPorts.done = compOp.getArgument(inPortsIt);
-      extMemPorts.writeData = compOp.getArgument(outPortsIt++);
-      unsigned nAddresses =
-          cast<MemRefType>(extMemPortIndices.getFirst().getType())
-              .getShape()
-              .size();
-      for (unsigned j = 0; j < nAddresses; ++j)
-        extMemPorts.addrPorts.push_back(compOp.getArgument(outPortsIt++));
-      extMemPorts.writeEn = compOp.getArgument(outPortsIt);
-
-      /// Register the external memory ports as a memory interface within the
-      /// component.
-      compState->registerMemoryInterface(extMemPortIndices.getFirst(),
-                                         calyx::MemoryInterface(extMemPorts));
-    }
 
     return success();
   }
@@ -1649,6 +1645,34 @@ class BuildControl : public calyx::FuncOpPartialLoweringPattern {
   }
 
 private:
+  /// Given a CallScheduleable, returns a list of Calyx MemoryOp's names in the
+  /// "callee" component
+  SmallVector<StringRef, 4>
+  getMemNamesInCalleeComp(PatternRewriter &rewriter,
+                          CallScheduleable *callSchedPtr) const {
+    auto callee = callSchedPtr->callOp.getCallee();
+    auto *calleeOp = SymbolTable::lookupNearestSymbolFrom(
+        callSchedPtr->callOp.getOperation()->getParentOp(),
+        StringAttr::get(rewriter.getContext(), "func_" + callee.str()));
+    FuncOp calleeFunc = dyn_cast_or_null<FuncOp>(calleeOp);
+
+    auto instanceOp = callSchedPtr->instanceOp;
+    auto instanceOpComp =
+        llvm::cast<calyx::ComponentOp>(instanceOp.getReferencedComponent());
+    auto *instanceOpLoweringState = loweringState().getState(instanceOpComp);
+
+    SmallVector<StringRef, 4> res;
+    for (auto operand : calleeFunc.getArguments()) {
+      if (isa<MemRefType>(operand.getType())) {
+        auto instanceOpMemOpName =
+            instanceOpLoweringState->getMemoryInterface(operand).memName();
+        res.push_back(instanceOpMemOpName);
+      }
+    }
+
+    return res;
+  }
+
   /// Sequentially schedules the groups that registered themselves with
   /// 'block'.
   LogicalResult scheduleBasicBlock(PatternRewriter &rewriter,
@@ -1772,13 +1796,35 @@ private:
         rewriter.setInsertionPointToStart(callBody.getBodyBlock());
         std::string initGroupName = "init_" + instanceOp.getSymName().str();
         rewriter.create<calyx::EnableOp>(instanceOp.getLoc(), initGroupName);
+
+        auto refMemNames = getMemNamesInCalleeComp(rewriter, callSchedPtr);
         SmallVector<Value, 4> instancePorts;
-        auto inputPorts = callSchedPtr->callOp.getOperands();
+        SmallVector<Value, 4> inputPorts;
+        NamedAttrList refCells;
+        for (auto operandEnum : enumerate(callSchedPtr->callOp.getOperands())) {
+          auto operand = operandEnum.value();
+          auto index = operandEnum.index();
+          if (isa<MemRefType>(operand.getType())) {
+            auto memOpName = getState<ComponentLoweringState>()
+                                 .getMemoryInterface(operand)
+                                 .memName();
+            auto memOpNameAttr =
+                SymbolRefAttr::get(rewriter.getContext(), memOpName);
+            refCells.append(NamedAttribute(
+                rewriter.getStringAttr(refMemNames[index]), memOpNameAttr));
+          } else {
+            inputPorts.push_back(operand);
+          }
+        }
         llvm::copy(instanceOp.getResults().take_front(inputPorts.size()),
                    std::back_inserter(instancePorts));
+
+        DictionaryAttr refCellsAttr =
+            refCells.getDictionary(rewriter.getContext());
+
         rewriter.create<calyx::InvokeOp>(
             instanceOp.getLoc(), instanceOp.getSymName(), instancePorts,
-            inputPorts, ArrayAttr::get(rewriter.getContext(), {}),
+            inputPorts, refCellsAttr, ArrayAttr::get(rewriter.getContext(), {}),
             ArrayAttr::get(rewriter.getContext(), {}));
       } else
         llvm_unreachable("Unknown scheduleable");
@@ -2013,7 +2059,8 @@ public:
         return failure();
       }
     }
-    return success();
+
+    return createOptNewTopLevelFn(moduleOp, topLevelFunction);
   }
 
   struct LoweringPattern {
@@ -2109,6 +2156,125 @@ public:
 private:
   LogicalResult partialPatternRes;
   std::shared_ptr<calyx::CalyxLoweringState> loweringState = nullptr;
+
+  /// Creates a new new top-level function based on `baseName`.
+  FuncOp createNewTopLevelFn(ModuleOp moduleOp, std::string &baseName) {
+    std::string newName = baseName;
+    unsigned counter = 0;
+    while (SymbolTable::lookupSymbolIn(moduleOp, newName)) {
+      newName = llvm::join_items("_", baseName, std::to_string(++counter));
+    }
+
+    OpBuilder builder(moduleOp.getContext());
+    builder.setInsertionPointToStart(moduleOp.getBody());
+
+    FunctionType funcType = builder.getFunctionType({}, {});
+
+    if (auto newFunc =
+            builder.create<FuncOp>(moduleOp.getLoc(), newName, funcType)) {
+      baseName = newName;
+      return newFunc;
+    }
+
+    moduleOp.emitError("Cannot create new top-level function.");
+
+    return nullptr;
+  }
+
+  /// Insert a call from the newly created top-level function/`caller` to the
+  /// old top-level function/`callee`; and create `memref.alloc`s inside the new
+  /// top-level function for arguments with `memref` types.
+  void insertCallFromNewTopLevel(OpBuilder &builder, FuncOp caller,
+                                 FuncOp callee) {
+    if (caller.getBody().empty()) {
+      caller.addEntryBlock();
+    }
+
+    Block *entryBlock = &caller.getBody().front();
+    builder.setInsertionPointToStart(entryBlock);
+
+    SmallVector<Type, 4> nonMemRefCalleeArgTypes;
+    for (auto arg : callee.getArguments()) {
+      if (!isa<MemRefType>(arg.getType())) {
+        nonMemRefCalleeArgTypes.push_back(arg.getType());
+      }
+    }
+
+    FunctionType callerFnType = caller.getFunctionType();
+    SmallVector<Type, 4> updatedCallerArgTypes(callerFnType.getInputs());
+    updatedCallerArgTypes.append(nonMemRefCalleeArgTypes.begin(),
+                                 nonMemRefCalleeArgTypes.end());
+    caller.setType(FunctionType::get(caller.getContext(), updatedCallerArgTypes,
+                                     callerFnType.getResults()));
+
+    for (Type type : nonMemRefCalleeArgTypes) {
+      entryBlock->addArgument(type, caller.getLoc());
+    }
+
+    SmallVector<Value, 4> memRefArgs;
+    SmallVector<Value, 4> otherArgs;
+    for (auto arg : callee.getArguments()) {
+      if (isa<MemRefType>(arg.getType())) {
+        auto memrefType = cast<MemRefType>(arg.getType());
+        auto allocOp =
+            builder.create<memref::AllocOp>(callee.getLoc(), memrefType);
+        memRefArgs.push_back(allocOp);
+      } else {
+        auto callerArg = entryBlock->getArgument(otherArgs.size());
+        otherArgs.push_back(callerArg);
+      }
+    }
+
+    auto calleeName =
+        SymbolRefAttr::get(builder.getContext(), callee.getSymName());
+    auto resultTypes = callee.getResultTypes();
+
+    SmallVector<Value, 4> allArgs;
+    allArgs.append(memRefArgs.begin(), memRefArgs.end());
+    allArgs.append(otherArgs.begin(), otherArgs.end());
+    builder.create<CallOp>(caller.getLoc(), calleeName, resultTypes, allArgs);
+  }
+
+  /// Conditionally creates an optional new top-level function; and inserts a
+  /// call from the new top-level function to the old top-level function if we
+  /// did create one
+  LogicalResult createOptNewTopLevelFn(ModuleOp moduleOp,
+                                       std::string &topLevelFunction) {
+    auto hasMemrefArguments = [](FuncOp func) {
+      return std::any_of(
+          func.getArguments().begin(), func.getArguments().end(),
+          [](BlockArgument arg) { return isa<MemRefType>(arg.getType()); });
+    };
+
+    /// We only create a new top-level function and call the original top-level
+    /// function from the new one if the original top-level has `memref` in its
+    /// argument
+    bool hasMemrefArgsInTopLevel = false;
+    for (auto funcOp : moduleOp.getOps<FuncOp>()) {
+      if (funcOp.getName() == topLevelFunction) {
+        if (hasMemrefArguments(funcOp)) {
+          hasMemrefArgsInTopLevel = true;
+        }
+      }
+    }
+
+    std::string oldName = topLevelFunction;
+    if (hasMemrefArgsInTopLevel) {
+      auto newTopLevelFunc = createNewTopLevelFn(moduleOp, topLevelFunction);
+
+      OpBuilder builder(moduleOp.getContext());
+      Operation *oldTopLevelFuncOp =
+          SymbolTable::lookupSymbolIn(moduleOp, oldName);
+      auto oldTopLevelFunc = dyn_cast_or_null<FuncOp>(oldTopLevelFuncOp);
+
+      if (!oldTopLevelFunc)
+        oldTopLevelFunc.emitOpError("Original top-level function not found!");
+
+      insertCallFromNewTopLevel(builder, newTopLevelFunc, oldTopLevelFunc);
+    }
+
+    return success();
+  }
 };
 
 void SCFToCalyxPass::runOnOperation() {
