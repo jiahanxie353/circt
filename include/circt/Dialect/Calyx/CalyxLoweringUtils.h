@@ -87,6 +87,7 @@ void buildAssignmentsForRegisterWrite(OpBuilder &builder,
 // A structure representing a set of ports which act as a memory interface for
 // external memories.
 struct MemoryPortsImpl {
+  StringRef memName;
   std::optional<Value> readData;
   std::optional<Value> readOrContentEn;
   std::optional<Value> writeData;
@@ -106,6 +107,8 @@ struct MemoryInterface {
   explicit MemoryInterface(calyx::SeqMemoryOp memOp);
 
   // Getter methods for each memory interface port.
+  bool isSeqMem();
+  StringRef memName();
   Value readData();
   Value readEn();
   Value contentEn();
