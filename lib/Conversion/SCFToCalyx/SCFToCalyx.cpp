@@ -2250,9 +2250,12 @@ private:
     }
 
     SmallVector<memref::AllocOp, 4> calleeAllocOps;
+    SmallVector<memref::GetGlobalOp, 4> calleeGetGlobalOps;
     for (auto &op : callee.getBody().getOps()) {
       if (auto allocOp = dyn_cast<memref::AllocOp>(&op)) {
         calleeAllocOps.push_back(allocOp);
+      } else if (auto getGlobalOp = dyn_cast<memref::GetGlobalOp>(op)) {
+        calleeGetGlobalOps.push_back(getGlobalOp);
       }
     }
 
@@ -2260,6 +2263,13 @@ private:
       auto allocType = cast<MemRefType>(allocOp.getType());
       auto alloc = builder.create<memref::AllocOp>(caller.getLoc(), allocType);
       memRefArgs.push_back(alloc);
+    }
+
+    for (auto getGlobalOp : calleeGetGlobalOps) {
+      auto globalType = getGlobalOp.getType();
+      auto newGetGlobal = builder.create<memref::GetGlobalOp>(
+          caller.getLoc(), globalType, getGlobalOp.getName());
+      memRefArgs.push_back(newGetGlobal);
     }
 
     auto calleeName =
