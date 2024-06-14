@@ -1411,7 +1411,7 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
         }
         auto memOp = rewriter.create<calyx::SeqMemoryOp>(
             funcOp.getLoc(), memName,
-            memtype.getElementType().getIntOrFloatBitWidth(), sizes, addrSizes);
+            memtype.getElementType(), sizes, addrSizes);
         // we don't set the memory to "external", which implies it's a reference
 
         compState->registerMemoryInterface(arg.value(),
