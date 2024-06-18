@@ -2062,7 +2062,7 @@ SmallVector<StringRef> MemoryOp::portNames() {
         StringAttr::get(this->getContext(), "addr" + std::to_string(i));
     portNames.push_back(nameAttr.getValue());
   }
-  portNames.append({"write_data", "write_en", clkPort, "read_data", donePort});
+  portNames.append({"write_data", "write_en", clkPort, resetPort, "read_data", donePort});
   return portNames;
 }
 
@@ -2070,7 +2070,7 @@ SmallVector<Direction> MemoryOp::portDirections() {
   SmallVector<Direction> portDirections;
   for (size_t i = 0, e = getAddrSizes().size(); i != e; ++i)
     portDirections.push_back(Input);
-  portDirections.append({Input, Input, Input, Output, Output});
+  portDirections.append({Input, Input, Input, Input, Output, Output});
   return portDirections;
 }
 
@@ -2085,10 +2085,12 @@ SmallVector<DictionaryAttr> MemoryOp::portAttributes() {
   NamedAttrList writeEn, clk, reset, done;
   writeEn.append(goPort, isSet);
   clk.append(clkPort, isSet);
+  reset.append(resetPort, isSet);
   done.append(donePort, isSet);
   portAttributes.append({DictionaryAttr::get(context),   // In
                          writeEn.getDictionary(context), // Write enable
                          clk.getDictionary(context),     // Clk
+                         reset.getDictionary(context),   // Reset
                          DictionaryAttr::get(context),   // Out
                          done.getDictionary(context)}    // Done
   );
@@ -2109,7 +2111,29 @@ void MemoryOp::build(OpBuilder &builder, OperationState &state,
   types.push_back(builder.getIntegerType(width));  // Write data
   types.push_back(builder.getI1Type());            // Write enable
   types.push_back(builder.getI1Type());            // Clk
+  types.push_back(builder.getI1Type());            // Reset
   types.push_back(builder.getIntegerType(width));  // Read data
+  types.push_back(builder.getI1Type());            // Done
+  state.addTypes(types);
+}
+
+void MemoryOp::build(OpBuilder &builder, OperationState &state,
+                        StringRef instanceName, Type type,
+                        ArrayRef<int64_t> sizes, ArrayRef<int64_t> addrSizes) {
+  state.addAttribute(SymbolTable::getSymbolAttrName(),
+                     builder.getStringAttr(instanceName));
+  int64_t width = type.getIntOrFloatBitWidth();
+  state.addAttribute("width", builder.getI64IntegerAttr(width));
+  state.addAttribute("sizes", builder.getI64ArrayAttr(sizes));
+  state.addAttribute("addrSizes", builder.getI64ArrayAttr(addrSizes));
+  SmallVector<Type> types;
+  for (int64_t size : addrSizes)
+    types.push_back(builder.getIntegerType(size)); // Addresses
+  types.push_back(type);                           // Write data
+  types.push_back(builder.getI1Type());            // Write enable
+  types.push_back(builder.getI1Type());            // Clk
+  types.push_back(builder.getI1Type());            // Reset
+  types.push_back(type);                           // Read data
   types.push_back(builder.getI1Type());            // Done
   state.addTypes(types);
 }
@@ -2123,7 +2147,7 @@ LogicalResult MemoryOp::verify() {
     return emitOpError("mismatched number of dimensions (")
            << numDims << ") and address sizes (" << numAddrs << ")";
 
-  size_t numExtraPorts = 5; // write data/enable, clk, and read data/done.
+  size_t numExtraPorts = 6; // write data/enable, clk, and read data/done.
   if (getNumResults() != numAddrs + numExtraPorts)
     return emitOpError("incorrect number of address ports, expected ")
            << numAddrs;
@@ -2182,7 +2206,7 @@ SmallVector<DictionaryAttr> SeqMemoryOp::portAttributes() {
   NamedAttrList done, clk, reset, contentEn;
   done.append(donePort, isSet);
   clk.append(clkPort, isSet);
-  clk.append(resetPort, isSet);
+  reset.append(resetPort, isSet);
   contentEn.append(goPort, isTwo);
   portAttributes.append({clk.getDictionary(context),       // Clk
                          reset.getDictionary(context),     // Reset
@@ -2674,26 +2698,25 @@ ParseResult InvokeOp::parse(OpAsmParser &parser, OperationState &result) {
   FlatSymbolRefAttr callee = FlatSymbolRefAttr::get(componentName);
   SMLoc loc = parser.getCurrentLocation();
 
-  SmallVector<NamedAttribute, 4> refCellSymbols;
+  SmallVector<Attribute, 4> refCells;
   if (succeeded(parser.parseOptionalLSquare())) {
     if (parser.parseCommaSeparatedList([&]() -> ParseResult {
           std::string refCellName;
           std::string externalMem;
+          NamedAttrList refCellAttr;
           if (parser.parseKeywordOrString(&refCellName) ||
               parser.parseEqual() || parser.parseKeywordOrString(&externalMem))
             return failure();
           auto externalMemAttr =
               SymbolRefAttr::get(parser.getContext(), externalMem);
-          refCellSymbols.push_back(
-              NamedAttribute(StringAttr::get(parser.getContext(), refCellName),
-                             externalMemAttr));
+          refCellAttr.append(StringAttr::get(parser.getContext(), refCellName), externalMemAttr);
+          refCells.push_back(DictionaryAttr::get(parser.getContext(), refCellAttr));
           return success();
         }) ||
         parser.parseRSquare())
       return failure();
   }
-  result.addAttribute("refCellsMap",
-                      DictionaryAttr::get(parser.getContext(), refCellSymbols));
+  result.addAttribute("refCellsMap", ArrayAttr::get(parser.getContext(), refCells));
 
   result.addAttribute("callee", callee);
   if (parseParameterList(parser, result, ports, inputs, portNames, inputNames,
@@ -2713,10 +2736,13 @@ ParseResult InvokeOp::parse(OpAsmParser &parser, OperationState &result) {
 void InvokeOp::print(OpAsmPrinter &p) {
   p << " @" << getCallee() << "[";
   auto refCellNamesMap = getRefCellsMap();
-  llvm::interleaveComma(refCellNamesMap, p, [&](auto arg) {
-    auto refCellName = arg.getName().str();
-    auto externalMem = cast<FlatSymbolRefAttr>(arg.getValue()).getValue();
-    p << refCellName << " = " << externalMem;
+  llvm::interleaveComma(refCellNamesMap, p, [&](Attribute attr) {
+    auto dictAttr = cast<DictionaryAttr>(attr);
+    llvm::interleaveComma(dictAttr, p, [&](NamedAttribute namedAttr) {
+      auto refCellName = namedAttr.getName().str();
+      auto externalMem = cast<FlatSymbolRefAttr>(namedAttr.getValue()).getValue();
+      p << refCellName << " = " << externalMem;
+   });
   });
   p << "](";
 
