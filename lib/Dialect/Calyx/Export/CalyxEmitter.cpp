@@ -823,10 +823,13 @@ void Emitter::emitMemory(MemoryOp memory) {
                         "supported by the native Calyx compiler.");
     return;
   }
-  indent() << getAttributes(memory, /*atFormat=*/true) << memory.instanceName()
-           << space() << equals() << space() << "std_mem_d"
-           << std::to_string(dimension) << LParen() << memory.getWidth()
-           << comma();
+  bool isRef = !memory->hasAttr("external");
+  indent();
+  if (isRef)
+    os << "ref ";
+  os << getAttributes(memory, /*atFormat=*/true) << memory.instanceName()
+     << space() << equals() << space() << "comb_mem_d"
+     << std::to_string(dimension) << LParen() << memory.getWidth() << comma();
   for (Attribute size : memory.getSizes()) {
     APInt memSize = cast<IntegerAttr>(size).getValue();
     memSize.print(os, /*isSigned=*/false);
@@ -881,10 +884,13 @@ void Emitter::emitInvoke(InvokeOp invoke) {
   auto refCellsMap = invoke.getRefCellsMap();
   if (!refCellsMap.empty()) {
     os << "[";
-    llvm::interleaveComma(refCellsMap, os, [&](auto refCell) {
-      auto refCellName = refCell.getName().str();
-      auto externalMem = cast<FlatSymbolRefAttr>(refCell.getValue()).getValue();
-      os << refCellName << " = " << externalMem;
+    llvm::interleaveComma(refCellsMap, os, [&](Attribute attr) {
+      auto dictAttr = cast<DictionaryAttr>(attr);
+      llvm::interleaveComma(dictAttr, os, [&](NamedAttribute namedAttr) {
+        auto refCellName = namedAttr.getName().str();
+        auto externalMem = cast<FlatSymbolRefAttr>(namedAttr.getValue()).getValue();
+        os << refCellName << " = " << externalMem;
+      });
     });
     os << "]";
   }
