@@ -10,7 +10,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
 #include "circt/Dialect/Calyx/CalyxHelpers.h"
 #include "circt/Dialect/Calyx/CalyxOps.h"
 #include "circt/Dialect/Calyx/CalyxPasses.h"
@@ -20,13 +19,20 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/OperationSupport.h"
 
+namespace circt {
+namespace calyx {
+#define GEN_PASS_DEF_SUBCONDITIONALS
+#include "circt/Dialect/Calyx/CalyxPasses.h.inc"
+} // namespace calyx
+} // namespace circt
+
 using namespace circt;
 using namespace calyx;
 using namespace mlir;
 
 namespace {
 
-struct SubConditionalsPass : public SubConditionalsBase<SubConditionalsPass> {
+struct SubConditionalsPass : public circt::calyx::impl::SubConditionalsBase<SubConditionalsPass> {
   LogicalResult transformOp(OpBuilder &builder, arith::MaximumFOp maxFOp) {
     auto loc = maxFOp.getLoc();
     builder.setInsertionPointAfter(maxFOp);
