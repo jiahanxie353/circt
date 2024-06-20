@@ -14,6 +14,7 @@
 #include "circt/Dialect/Calyx/CalyxOps.h"
 #include "circt/Dialect/Calyx/CalyxPasses.h"
 #include "circt/Support/LLVM.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -54,11 +55,38 @@ struct SubConditionalsPass : public circt::calyx::impl::SubConditionalsBase<SubC
     maxFOp.erase();
     return success();
   }
+  
+  LogicalResult transformOp(OpBuilder &builder, arith::MaxSIOp maxSIOp) {
+    auto loc = maxSIOp.getLoc();
+    builder.setInsertionPointAfter(maxSIOp);
+    auto cmpIOp = builder.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::sgt, maxSIOp.getLhs(), maxSIOp.getRhs());
+    auto ifOp = builder.create<scf::IfOp>(loc, maxSIOp.getResult().getType(),
+                                          cmpIOp.getResult(), true);
+
+    auto &thenBlock = ifOp.getThenRegion().front();
+    auto &elseBlock = ifOp.getElseRegion().front();
+
+    builder.setInsertionPointToStart(&thenBlock);
+    builder.create<scf::YieldOp>(loc, maxSIOp.getLhs());
+
+    builder.setInsertionPointToStart(&elseBlock);
+    builder.create<scf::YieldOp>(loc, maxSIOp.getRhs());
+
+    maxSIOp.replaceAllUsesWith(ifOp.getResults()[0]);
+    maxSIOp.erase();
+    return success();
+  }
 
   void runOnOperation() override {
     func::FuncOp funcOp = getOperation();
     auto builder = OpBuilder(funcOp);
     funcOp.walk([&](arith::MaximumFOp op) {
+      if (failed(transformOp(builder, op))) {
+        signalPassFailure();
+      }
+    });
+    funcOp.walk([&](arith::MaxSIOp op) {
       if (failed(transformOp(builder, op))) {
         signalPassFailure();
       }
