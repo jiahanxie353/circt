@@ -1672,10 +1672,10 @@ private:
 
     for (auto &group : compBlockScheduleables) {
       rewriter.setInsertionPointToEnd(parentCtrlBlock);
-      if (auto groupPtr = std::get_if<calyx::GroupOp>(&group); groupPtr) {
+      if (auto *groupPtr = std::get_if<calyx::GroupOp>(&group); groupPtr) {
         rewriter.create<calyx::EnableOp>(groupPtr->getLoc(),
                                          groupPtr->getSymName());
-      } else if (auto whileSchedPtr = std::get_if<WhileScheduleable>(&group);
+      } else if (auto *whileSchedPtr = std::get_if<WhileScheduleable>(&group);
                  whileSchedPtr) {
         auto &whileOp = whileSchedPtr->whileOp;
 
@@ -1727,7 +1727,7 @@ private:
                                          forLatchGroup.getName());
         if (res.failed())
           return res;
-      } else if (auto ifSchedPtr = std::get_if<IfScheduleable>(&group);
+      } else if (auto *ifSchedPtr = std::get_if<IfScheduleable>(&group);
                  ifSchedPtr) {
         auto ifOp = ifSchedPtr->ifOp;
 
@@ -1773,11 +1773,8 @@ private:
         }
       } else if (auto *callSchedPtr = std::get_if<CallScheduleable>(&group)) {
         auto instanceOp = callSchedPtr->instanceOp;
-        OpBuilder::InsertionGuard g(rewriter);
         auto callBody = rewriter.create<calyx::SeqOp>(instanceOp.getLoc());
         rewriter.setInsertionPointToStart(callBody.getBodyBlock());
-        std::string initGroupName = "init_" + instanceOp.getSymName().str();
-        rewriter.create<calyx::EnableOp>(instanceOp.getLoc(), initGroupName);
         
         auto callee = callSchedPtr->callOp.getCallee();
         auto *calleeOp = SymbolTable::lookupNearestSymbolFrom(
