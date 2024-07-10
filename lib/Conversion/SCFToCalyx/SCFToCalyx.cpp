@@ -48,7 +48,7 @@ namespace circt {
 class ComponentLoweringStateInterface;
 namespace scftocalyx {
 
-using json = nlohmann::json;
+using json = nlohmann::ordered_json;
 
 //===----------------------------------------------------------------------===//
 // Utility types
