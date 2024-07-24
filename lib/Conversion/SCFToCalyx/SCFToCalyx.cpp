@@ -25,11 +25,16 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/Value.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/raw_ostream.h"
+#include <cstdint>
 #include <fstream>
 
 #include <variant>
@@ -115,6 +120,11 @@ struct ForScheduleable {
   uint64_t bound;
 };
 
+struct ParScheduleable {
+  /// Parallel operation to schedule.
+  scf::ParallelOp parOp;
+};
+
 struct CallScheduleable {
   /// Instance for invoking.
   calyx::InstanceOp instanceOp;
@@ -125,7 +135,7 @@ struct CallScheduleable {
 /// A variant of types representing scheduleable operations.
 using Scheduleable =
     std::variant<calyx::GroupOp, WhileScheduleable, ForScheduleable,
-                 IfScheduleable, CallScheduleable>;
+                 IfScheduleable, ParScheduleable, CallScheduleable>;
 
 class IfLoweringStateInterface {
 public:
@@ -278,6 +288,7 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
               .template Case<arith::ConstantOp, ReturnOp, BranchOpInterface,
                              /// SCF
                              scf::YieldOp, scf::WhileOp, scf::ForOp, scf::IfOp,
+                             scf::ReduceOp, scf::ParallelOp,
                              /// memref
                              memref::AllocOp, memref::AllocaOp, memref::LoadOp,
                              memref::StoreOp, memref::GetGlobalOp,
@@ -316,6 +327,8 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
 
 private:
   /// Op builder specializations.
+  LogicalResult buildOp(PatternRewriter &rewriter, scf::ReduceOp reduceOp) const;
+  LogicalResult buildOp(PatternRewriter &rewriter, scf::ParallelOp parallelOp) const;
   LogicalResult buildOp(PatternRewriter &rewriter, scf::YieldOp yieldOp) const;
   LogicalResult buildOp(PatternRewriter &rewriter,
                         BranchOpInterface brOp) const;
@@ -897,6 +910,18 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      memref::GetGlobalOp getGlobalOp) const {
   return buildAllocOp(getState<ComponentLoweringState>(), rewriter, getGlobalOp);
+}
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     scf::ReduceOp reduceOp) const {
+  return success();
+}
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     scf::ParallelOp parOp) const {
+  getState<ComponentLoweringState>().addBlockScheduleable(
+      parOp.getOperation()->getBlock(), ParScheduleable{parOp});
+  return success();
 }
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
@@ -1589,6 +1614,148 @@ class BuildForGroups : public calyx::FuncOpPartialLoweringPattern {
   }
 };
 
+class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
+   using FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern;
+  LogicalResult
+  partiallyLowerFuncToComp(FuncOp funcOp,
+                           PatternRewriter &rewriter) const override {
+    LogicalResult res = success();
+    funcOp.walk([&](Operation *op) {
+      if (!isa<scf::ParallelOp>(op))
+        return WalkResult::advance();
+
+      auto scfParOp = cast<scf::ParallelOp>(op);
+      mlir::ModuleOp moduleOp = llvm::dyn_cast_or_null<mlir::ModuleOp>(funcOp->getParentOp());
+
+      // Create a totalNumSteps by numLoops 2-D vector
+      SmallVector<int64_t, 4> lowerBounds, upperBounds, steps;
+      SmallVector<SmallVector<int64_t,4>, 4> accessIndices;
+      for (size_t i = 0; i < scfParOp.getNumLoops(); i++) {
+        auto lbAttr = cast<arith::ConstantOp>(scfParOp.getLowerBound()[i].getDefiningOp()).getValue();
+        auto lb = dyn_cast<IntegerAttr>(lbAttr).getInt();
+        lowerBounds.push_back(lb);
+        auto ubAttr = cast<arith::ConstantOp>(scfParOp.getUpperBound()[i].getDefiningOp()).getValue();
+        auto ub = dyn_cast<IntegerAttr>(ubAttr).getInt();
+        upperBounds.push_back(ub);
+        auto stepAttr = cast<arith::ConstantOp>(scfParOp.getStep()[i].getDefiningOp()).getValue();
+        auto step = dyn_cast<IntegerAttr>(stepAttr).getInt();
+        steps.push_back(step);
+      }
+      auto currIndices = lowerBounds;
+      std::function<void(size_t)> generateCombinations = [&](size_t currDim) {
+        if (currDim == lowerBounds.size()) {
+            accessIndices.push_back(currIndices);
+            return;
+        }
+        
+        for (auto s = lowerBounds[currDim]; s < upperBounds[currDim]; s += steps[currDim]) {
+            currIndices[currDim] = s;
+            generateCombinations(currDim + 1);
+        }
+      };
+    
+      generateCombinations(0);
+      
+      SmallVector<FuncOp, 4> parFuncs;
+      SmallVector<SmallVector<Value, 4>, 4> operandsToParFuncs;
+      for (size_t idx = 0; idx < accessIndices.size(); idx++) {
+        SmallVector<Value, 4> resOperands;
+        SmallVector<Type, 4> operandTypes;
+        // `argNumMap`'s size equals to:
+        //    \Sigma operation \Sigma operands - \Sigma operation \Sigma results
+        // `argNumMap[i]` maps the `i`th overall operand totalSize
+        //    the corresponding argument index in the newly created function 
+        SmallVector<int, 4> argNumMap;
+        DenseSet<Value> seen;
+        DenseMap<BlockArgument, arith::ConstantIndexOp> blockArgConsts;
+        for (auto &innerOp : scfParOp.getRegion().getOps()) {
+          for (auto operand : innerOp.getOperands()) {
+            if (isa<BlockArgument>(operand)) {
+              auto blockArg = cast<BlockArgument>(operand);
+              if (seen.insert(operand).second) {
+                auto stepValue = accessIndices[idx][blockArg.getArgNumber()];
+                rewriter.setInsertionPointToStart(&scfParOp->getParentOp()->getRegion(0).getBlocks().front());
+                auto indexOp = rewriter.create<arith::ConstantIndexOp>(scfParOp.getLoc(), stepValue);
+                blockArgConsts[blockArg] = indexOp;
+                auto indexVal = indexOp.getResult();
+                resOperands.push_back(indexVal);
+                operandTypes.push_back(indexOp.getType());
+                argNumMap.push_back(resOperands.size() - 1);
+              }
+              else {
+                auto indexVal = blockArgConsts[blockArg].getResult();
+                auto *it = std::find(resOperands.begin(), resOperands.end(), indexVal);
+                if (it != resOperands.end()) {
+                  int index = std::distance(resOperands.begin(), it);
+                  argNumMap.push_back(index);
+                } else {
+                  scfParOp.emitError("index not found!");
+                }
+              }
+            }
+            else if (!mlir::OperationEquivalence::isRegionEquivalentTo(operand.getParentRegion(), &scfParOp.getRegion(), OperationEquivalence::None)) {
+              if (seen.insert(operand).second) {
+                resOperands.push_back(operand);
+                operandTypes.push_back(operand.getType());
+                argNumMap.push_back(resOperands.size() - 1);
+              }
+              else {
+                auto *it = std::find(resOperands.begin(), resOperands.end(), operand);
+                if (it != resOperands.end()) {
+                  int index = std::distance(resOperands.begin(), it);
+                  argNumMap.push_back(index);
+                } else {
+                  scfParOp.emitError("index not found!");
+                }
+              }
+            }
+          }
+        }
+        rewriter.setInsertionPointToEnd(&moduleOp.getBodyRegion().back());
+        FunctionType parFuncType = rewriter.getFunctionType(operandTypes, {}); // TODO: return type is empty for now, need change for `reduce.return`
+        auto parFuncOp = rewriter.create<FuncOp>(scfParOp.getLoc(), llvm::join_items("_", "par_func", std::to_string(idx)), parFuncType);
+        parFuncOp.addEntryBlock();
+        rewriter.setInsertionPointToStart(&parFuncOp.getBody().front());
+        
+        IRMapping mapping;
+        int mapCnt = 0;
+        DenseSet<Value> opResults;
+        for (auto &op : scfParOp.getRegion().getOps()) {
+          if (dyn_cast_or_null<scf::ReduceOp>(op))
+            continue;
+          opResults.insert(op.getResults().begin(), op.getResults().end());
+          for (size_t operandIdx = 0; operandIdx < op.getOperands().size(); operandIdx++) {
+            auto operand = op.getOperand(operandIdx);
+            if (!opResults.contains(operand)) {
+              // llvm::errs() << argNumMap[mapCnt] << "\n";
+              mapping.map(operand, parFuncOp.getBody().getArgument(argNumMap[mapCnt++]));
+            }
+          }
+          rewriter.clone(op, mapping);
+        }
+        parFuncs.push_back(parFuncOp);
+        operandsToParFuncs.push_back(resOperands);
+      }
+
+      for (size_t idx = 0; idx < accessIndices.size(); idx++) {
+        for (auto &op : llvm::make_early_inc_range(scfParOp.getRegion().getOps())) {
+          op.dropAllDefinedValueUses();
+          op.erase();
+        }
+        rewriter.setInsertionPointToEnd(&(*scfParOp->getRegion(0).getBlocks().begin()));
+        for (size_t i = 0; i < parFuncs.size(); i++) {
+          auto parFunc = parFuncs[i];
+          auto parFuncOperands = operandsToParFuncs[i];
+          rewriter.create<func::CallOp>(parFunc.getLoc(), parFunc, parFuncOperands);
+        }
+      }
+
+      return WalkResult::advance();
+    });
+    return res;
+  }
+};
+
 class BuildIfGroups : public calyx::FuncOpPartialLoweringPattern {
   using FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern;
 
@@ -1664,8 +1831,8 @@ private:
     auto compBlockScheduleables =
         getState<ComponentLoweringState>().getBlockScheduleables(block);
     auto loc = block->front().getLoc();
-
-    if (compBlockScheduleables.size() > 1) {
+    
+    if (compBlockScheduleables.size() > 1 && !isa<scf::ParallelOp>(block->getParentOp())) {
       auto seqOp = rewriter.create<calyx::SeqOp>(loc);
       parentCtrlBlock = seqOp.getBodyBlock();
     }
@@ -1771,6 +1938,14 @@ private:
           rewriter.create<calyx::EnableOp>(elseGroup.getLoc(),
                                            elseGroup.getName());
         }
+      } else if (auto *parSchedPtr = std::get_if<ParScheduleable>(&group)) {
+        auto parOp = parSchedPtr->parOp;
+
+        auto calyxParOp = rewriter.create<calyx::ParOp>(parOp.getLoc());
+        LogicalResult res = buildCFGControl(path, rewriter, calyxParOp.getBodyBlock(),
+                                            block, &parOp.getRegion().getBlocks().front());
+        if (res.failed())
+          return res;
       } else if (auto *callSchedPtr = std::get_if<CallScheduleable>(&group)) {
         auto instanceOp = callSchedPtr->instanceOp;
         auto callBody = rewriter.create<calyx::SeqOp>(instanceOp.getLoc());
@@ -2348,6 +2523,9 @@ void SCFToCalyxPass::runOnOperation() {
   DenseMap<FuncOp, calyx::ComponentOp> funcMap;
   SmallVector<LoweringPattern, 8> loweringPatterns;
   calyx::PatternApplicationState patternState;
+
+  addOncePattern<BuildParGroups>(loweringPatterns, patternState, funcMap,
+                                 *loweringState);
 
   /// Creates a new Calyx component for each FuncOp in the inpurt module.
   addOncePattern<FuncOpConversion>(loweringPatterns, patternState, funcMap,
