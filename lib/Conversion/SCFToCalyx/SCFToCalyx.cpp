@@ -520,7 +520,7 @@ private:
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      memref::LoadOp loadOp) const {
-  getState<ComponentLoweringState>().getComponentOp().dump();
+  //getState<ComponentLoweringState>().getComponentOp().dump();
   Value memref = loadOp.getMemref();
   auto memoryInterface =
       getState<ComponentLoweringState>().getMemoryInterface(memref);
@@ -1658,7 +1658,33 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
       };
     
       generateCombinations(0);
-      
+
+      SmallVector<Operation *, 4> allNestedOps;
+      auto getAllOpsInRegion = [&](Region &region, auto &self) -> void {
+        for (Block &block : region) {
+          for (Operation &op : block) {
+            allNestedOps.push_back(&op);
+            // Recursively get all operations in nested regions
+            for (Region &nestedRegion : op.getRegions()) {
+              self(nestedRegion, self);
+            }
+          }
+        }
+      };
+    
+      getAllOpsInRegion(scfParOp.getRegion(), getAllOpsInRegion);
+
+      auto isWithinRegionHierarchy = [&](Region *startRegion, Region &targetRegion) -> bool {
+        Region *currentRegion = startRegion;
+        while (currentRegion) {
+          if (currentRegion == &targetRegion) {
+            return true;
+          }
+          currentRegion = currentRegion->getParentOp() ? currentRegion->getParentOp()->getParentRegion() : nullptr;
+        }
+        return false;
+      };
+
       SmallVector<FuncOp, 4> parFuncs;
       SmallVector<SmallVector<Value, 4>, 4> operandsToParFuncs;
       for (size_t idx = 0; idx < accessIndices.size(); idx++) {
@@ -1671,8 +1697,8 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
         SmallVector<int, 4> argNumMap;
         DenseSet<Value> seen;
         DenseMap<BlockArgument, arith::ConstantIndexOp> blockArgConsts;
-        for (auto &innerOp : scfParOp.getRegion().getOps()) {
-          for (auto operand : innerOp.getOperands()) {
+        for (auto *innerOp : allNestedOps) {
+          for (auto operand : innerOp->getOperands()) {
             if (isa<BlockArgument>(operand) && operand.getParentBlock() == scfParOp.getBody()) {
               auto blockArg = cast<BlockArgument>(operand);
               if (seen.insert(operand).second) {
@@ -1696,7 +1722,7 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
                 }
               }
             }
-            else if (!mlir::OperationEquivalence::isRegionEquivalentTo(operand.getParentRegion(), &scfParOp.getRegion(), OperationEquivalence::None)) {
+            else if (!isWithinRegionHierarchy(operand.getParentRegion(), scfParOp.getRegion())) {
               if (seen.insert(operand).second) {
                 resOperands.push_back(operand);
                 operandTypes.push_back(operand.getType());
@@ -1714,6 +1740,15 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
             }
           }
         }
+        llvm::errs() << "resOperands: \n";
+        for (auto resOp : resOperands) {
+          resOp.dump();
+        }
+        llvm::errs() << "argNumMap: \n";
+        for (auto map : argNumMap) {
+          llvm::errs() << map << "  ";
+        }
+        llvm::errs() << "\n";
         rewriter.setInsertionPointToEnd(&moduleOp.getBodyRegion().back());
         FunctionType parFuncType = rewriter.getFunctionType(operandTypes, {}); // TODO: return type is empty for now, need change for `reduce.return`
         auto parFuncOp = rewriter.create<FuncOp>(scfParOp.getLoc(), llvm::join_items("_", "" "par_func", std::to_string(parOpCnt), std::to_string(idx)), parFuncType);
@@ -1723,34 +1758,95 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
         IRMapping mapping;
         int mapCnt = 0;
         DenseSet<Value> opResults;
-        for (auto &op : scfParOp.getRegion().getOps()) {
-          if (dyn_cast_or_null<scf::ReduceOp>(op))
+        llvm::errs() << "parFuncOp argument size: " << parFuncOp.getBody().getArguments().size() << "\n";
+auto isValueDefinedInRegion = [](Value value, Region &region) -> bool {
+  // Define the recursive lambda
+  std::function<bool(Value, Region &)> isValueDefinedInRegionRecursive;
+  isValueDefinedInRegionRecursive = [&isValueDefinedInRegionRecursive](Value value, Region &region) -> bool {
+    // Iterate over each block in the region
+    for (Block &block : region) {
+      // Check if the value is a block argument of the block
+      for (BlockArgument blockArg : block.getArguments()) {
+        if (blockArg == value) {
+          return true;
+        }
+      }
+
+      // Iterate over each operation in the block
+      for (Operation &op : block) {
+        // Check if the value is an operation result
+        for (Value result : op.getResults()) {
+          if (result == value) {
+            return true;
+          }
+        }
+
+        // Recursively check nested regions
+        for (Region &nestedRegion : op.getRegions()) {
+          if (isValueDefinedInRegionRecursive(value, nestedRegion)) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  };
+  return isValueDefinedInRegionRecursive(value, region);
+};
+        for (auto *op : allNestedOps) {
+          if (dyn_cast_or_null<scf::ReduceOp>(*op))
             continue;
-          opResults.insert(op.getResults().begin(), op.getResults().end());
-          for (size_t operandIdx = 0; operandIdx < op.getOperands().size(); operandIdx++) {
-            auto operand = op.getOperand(operandIdx);
-            if (!opResults.contains(operand)) {
-              // llvm::errs() << argNumMap[mapCnt] << "\n";
+          opResults.insert(op->getResults().begin(), op->getResults().end());
+          llvm::errs() << "op: ";
+          op->dump();
+          for (size_t operandIdx = 0; operandIdx < op->getOperands().size(); operandIdx++) {
+            auto operand = op->getOperand(operandIdx);
+            // TODO: use isValueDefinedInBlock maybe
+            if ((isa<BlockArgument>(operand) && operand.getParentRegion() == &scfParOp.getRegion()) || !isValueDefinedInRegion(operand, scfParOp.getRegion())) {
+              llvm::errs() << "argNumMap: " << argNumMap[mapCnt] << "\n";
+              llvm::errs() << "operand: ";
+              operand.dump();
+              llvm::errs() << "parFunc arg: ";
+              parFuncOp.getBody().getArgument(argNumMap[mapCnt]).dump();
               mapping.map(operand, parFuncOp.getBody().getArgument(argNumMap[mapCnt++]));
             }
           }
           // TODO: recursive cloning
-          rewriter.clone(op, mapping);
+          rewriter.clone(*op, mapping);
         }
         parFuncs.push_back(parFuncOp);
         operandsToParFuncs.push_back(resOperands);
       }
 
       for (size_t idx = 0; idx < accessIndices.size(); idx++) {
-        for (auto &op : llvm::make_early_inc_range(scfParOp.getRegion().getOps())) {
-          op.dropAllDefinedValueUses();
-          op.erase();
-        }
+        SmallVector<Operation*, 8> opsToErase;
+        auto collectOpsInRegion = [&](Region &region, auto &self) -> void {
+          for (Block &block : region) {
+            for (Operation &op : reverse(block)) {
+              for (Region &nestedRegion : op.getRegions()) {
+                self(nestedRegion, self);
+              }
+              opsToErase.push_back(&op);
+            }
+          }
+        };
+        collectOpsInRegion(scfParOp.getRegion(), collectOpsInRegion);
+
+      }
+      
+      for (size_t idx = 0; idx < accessIndices.size(); idx++) {
         rewriter.setInsertionPointToEnd(&(*scfParOp->getRegion(0).getBlocks().begin()));
         for (size_t i = 0; i < parFuncs.size(); i++) {
           auto parFunc = parFuncs[i];
+          llvm::errs() << "funcOp: \n";
+          parFunc.dump();
           auto parFuncOperands = operandsToParFuncs[i];
-          rewriter.create<func::CallOp>(parFunc.getLoc(), parFunc, parFuncOperands);
+          llvm::errs() << "operands: \n";
+          for (auto operand : parFuncOperands) {
+            operand.dump();
+          }
+          auto callOp = rewriter.create<func::CallOp>(parFunc.getLoc(), parFunc, parFuncOperands);
+          callOp.dump();
         }
       }
       parOpCnt++;
