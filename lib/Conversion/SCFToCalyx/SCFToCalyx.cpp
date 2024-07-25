@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <fstream>
 
+#include <string>
 #include <variant>
 
 namespace circt {
@@ -519,6 +520,7 @@ private:
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      memref::LoadOp loadOp) const {
+  getState<ComponentLoweringState>().getComponentOp().dump();
   Value memref = loadOp.getMemref();
   auto memoryInterface =
       getState<ComponentLoweringState>().getMemoryInterface(memref);
@@ -1620,6 +1622,7 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
   partiallyLowerFuncToComp(FuncOp funcOp,
                            PatternRewriter &rewriter) const override {
     LogicalResult res = success();
+    int parOpCnt = 0;
     funcOp.walk([&](Operation *op) {
       if (!isa<scf::ParallelOp>(op))
         return WalkResult::advance();
@@ -1670,7 +1673,7 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
         DenseMap<BlockArgument, arith::ConstantIndexOp> blockArgConsts;
         for (auto &innerOp : scfParOp.getRegion().getOps()) {
           for (auto operand : innerOp.getOperands()) {
-            if (isa<BlockArgument>(operand)) {
+            if (isa<BlockArgument>(operand) && operand.getParentBlock() == scfParOp.getBody()) {
               auto blockArg = cast<BlockArgument>(operand);
               if (seen.insert(operand).second) {
                 auto stepValue = accessIndices[idx][blockArg.getArgNumber()];
@@ -1713,7 +1716,7 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
         }
         rewriter.setInsertionPointToEnd(&moduleOp.getBodyRegion().back());
         FunctionType parFuncType = rewriter.getFunctionType(operandTypes, {}); // TODO: return type is empty for now, need change for `reduce.return`
-        auto parFuncOp = rewriter.create<FuncOp>(scfParOp.getLoc(), llvm::join_items("_", "par_func", std::to_string(idx)), parFuncType);
+        auto parFuncOp = rewriter.create<FuncOp>(scfParOp.getLoc(), llvm::join_items("_", "" "par_func", std::to_string(parOpCnt), std::to_string(idx)), parFuncType);
         parFuncOp.addEntryBlock();
         rewriter.setInsertionPointToStart(&parFuncOp.getBody().front());
         
@@ -1731,6 +1734,7 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
               mapping.map(operand, parFuncOp.getBody().getArgument(argNumMap[mapCnt++]));
             }
           }
+          // TODO: recursive cloning
           rewriter.clone(op, mapping);
         }
         parFuncs.push_back(parFuncOp);
@@ -1749,6 +1753,8 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
           rewriter.create<func::CallOp>(parFunc.getLoc(), parFunc, parFuncOperands);
         }
       }
+      parOpCnt++;
+      moduleOp.dump();
 
       return WalkResult::advance();
     });
