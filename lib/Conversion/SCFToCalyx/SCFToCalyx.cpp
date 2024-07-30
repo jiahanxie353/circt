@@ -1612,31 +1612,6 @@ class BuildForGroups : public calyx::FuncOpPartialLoweringPattern {
   }
 };
 
-bool isDefinedOutsideRegion(Value value, Region *targetRegion) {
-  Operation *definingOp = value.getDefiningOp();
-  if (!definingOp) {
-    Block *block = cast<BlockArgument>(value).getOwner();
-    Operation *parentOp = block->getParentOp();
-    while (parentOp) {
-      if (parentOp->getParentRegion() == targetRegion) {
-        return false;
-      }
-      parentOp = parentOp->getParentOp();
-    }
-    return true;
-  }
-
-  Operation *parentOp = definingOp;
-  while (parentOp) {
-    if (parentOp->getParentRegion() == targetRegion) {
-      return false;
-    }
-    parentOp = parentOp->getParentOp();
-  }
-
-  return true;
-}
-
 class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
    using FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern;
   LogicalResult
@@ -1649,35 +1624,12 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
         return WalkResult::advance();
 
       auto scfParOp = cast<scf::ParallelOp>(op);
-      mlir::ModuleOp moduleOp = llvm::dyn_cast_or_null<mlir::ModuleOp>(funcOp->getParentOp());
+      mlir::ModuleOp moduleOp = funcOp->getParentOfType<ModuleOp>();
       auto inductVars = scfParOp.getInductionVars();
       // Create a totalNumSteps by numLoops 2-D vector
-      SmallVector<int64_t, 4> lowerBounds, upperBounds, steps;
-      SmallVector<SmallVector<int64_t,4>, 4> accessIndices;
-      for (size_t i = 0; i < scfParOp.getNumLoops(); i++) {
-        auto lbAttr = cast<arith::ConstantOp>(scfParOp.getLowerBound()[i].getDefiningOp()).getValue();
-        auto lb = dyn_cast<IntegerAttr>(lbAttr).getInt();
-        lowerBounds.push_back(lb);
-        auto ubAttr = cast<arith::ConstantOp>(scfParOp.getUpperBound()[i].getDefiningOp()).getValue();
-        auto ub = dyn_cast<IntegerAttr>(ubAttr).getInt();
-        upperBounds.push_back(ub);
-        auto stepAttr = cast<arith::ConstantOp>(scfParOp.getStep()[i].getDefiningOp()).getValue();
-        auto step = dyn_cast<IntegerAttr>(stepAttr).getInt();
-        steps.push_back(step);
-      }
-      auto currIndices = lowerBounds;
-      std::function<void(size_t)> generateCombinations = [&](size_t currDim) {
-        if (currDim == lowerBounds.size()) {
-            accessIndices.push_back(currIndices);
-            return;
-        }
-
-        for (auto s = lowerBounds[currDim]; s < upperBounds[currDim]; s += steps[currDim]) {
-            currIndices[currDim] = s;
-            generateCombinations(currDim + 1);
-        }
-      };
-      generateCombinations(0);
+      auto [lowerBounds, upperBounds, steps] = getLoopBounds(scfParOp);
+      auto accessIndices =
+          generateAccessIndices(lowerBounds, upperBounds, steps);
 
       // parentBlock will be used to insert induct variable constants
       auto *parentBlock = scfParOp.getOperation()->getBlock();
@@ -1697,42 +1649,41 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
             return WalkResult::advance();
 
           for (auto operand : innerOp->getOperands()) {
-            if (std::find(inductVars.begin(), inductVars.end(), operand) != inductVars.end()) {
-              auto blockArg = cast<BlockArgument>(operand);
-              if (seenOperands.insert(operand).second) {
-                auto inductValue = accessIndices[idx][blockArg.getArgNumber()];
-                rewriter.setInsertionPointToStart(parentBlock); 
+            bool isInductVar = std::find(inductVars.begin(), inductVars.end(),
+                                         operand) != inductVars.end();
+            bool isDefinedOutside =
+                isDefinedOutsideRegion(operand, &scfParOp->getRegion(0));
+            if (!isInductVar && !isDefinedOutside)
+              continue;
+
+            if (seenOperands.insert(operand).second) {
+              if (isInductVar) {
+                auto blockArg = cast<BlockArgument>(operand);
+                int inductValue = accessIndices[idx][blockArg.getArgNumber()];
+                rewriter.setInsertionPointToStart(parentBlock);
                 auto indexOp = rewriter.create<arith::ConstantIndexOp>(scfParOp.getLoc(), inductValue);
                 blockArgConsts[blockArg] = indexOp;
                 auto indexVal = indexOp.getResult();
                 currInductOperands.push_back(indexVal);
                 operandTypes.push_back(indexOp.getType());
-                argNumMap.push_back(currInductOperands.size() - 1);
-              }
-              else {
-                auto indexVal = blockArgConsts[blockArg].getResult();
-                auto *it = std::find(currInductOperands.begin(), currInductOperands.end(), indexVal);
-                if (it != currInductOperands.end()) {
-                  int index = std::distance(currInductOperands.begin(), it);
-                  argNumMap.push_back(index);
-                }
-                else
-                  scfParOp.emitError("index not found!");
-              }
-            }
-            else if (isDefinedOutsideRegion(operand, &scfParOp->getRegion(0))) {
-              if (seenOperands.insert(operand).second) {
+              } else {
                 currInductOperands.push_back(operand);
                 operandTypes.push_back(operand.getType());
-                argNumMap.push_back(currInductOperands.size() - 1);
-              } else {
-                auto *it = std::find(currInductOperands.begin(), currInductOperands.end(), operand);
-                if (it != currInductOperands.end()) {
-                  int index = std::distance(currInductOperands.begin(), it);
-                  argNumMap.push_back(index);
-                } else
-                    scfParOp.emitError("index not found!");
               }
+              argNumMap.push_back(currInductOperands.size() - 1);
+            } else {
+              Value indexVal = operand;
+              if (isInductVar) {
+                auto blockArg = cast<BlockArgument>(operand);
+                indexVal = blockArgConsts[blockArg].getResult();
+              }
+              auto *it = std::find(currInductOperands.begin(),
+                                   currInductOperands.end(), indexVal);
+              if (it != currInductOperands.end()) {
+                int index = std::distance(currInductOperands.begin(), it);
+                argNumMap.push_back(index);
+              } else
+                llvm_unreachable("Operand not found!");
             }
           }
           return WalkResult::advance();
@@ -1776,24 +1727,93 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
         operandsToParFuncs.push_back(currInductOperands);
       }
 
-      for (size_t idx = 0; idx < accessIndices.size(); idx++) {
-        for (auto &op : llvm::make_early_inc_range(scfParOp.getOps())) {
-          op.dropAllDefinedValueUses();
-          op.erase();
-        }
-        rewriter.setInsertionPointToEnd(&(*scfParOp->getRegion(0).getBlocks().begin()));
-        for (size_t i = 0; i < parFuncs.size(); i++) {
-          auto parFunc = parFuncs[i];
-          auto parFuncOperands = operandsToParFuncs[i];
-          rewriter.create<func::CallOp>(parFunc.getLoc(), parFunc, parFuncOperands);
-        }
+      for (auto &op : llvm::make_early_inc_range(scfParOp.getOps())) {
+        op.dropAllDefinedValueUses();
+        op.erase();
       }
-      moduleOp.dump();
 
+      rewriter.setInsertionPointToEnd(
+          &(*scfParOp->getRegion(0).getBlocks().begin()));
+      for (size_t i = 0; i < accessIndices.size(); i++) {
+        auto parFunc = parFuncs[i];
+        auto parFuncOperands = operandsToParFuncs[i];
+        rewriter.create<func::CallOp>(parFunc.getLoc(), parFunc,
+                                      parFuncOperands);
+      }
       parOpCnt++;
+
       return WalkResult::advance();
     });
     return res;
+  }
+
+private:
+  using LoopBounds =
+      std::tuple<SmallVector<int64_t, 4>, SmallVector<int64_t, 4>,
+                 SmallVector<int64_t, 4>>;
+
+  bool isDefinedOutsideRegion(Value value, Region *targetRegion) const {
+    Operation *definingOp = value.getDefiningOp();
+    if (!definingOp) {
+      Block *block = cast<BlockArgument>(value).getOwner();
+      Operation *parentOp = block->getParentOp();
+      while (parentOp) {
+        if (parentOp->getParentRegion() == targetRegion) {
+          return false;
+        }
+        parentOp = parentOp->getParentOp();
+      }
+      return true;
+    }
+
+    Operation *parentOp = definingOp;
+    while (parentOp) {
+      if (parentOp->getParentRegion() == targetRegion) {
+        return false;
+      }
+      parentOp = parentOp->getParentOp();
+    }
+
+    return true;
+  }
+
+  int64_t getConstantIntValue(Value val) const {
+    return cast<IntegerAttr>(
+               cast<arith::ConstantOp>(val.getDefiningOp()).getValue())
+        .getInt();
+  }
+
+  LoopBounds getLoopBounds(scf::ParallelOp scfParOp) const {
+    SmallVector<int64_t, 4> lowerBounds, upperBounds, steps;
+    for (size_t i = 0; i < scfParOp.getNumLoops(); i++) {
+      lowerBounds.push_back(getConstantIntValue(scfParOp.getLowerBound()[i]));
+      upperBounds.push_back(getConstantIntValue(scfParOp.getUpperBound()[i]));
+      steps.push_back(getConstantIntValue(scfParOp.getStep()[i]));
+    }
+    return {lowerBounds, upperBounds, steps};
+  }
+
+  SmallVector<SmallVector<int64_t, 4>, 4>
+  generateAccessIndices(const SmallVector<int64_t, 4> &lowerBounds,
+                        const SmallVector<int64_t, 4> &upperBounds,
+                        const SmallVector<int64_t, 4> &steps) const {
+    SmallVector<SmallVector<int64_t, 4>, 4> accessIndices;
+    auto currIndices = lowerBounds;
+
+    std::function<void(size_t)> generateCombinations = [&](size_t currDim) {
+      if (currDim == lowerBounds.size()) {
+        accessIndices.push_back(currIndices);
+        return;
+      }
+      for (auto s = lowerBounds[currDim]; s < upperBounds[currDim];
+           s += steps[currDim]) {
+        currIndices[currDim] = s;
+        generateCombinations(currDim + 1);
+      }
+    };
+
+    generateCombinations(0);
+    return accessIndices;
   }
 };
 
