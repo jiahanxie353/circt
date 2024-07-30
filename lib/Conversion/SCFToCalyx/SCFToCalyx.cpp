@@ -1751,23 +1751,19 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
 
           mlir::IRMapping mapping;
           innerOp.walk([&](Operation *nestedOp) {
-            llvm::errs() << "nestedOp: " << nestedOp->getName().getStringRef() << "\n";
             for (auto &opOperand : nestedOp->getOpOperands()) {
               auto nestedOperand = nestedOp->getOperand(opOperand.getOperandNumber());
-              if(std::find(inductVars.begin(), inductVars.end(), nestedOperand) != inductVars.end() || isDefinedOutsideRegion(nestedOperand, &scfParOp->getRegion(0))) {
-                llvm::errs() << "mapping: ";
-                nestedOperand.dump();
-                llvm::errs() << "to: ";
-                parFuncOp.getBody().getArgument(argNumMap[mapCnt]).dump();
+              if(std::find(inductVars.begin(), inductVars.end(), nestedOperand) != inductVars.end() || isDefinedOutsideRegion(nestedOperand, &scfParOp->getRegion(0)))
                 mapping.map(nestedOperand, parFuncOp.getBody().getArgument(argNumMap[mapCnt++]));
-              }
               else {
+                if (auto blkArgOp = dyn_cast<BlockArgument>(nestedOperand)) {
+                  if (blkArgOp.getOwner()->getParentOp() != scfParOp)
+                    continue; // seems like `rewriter.clone` takes care of the nested cloning
+                }
+                else if (nestedOperand.getDefiningOp()->getParentOp() != scfParOp)
+                  continue; // same reason as above
                 auto *clonedOp = cloneMapping[nestedOperand.getDefiningOp()];
-                llvm::errs() << "its defin op: ";
-                nestedOperand.getDefiningOp()->dump();
-                llvm::errs() << "its clonedOp: ";
-                clonedOp->getResult(0).dump();
-                mapping.map(nestedOperand, clonedOp->getResult(0));
+                mapping.map(nestedOperand, clonedOp->getResult(0)); // TODO: fix it
               }
             }
             return WalkResult::advance();
@@ -1775,7 +1771,6 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
           rewriter.setInsertionPointToEnd(&parFuncOp.getBody().front());
           auto *clonedOp = rewriter.clone(innerOp, mapping);
           cloneMapping[&innerOp] = clonedOp;
-          //innerOp.getResults().replaceUsesWithIf();
         }
         parFuncs.push_back(parFuncOp);
         operandsToParFuncs.push_back(currInductOperands);
