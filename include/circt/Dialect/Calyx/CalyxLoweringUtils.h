@@ -531,6 +531,19 @@ public:
     return s;
   }
 
+  void setMemoryBank(mlir::scf::ParallelOp op, Value memoryToBank, SmallVector<Value, 4> &banks) {
+    assert(bankedMemories[op.getOperation()].count(memoryToBank) == 0 &&
+           "Memory banks were already registered for the memory");
+    bankedMemories[op.getOperation()][memoryToBank] = banks;
+  }
+
+  SmallVector<Value, 4> getMemoryBank(mlir::scf::ParallelOp op, Value bankedMemory) {
+    auto availMemories = bankedMemories[op.getOperation()];
+    auto it = availMemories.find(bankedMemory);
+    assert(it != availMemories.end() && "memory not found in this parallel op");
+    return it->second;
+  } 
+
 private:
   /// The name of this top-level function.
   StringRef topLevelFunction;
@@ -539,6 +552,8 @@ private:
   /// Mapping from ComponentOp to component lowering state.
   DenseMap<Operation *, std::unique_ptr<ComponentLoweringStateInterface>>
       componentStates;
+  /// Mapping from scf::ParallelOp's accessed memories to their corresponding banked memories.
+  DenseMap<Operation *, DenseMap<Value, SmallVector<Value, 4>>> bankedMemories;
 };
 
 /// Extra state that is passed to all PartialLoweringPatterns so they can record

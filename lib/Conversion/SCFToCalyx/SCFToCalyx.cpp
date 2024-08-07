@@ -16,6 +16,8 @@
 #include "circt/Dialect/Calyx/CalyxOps.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
+#include "circt/Support/LLVM.h"
+#include "mlir-c/AffineMap.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -26,13 +28,18 @@
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/ValueRange.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/IR/BlockSupport.h"
+#include "llvm/ADT/DynamicAPInt.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
+#include <cmath>
 #include <fstream>
 
 #include <variant>
@@ -1619,12 +1626,16 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
                            PatternRewriter &rewriter) const override {
     LogicalResult res = success();
     int parOpCnt = 0;
+    mlir::ModuleOp moduleOp = funcOp->getParentOfType<ModuleOp>();
+    // TODO: fix it, hard coding it to experiment
+    // also neeed to verify that the access is affine
+    uint bankingFactor = 4;
+    SmallVector<scf::ParallelOp, 4> parsToClone;
     funcOp.walk([&](Operation *op) {
       if (!isa<scf::ParallelOp>(op))
         return WalkResult::advance();
 
       auto scfParOp = cast<scf::ParallelOp>(op);
-      mlir::ModuleOp moduleOp = funcOp->getParentOfType<ModuleOp>();
       auto inductVars = scfParOp.getInductionVars();
       // Create a totalNumSteps by numLoops 2-D vector
       auto [lowerBounds, upperBounds, steps] = getLoopBounds(scfParOp);
@@ -1637,6 +1648,7 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
       // equals the number of newly created FuncOps
       SmallVector<FuncOp, 4> parFuncs;
       SmallVector<SmallVector<Value, 4>, 4> operandsToParFuncs;
+      DenseSet<Value> seenExtnMemories;
       for (size_t idx = 0; idx < accessIndices.size(); idx++) {
         DenseMap<BlockArgument, arith::ConstantIndexOp> blockArgConsts;
         DenseSet<Value> seenOperands;
@@ -1667,6 +1679,43 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
                 currInductOperands.push_back(indexVal);
                 operandTypes.push_back(indexOp.getType());
               } else {
+                if (isa<MemRefType>(operand.getType())) {
+                  auto operandMemRefType = cast<MemRefType>(operand.getType());
+                  if (seenExtnMemories.insert(operand).second) {
+                    //llvm::errs() << "Is a MemRefType: ";
+                    //operand.dump();
+                    auto origShape = operandMemRefType.getShape();
+                    SmallVector<int64_t, 4> newShape(origShape.begin(), origShape.end());
+                    if (!newShape.empty())
+                      newShape.back() = newShape.back() / bankingFactor;
+                    // First time seeing it, need to create banks based on bankingFactor
+                    // TODO: need a algorithm that work backwards to the top-level function
+                    // in order to pass memory by reference if there is a chain of calls.
+                    // The reason being Calyx only support instantiating memories in the top-level.
+                    // Now I'm just assuming that current FuncOp is the child of the top-level FuncOp
+                    auto topLevelFn = dyn_cast<FuncOp>(SymbolTable::lookupSymbolIn(moduleOp, loweringState().getTopLevelFunction())); // TODO: fix it
+                    rewriter.setInsertionPointToStart(&topLevelFn.getBody().front());
+                    SmallVector<Value, 4> banksForOp;
+                    for (size_t bF = 0; bF < bankingFactor; bF++) {
+                      auto bankMem = rewriter.create<memref::AllocOp>(scfParOp.getLoc(), 
+                                      MemRefType::get(newShape, operandMemRefType.getElementType(), 
+                                                      operandMemRefType.getLayout(), operandMemRefType.getMemorySpace()));
+                      // parentBlock->dump();
+                      banksForOp.push_back(bankMem.getResult());
+                      //currInductOperands.push_back(bankMem.getResult());
+                      //operandTypes.push_back(operandMemRefType);
+                    }
+                    // Then map the banks with the original memory together
+                    loweringState().setMemoryBank(scfParOp, operand, banksForOp);
+                  }
+                  else {
+                    auto banks = loweringState().getMemoryBank(scfParOp, operand);
+                    auto roundRobin = idx % bankingFactor;
+                    //llvm::errs() << "already existing banked memory, round robin: " << roundRobin << "\n";
+                    //llvm::errs() << "corresponding bank: ";
+                    //banks[roundRobin].dump();
+                  }
+                }
                 currInductOperands.push_back(operand);
                 operandTypes.push_back(operand.getType());
               }
@@ -1740,10 +1789,39 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
         rewriter.create<func::CallOp>(parFunc.getLoc(), parFunc,
                                       parFuncOperands);
       }
+
+      parsToClone.push_back(scfParOp);
       parOpCnt++;
 
       return WalkResult::advance();
     });
+
+    IRMapping mapper;
+    for (auto oldPar : parsToClone) {
+      Block &origBlock = oldPar.getRegion().front();
+      auto it = origBlock.begin();
+      uint roundRobin = 0;
+      scf::ParallelOp newParOp;
+      while (it != origBlock.end()) {
+        if (roundRobin % bankingFactor == 0) {
+          rewriter.setInsertionPointToEnd(&funcOp.getFunctionBody().front());
+          newParOp = rewriter.create<scf::ParallelOp>(oldPar.getLoc(), oldPar.getLowerBound(), oldPar.getUpperBound(), oldPar.getStep());
+          mapper.clear();
+          for (auto [origValue, newValue] : llvm::zip(oldPar.getInductionVars(), newParOp.getInductionVars())) {
+            mapper.map(origValue, newValue);
+          }
+          Block &newBlock = newParOp.getRegion().front();
+          rewriter.setInsertionPointToStart(&newBlock);
+        }
+
+      rewriter.clone(*it, mapper);
+      ++it;
+      roundRobin = (roundRobin + 1) % bankingFactor;
+      }
+
+      rewriter.eraseOp(oldPar);
+    }
+    moduleOp.dump();
     return res;
   }
 
