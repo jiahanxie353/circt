@@ -24,6 +24,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AsmState.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LogicalResult.h"
@@ -32,6 +33,7 @@
 #include "llvm/Support/Casting.h"
 #include <fstream>
 
+#include <tuple>
 #include <variant>
 
 namespace circt {
@@ -122,10 +124,15 @@ struct CallScheduleable {
   func::CallOp callOp;
 };
 
+struct ParScheduleable {
+  /// Parallel operation to schedule.
+  scf::ParallelOp parOp;
+};
+
 /// A variant of types representing scheduleable operations.
 using Scheduleable =
     std::variant<calyx::GroupOp, WhileScheduleable, ForScheduleable,
-                 IfScheduleable, CallScheduleable>;
+                 IfScheduleable, CallScheduleable, ParScheduleable>;
 
 class IfLoweringStateInterface {
 public:
@@ -278,6 +285,7 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
               .template Case<arith::ConstantOp, ReturnOp, BranchOpInterface,
                              /// SCF
                              scf::YieldOp, scf::WhileOp, scf::ForOp, scf::IfOp,
+                             scf::ParallelOp, scf::ReduceOp,
                              /// memref
                              memref::AllocOp, memref::AllocaOp, memref::LoadOp,
                              memref::StoreOp, memref::GetGlobalOp,
@@ -316,6 +324,10 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
 
 private:
   /// Op builder specializations.
+  LogicalResult buildOp(PatternRewriter &rewriter,
+                        scf::ReduceOp reduceOp) const;
+  LogicalResult buildOp(PatternRewriter &rewriter,
+                        scf::ParallelOp parallelOp) const;
   LogicalResult buildOp(PatternRewriter &rewriter, scf::YieldOp yieldOp) const;
   LogicalResult buildOp(PatternRewriter &rewriter,
                         BranchOpInterface brOp) const;
@@ -503,6 +515,18 @@ private:
     }
   }
 };
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     scf::ReduceOp reduceOp) const {
+  return success();
+}
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     scf::ParallelOp parOp) const {
+  getState<ComponentLoweringState>().addBlockScheduleable(
+      parOp.getOperation()->getBlock(), ParScheduleable{parOp});
+  return success();
+}
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      memref::LoadOp loadOp) const {
@@ -1588,6 +1612,595 @@ class BuildForGroups : public calyx::FuncOpPartialLoweringPattern {
   }
 };
 
+class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
+  using FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern;
+  LogicalResult
+  partiallyLowerFuncToComp(FuncOp funcOp,
+                           PatternRewriter &rewriter) const override {
+    LogicalResult res = success();
+    auto moduleOp = funcOp->getParentOfType<ModuleOp>();
+    funcOp.walk([&](Operation *op) {
+      if (!isa<scf::ParallelOp>(op))
+        return WalkResult::advance();
+
+      auto scfParOp = cast<scf::ParallelOp>(op);
+
+      // If there is no memory inside `scf.parallel` region, we make everything parallel:
+      /*** seq {
+       *    par {
+       *      call par_func0;
+       *      call par_func1;
+       *      ...
+       *      call par_func(access indices - 1);
+       *    }
+       *  }
+       *  
+       *  par_func0 {
+       *    same as scf.paralle's body, but with specific induction variables substituted
+       *  }
+       *  ...
+       *  par_func(access indicies - 1) {
+       *    ...
+       *  }
+       *
+      ***/
+      //
+      // If we have memories involved, the number of `par_func` we can execute simultaneously == the banking factor:
+      //   since all the `par_func`s embedded in a `calyx.par` will be executed in parallel;
+      //   and we need to make sure that all banks can always get executed in parallel so we have to analyze
+      //   the access patterns, which we need to look at user input and correct that.
+      // One exception about the number of `par_func`s executed in parallel is the ones got "leftover",
+      //   when the size of `access indices` is not divisible by the banking factor.
+      // If we have multiple memories, the number of parallelism is min{bf}, for bf \in {all banking_factors}.
+      // FWIW, the number of `par_func`s can be executed in parallel equals the `width` in a `calyx.par`.
+      //
+      // On the other hand, the instructions within a `par_func` are executed in sequence. These body-instructions
+      //   can share the same bank and the same induction variables.
+      // FWIW, the number of instructions in `par_func`'s == the number of instructions in the original `scf.parallel`.
+      //
+      // Then, the number of `calyx.par` equals `ceil(access indicies / banking factor)` 
+      //
+      // Note: if we don't know either one of lower bound/upper bound/step, we need to be conservative.
+      //
+      /*** seq {
+       *    par {
+       *      call par_func0(iv0, bank0);
+       *      call par_func1(iv1, bank1);
+       *      ...
+       *      call par_funcj(iv{z}, bank{z});               // z <= banking factor - 1
+       *    }
+       *    par {
+       *      call par_func0(iv{z+1}, bank0);
+       *      call par_func1(iv{z+2}, bank1)
+       *    }
+       *    ...
+       *    par {
+       *      call par_func0(iv{m},, bank0);                // m = access indicies - l - 1
+       *      ...
+       *      call par_func(iv{access indicies-1}, bank{l}) // l = min{z, access indicies % z} - 1
+       *    }
+       *  }
+       *
+       *
+       * par_func0 {
+       *  same as scf.parallel's body, but with memory bank 0 and specific induction variables
+       * }
+       *
+      ***/
+
+      /*** Affine analysis 
+       *
+       * Need the layout of all access patterns by doing static analysis; one access pattern per memory,
+       * then we can decide how many banks we need for each memory. 
+       *
+       * Algorithm:
+       *  1. Iterate all memories, for each memory:
+       *       - Obtain the access index;
+       *       - Compute the static constant value for this index
+       *         - if we can't get the constant value statically, we make the banking factor = 1
+       *       - Insert the static value to the map 
+       *
+       *  2. For each mem, need to get the minimum interval for two identical values between all patterns of affine access.
+       *      - For example, if we have three patterns of affine access:
+       *        step: 0, 1   2,  3,  4
+       *        -----------------------
+       *        i:    0, 1,  2,  3,  4  ==> (1)
+       *        2i+3: 3, 5,  7,  9, 11  ==> (2)
+       *        5i+4: 4, 9, 14, 19, 24  ==> (3)
+       *
+       *        we want the min of:
+       *          - (1) & (2):
+       *            - s3 - s0 = 3
+       *          - (1) & (3):
+       *            - s4 - s0 = 4
+       *          - (2) & (3):
+       *            - s3 - s1 = 2
+       *       which is 2
+       * 
+       ***************************************************
+       *
+       * Overall algorithm
+       *  1. Determine the total number of access indicies combinations;
+       *  2. Determine the number of banking factors by doing affine analaysis (above);
+       *  3. int round_robin = 0, new_pars = 0
+       *     for access_idx in range(0, access_indicies.size) {
+       *        1. create operands
+       *          - inductive operand: create arith.constant;
+       *          - operands that are defined outside the scf.parallel region
+       *          - memref banked operands: pass in round_robin'th bank
+       *        2. create `par_func` and pass in operands
+       *        3. round_robin += 1
+       *           if (round_robin + 1) % banking_factor == 0:
+       *             round_robin = 0
+       *             new_pars += 1
+       *    }
+       *
+       ***/ 
+      
+      // Implementation
+      // 1. Calculate `access_indicies`, the `combinations` of all loop inductive variables.
+      //    Note, we need to guarantee that all memories are one-dim. So the size of `access_indicies` = #memories.
+      auto [lowerBounds, upperBounds, steps] = getLoopBounds(scfParOp);
+      auto inductVarCombs =
+          genInductVarCombinations(lowerBounds, upperBounds, steps);
+
+      // 2. Iterate through the induct vars, create a `par_func` when the banking factor is divisible by `round_robin` 
+      uint roundRobin = 0;
+      uint newParOpCnt = 0;
+      auto ivToArithConst = createIVConsts(rewriter, scfParOp);
+      partialEval(rewriter, ivToArithConst, scfParOp);
+      auto bankingFactor = computeBankingFactor(ivToArithConst, scfParOp);
+      rewriter.setInsertionPointAfter(scfParOp);
+      SmallVector<FuncOp> funcsInPar;
+      DenseSet<Value> seenOperands;
+      DenseMap<Value, uint> operandToArgPos;
+      uint argPos = 0;
+      SmallVector<Value> fnOperands;
+      for (size_t ivCombIdx = 0; ivCombIdx < inductVarCombs.size(); ivCombIdx++) {
+        FuncOp parFuncOp;
+        if (parFuncs.begin() + ivCombIdx % bankingFactor == parFuncs.end()) {
+          FunctionType parFuncTy = computeParFuncTy(rewriter, ivCombIdx, bankingFactor, scfParOp);
+          rewriter.setInsertionPointAfter(funcOp);
+          parFuncOp = rewriter.create<FuncOp>(scfParOp.getLoc(),
+              llvm::join_items("_", "" "par_func", std::to_string(newParOpCnt),
+                             std::to_string(ivCombIdx % bankingFactor)), parFuncTy);
+          parFuncs.push_back(parFuncOp);
+        }
+        else
+          parFuncOp = parFuncs[ivCombIdx % bankingFactor];
+        if (parFuncOp.getBlocks().empty()) {
+          IRMapping funcParBodyMap;
+          parFuncOp.addEntryBlock();
+          //rewriter.setInsertionPointToStart(entryBlock);
+          //DenseSet<Value> seenOperands;
+          //DenseMap<Value, uint> operandToArgPos;
+          //uint argPos = 0;
+          //for (Operation &op : scfParOp.getBody()->getOperations()) {
+            //if (isa<scf::ReduceOp, scf::ParallelOp>(op))
+              //continue;
+            //mapFuncAndParOpBody(funcParBodyMap, argPos, &op, parFuncOp, seenOperands, operandToArgPos);
+            //rewriter.clone(op, funcParBodyMap);
+          //}
+        }
+        Block *entryBlock = &parFuncOp.getBlocks().front();
+        funcsInPar.push_back(parFuncOp);
+        IRMapping mapping;
+        const auto &ivComb = inductVarCombs[ivCombIdx];
+        rewriter.setInsertionPointToEnd(entryBlock);
+        for (auto ivComb : inductVarCombs) {
+          auto [lbVal, ubVal] = ivComb;
+          auto lbConst = rewriter.create<arith::ConstantIndexOp>(scfParOp.getLoc(), lbVal);
+          auto ubConst = rewriter.create<arith::ConstantIndexOp>(scfParOp.getLoc(), ubVal);
+          ivToArithConst[ivComb] = std::make_tuple(lbConst, ubConst);
+        }
+        auto ivCombConst = ivToArithConst[ivComb];
+        mapping.map(scfParOp.getInductionVars()[0], std::get<0>(ivCombConst));
+        mapping.map(scfParOp.getInductionVars()[1], std::get<1>(ivCombConst));
+        auto inductVars = scfParOp.getInductionVars();
+        for (Operation &innerOp : scfParOp.getBody()->getOperations()) {
+          for (auto operand : innerOp.getOperands()) {
+            bool isDefinedInside = isDefinedInsideRegion(operand, &scfParOp->getRegion(0));
+            if (!isDefinedInside) {
+              if (seenOperands.insert(operand).second) {
+                assert(operandToArgPos.find(operand) == operandToArgPos.end() && "must have not seen");
+                mapping.map(operand, parFuncOp.getArgument(argPos));
+                operandToArgPos[operand] = argPos;
+                argPos++;
+                fnOperands.push_back(operand);
+              }
+              else
+                mapping.map(operand, parFuncOp.getArgument(operandToArgPos[operand]));
+            }
+          }
+        }
+        rewriter.setInsertionPointToEnd(entryBlock);
+        //rewriter.setInsertionPointAfter(scfParOp);
+        SmallVector<Operation *> clonedOps;
+        for (Operation &op : scfParOp.getBody()->getOperations()) {
+          if (!isa<scf::ReduceOp>(op)) {
+            Operation *clonedOp = rewriter.clone(op, mapping);
+            clonedOps.push_back(clonedOp);
+          }
+        }
+        //llvm::errs() << "par_func at: " << ivCombIdx << " is: \n";
+        //parFuncOp->dump();
+        roundRobin = (roundRobin + 1) % bankingFactor;
+        assert(inductVarCombs.size() % bankingFactor == 0);
+      }
+      rewriter.setInsertionPointAfter(scfParOp);
+      for (size_t bF = 0; bF < bankingFactor; bF++) {
+          // the actual steps and everything doesn't really matter for the newly created parallel ops now
+          auto newParOp = rewriter.create<scf::ParallelOp>(
+            scfParOp.getLoc(), scfParOp.getLowerBound(), scfParOp.getUpperBound(), scfParOp.getStep());
+          rewriter.setInsertionPointToStart(&newParOp.getRegion().getBlocks().front());
+          auto calleeName =
+                  SymbolRefAttr::get(rewriter.getContext(), funcsInPar.front().getSymName());
+          auto resultTypes = funcsInPar.front().getResultTypes();
+          rewriter.create<CallOp>(newParOp.getLoc(), calleeName, resultTypes, fnOperands);
+          for (auto parFunc : funcsInPar) {
+            //parFunc->moveAfter(&newParOp.getRegion().getBlocks().front().back());
+          }
+          newParOpCnt++;
+          funcsInPar.clear();
+          //rewriter.setInsertionPointAfter(newParOp);
+          // llvm::errs() << "need to create a scf parallel; par func count: " << newParCnt << "\n";
+      }
+
+      rewriter.eraseOp(scfParOp);
+      
+      return WalkResult::advance();
+    });
+    //llvm::errs() << "moduleOp: \n";
+    //moduleOp.dump();
+    return res;
+};
+
+private:
+  mutable SmallVector<FuncOp> parFuncs;
+  using LoopBounds =
+      std::tuple<SmallVector<int64_t, 4>, SmallVector<int64_t, 4>,
+                 SmallVector<int64_t, 4>>;
+
+  LoopBounds getLoopBounds(scf::ParallelOp scfParOp) const {
+    auto getConstantIntValue = [](Value val) -> int64_t {
+        return cast<IntegerAttr>(
+                   cast<arith::ConstantIndexOp>(val.getDefiningOp()).getValue())
+            .getInt();
+    };
+    SmallVector<int64_t, 4> lowerBounds, upperBounds, steps;
+    for (size_t i = 0; i < scfParOp.getNumLoops(); i++) {
+      lowerBounds.push_back(getConstantIntValue(scfParOp.getLowerBound()[i]));
+      upperBounds.push_back(getConstantIntValue(scfParOp.getUpperBound()[i]));
+      steps.push_back(getConstantIntValue(scfParOp.getStep()[i]));
+    }
+    return {lowerBounds, upperBounds, steps};
+  }
+
+  template <std::size_t... Is>
+  auto generateTuple(const std::vector<int64_t>& indices, std::index_sequence<Is...>) const {
+      return std::make_tuple(indices[Is]...);
+  }
+  
+  SmallVector<std::tuple<int64_t, int64_t>, 4>
+  genInductVarCombinations(const SmallVector<int64_t, 4> &lowerBounds,
+                        const SmallVector<int64_t, 4> &upperBounds,
+                        const SmallVector<int64_t, 4> &steps) const {
+      SmallVector<std::tuple<int64_t, int64_t>, 4> accessIndices;
+      std::vector<int64_t> currIndices(lowerBounds.size());
+  
+      std::function<void(size_t)> generateCombinations = [&](size_t currDim) {
+          if (currDim == lowerBounds.size()) {
+              accessIndices.push_back(generateTuple(currIndices, std::make_index_sequence<2>{}));
+              return;
+          }
+  
+          for (auto s = lowerBounds[currDim]; s < upperBounds[currDim]; s += steps[currDim]) {
+              currIndices[currDim] = s;
+              generateCombinations(currDim + 1);
+          }
+      };
+  
+      generateCombinations(0);
+      return accessIndices;
+  }
+
+  bool isDefinedInsideRegion(Value value, Region *targetRegion) const {
+    Operation *definingOp = value.getDefiningOp();
+    if (!definingOp) {
+      Block *block = cast<BlockArgument>(value).getOwner();
+      Region *currentRegion = block->getParent();
+      while (currentRegion) {
+        if (currentRegion == targetRegion) {
+          return true;
+        }
+        Operation *parentOp = currentRegion->getParentOp();
+        currentRegion = parentOp ? parentOp->getParentRegion() : nullptr;
+      }
+      return false;
+    }
+
+    Operation *parentOp = definingOp;
+    while (parentOp) {
+      if (parentOp->getParentRegion() == targetRegion) {
+        return true;
+      }
+      parentOp = parentOp->getParentOp();
+    }
+
+    return false;
+  }
+
+  DenseMap<std::tuple<int64_t, int64_t>, std::tuple<arith::ConstantIndexOp, arith::ConstantIndexOp>> createIVConsts(PatternRewriter &rewriter, scf::ParallelOp scfParOp) const {
+    DenseMap<std::tuple<int64_t, int64_t>, std::tuple<arith::ConstantIndexOp, arith::ConstantIndexOp>> ivToArithConst;
+    auto [lowerBounds, upperBounds, steps] = getLoopBounds(scfParOp);
+    auto inductVarCombs =
+          genInductVarCombinations(lowerBounds, upperBounds, steps);
+    rewriter.setInsertionPointToStart(scfParOp.getOperation()->getBlock());
+    for (auto ivComb : inductVarCombs) {
+      auto [lbVal, ubVal] = ivComb;
+      auto lbConst = rewriter.create<arith::ConstantIndexOp>(scfParOp.getLoc(), lbVal);
+      auto ubConst = rewriter.create<arith::ConstantIndexOp>(scfParOp.getLoc(), ubVal);
+      ivToArithConst[ivComb] = std::make_tuple(lbConst, ubConst);
+    }
+    return ivToArithConst;
+  }
+
+  void partialEval(PatternRewriter &rewriter, DenseMap<std::tuple<int64_t, int64_t>, std::tuple<arith::ConstantIndexOp, arith::ConstantIndexOp>>& ivToArithConst, scf::ParallelOp scfParOp) const {
+    std::function<uint(Value)> evaluateIndex = [&](Value val) -> uint {
+      if (auto constIndexOp = dyn_cast<arith::ConstantIndexOp>(val.getDefiningOp())) {
+        return constIndexOp.value();
+      }
+      if (auto addOp = dyn_cast<arith::AddIOp>(val.getDefiningOp())) {
+        uint lhsValue = evaluateIndex(addOp.getLhs());
+        uint rhsValue = evaluateIndex(addOp.getRhs());
+        return lhsValue + rhsValue;
+      }
+      if (auto mulOp = dyn_cast<arith::MulIOp>(val.getDefiningOp())) {
+        uint lhsValue = evaluateIndex(mulOp.getLhs());
+        uint rhsValue = evaluateIndex(mulOp.getRhs());
+        return lhsValue * rhsValue;
+      }
+      // Add more cases. We can do this only because we would have got error if we
+      // failed to get induction variables as constants.
+      llvm_unreachable("Unsupported operation for index evaluation");
+    };
+
+    auto [lowerBounds, upperBounds, steps] = getLoopBounds(scfParOp);
+    auto inductVarCombs =
+          genInductVarCombinations(lowerBounds, upperBounds, steps);
+    auto inductVars = scfParOp.getInductionVars();
+ //   rewriter.setInsertionPointAfter(scfParOp);
+ //   for (const auto &ivComb : inductVarCombs) {
+ //     auto ivCombConst = ivToArithConst[ivComb];
+ //     IRMapping mapping;
+ //     mapping.map(scfParOp.getInductionVars()[0], std::get<0>(ivCombConst));
+ //     mapping.map(scfParOp.getInductionVars()[1], std::get<1>(ivCombConst));
+ //     for (Operation &op : scfParOp.getBody()->getOperations()) {
+ //       if (isa<scf::ReduceOp, scf::ParallelOp>(op))
+ //         continue;
+ //       Operation *clonedOp = rewriter.clone(op, mapping);
+ //       if (auto loadOp = dyn_cast<memref::LoadOp>(clonedOp)) {
+ //         assert(loadOp.getIndices().size() == 1);
+ //         auto loadAddr = loadOp.getIndices().front();
+ //         auto constIntAddr = evaluateIndex(loadAddr); 
+ //       }
+ //       else if (auto storeOp = dyn_cast<memref::StoreOp>(clonedOp)) {
+ //         assert(storeOp.getIndices().size() == 1);
+ //         auto storeAddr = storeOp.getIndices().front();
+ //         auto constIntAddr = evaluateIndex(storeAddr); 
+ //       }
+ //     }
+ //   }
+    // TODO: return a mapping from memory values to their access indices, 
+    // to be ready for computing the banking factor
+  }
+
+  uint computeBankingFactor(DenseMap<std::tuple<int64_t, int64_t>, std::tuple<arith::ConstantIndexOp, arith::ConstantIndexOp>>& ivToArithConst, scf::ParallelOp scfParOp) const {
+    DenseMap<Operation *, SmallVector<uint>> memOpAccessIndices;
+    auto [lowerBounds, upperBounds, steps] = getLoopBounds(scfParOp);
+    auto inductVarCombs =
+          genInductVarCombinations(lowerBounds, upperBounds, steps);
+    bool knowAddrsStatically = true;
+    for (size_t ivCombIdx = 0; ivCombIdx < inductVarCombs.size(); ivCombIdx++) {
+      scfParOp.walk([&](Operation *innerOp) {
+        if (auto loadOp = dyn_cast<memref::LoadOp>(innerOp)) {
+          assert(loadOp.getIndices().size() == 1 && "all memref::load operations should get flattened before this pass");
+          auto loadAddr = loadOp.getIndices().front();
+          OpFoldResult foldRes = getAsOpFoldResult(loadAddr);
+          auto constIntAddr = getConstantIntValue(foldRes); 
+          if (!constIntAddr.has_value()) {
+            // llvm::errs() << "cannot know statically: \n";
+            //loadAddr.dump();
+            knowAddrsStatically = false;
+            return WalkResult::interrupt();
+          }
+          //llvm::errs() << "constant int value: " << constIntAddr << "\n";
+        }
+
+        if (auto storeOp = dyn_cast<memref::StoreOp>(innerOp)) {
+          assert(storeOp.getIndices().size() == 1 && "all memref::store operations should get flattened before this pass");
+          auto storeAddr = storeOp.getIndices().front();
+          //llvm::errs() << "store address is: " << storeAddr << "\n";
+        }
+
+        return WalkResult::advance();
+      });
+    }
+   
+    if (!knowAddrsStatically)
+      // conservatively set the `bankingFactor` to 1 if we don't know the value statically
+      return 1;
+    return 7;
+  }
+
+  mutable DenseMap<Value, uint> memToBankSize;
+  mutable DenseMap<Value, SmallVector<Value, 4>> memsToBanks;
+  std::optional<SmallVector<Value, 4>> computeMemBanks(PatternRewriter &rewriter, Value mem, uint bankingFactor, scf::ParallelOp scfParOp) const {
+    if (memsToBanks.find(mem) == memsToBanks.end()) {
+      // Calculate the new shape of each newly created `allocOp`s
+      auto memTy = cast<MemRefType>(mem.getType());
+      auto origShape = memTy.getShape();
+      if (origShape.front() % bankingFactor != 0) {
+        scfParOp.emitError() << "memory shape must be divisible by the banking factor";
+        return std::nullopt;
+      }
+      assert(origShape.size() == 1 && "memref must be flattened before scf-to-calyx pass");
+      auto bankSize = origShape.front() / bankingFactor;
+
+      // Create new `allocOp`s to the proper top-level function
+      auto moduleOp = scfParOp->getParentOfType<ModuleOp>();
+      auto funcOp = scfParOp->getParentOfType<FuncOp>();
+      auto topLevelFn = cast<FuncOp>(SymbolTable::lookupSymbolIn(
+                              moduleOp, loweringState().getTopLevelFunction()));
+
+      SmallVector<Value, 4> memBankOperands, memBankArgs;
+      SmallVector<Type, 4> memBankArgTys;
+      Block *curFnBody = &funcOp.getBody().front();
+      Block *topLevelEntryBlock = &topLevelFn.getBody().front();
+      rewriter.setInsertionPointToStart(topLevelEntryBlock);
+      for (size_t bankCnt = 0; bankCnt < bankingFactor; bankCnt++) {
+        // TODO: change to alloc, alloca, getglobal
+        auto allocOp = rewriter.create<memref::AllocOp>(
+              topLevelFn.getLoc(), MemRefType::get(bankSize, memTy.getElementType(),
+                                                memTy.getLayout(), memTy.getMemorySpace()));
+        memBankOperands.push_back(allocOp.getResult());
+        curFnBody->addArgument(allocOp.getType(), funcOp.getLoc());
+        BlockArgument newBodyArg = curFnBody->getArguments().back();
+        memBankArgs.push_back(newBodyArg); 
+        memBankArgTys.push_back(newBodyArg.getType());
+      }
+
+      // Update the `funcOp`/callee type to get ready to be called by new operands
+      SmallVector<Type, 4> updatedCurFnArgTys(
+        funcOp.getFunctionType().getInputs());
+      updatedCurFnArgTys.append(memBankArgTys.begin(), memBankArgTys.end());
+      funcOp.setType(FunctionType::get(funcOp.getContext(), updatedCurFnArgTys,
+                                     funcOp.getFunctionType().getResults()));
+
+      // Update the `callOp` from the topl-level function with the newly created
+      // `allocOp`s' result      
+      topLevelFn.walk([&](Operation *op) {
+        if (auto callOp = dyn_cast<CallOp>(op)) {
+          if (callOp.getCallee() == funcOp.getName()) {
+            SmallVector<Value, 4> newOperands(callOp.getOperands());
+            newOperands.append(memBankOperands.begin(), memBankOperands.end());
+
+            callOp->setOperands(newOperands);
+            assert(callOp.getNumOperands() == funcOp.getNumArguments() &&
+              "number of operands and block arguments should match after appending new memory banks");
+          }
+        }
+      });
+
+      // Finally set the corresponding memory banks to the given `mem`
+      memsToBanks[mem] = memBankOperands;
+    }
+    return memsToBanks[mem];
+  }
+
+  SmallVector<Type> computeParFuncRetTys(scf::ParallelOp scfParOp) const {
+    SmallVector<Type> parFuncRetTys;
+    scfParOp.walk([&](mlir::Operation *innerOp) {
+      if (isa<scf::ReduceOp>(innerOp)) {
+        auto reduceOp = cast<scf::ReduceOp>(innerOp);
+        reduceOp->getResultTypes();
+        parFuncRetTys.append(reduceOp->getResultTypes().begin(), reduceOp->getResultTypes().end());
+        return WalkResult::advance();
+      }
+    return WalkResult::advance();
+    });
+    return parFuncRetTys;
+  }
+
+  FunctionType computeParFuncTy(PatternRewriter &rewriter, uint idx, uint bankingFactor, scf::ParallelOp scfParOp) const {
+    //llvm::errs() << "need to compute function type\n";
+    SmallVector<Type> curFuncArgTys;
+    auto inductVars = scfParOp.getInductionVars();
+    DenseSet<Value> seenOperands;
+    scfParOp.walk([&](mlir::Operation *innerOp) {
+      if (isa<scf::ParallelOp, scf::ReduceOp>(innerOp))
+        return WalkResult::advance();
+
+      for (auto operand : innerOp->getOperands()) {
+        // Scenario 1: inductive var;
+//        bool isInductVar = std::find(inductVars.begin(), inductVars.end(), operand) != inductVars.end();
+//        if (isInductVar && seenOperands.insert(operand).second) {
+//          curFuncArgTys.push_back(operand.getType());
+//          continue;
+//        }
+        // Scenario 2: defined outside of scf::parallel;
+        bool isDefinedInside = isDefinedInsideRegion(operand, &scfParOp->getRegion(0));
+        if (!isDefinedInside && seenOperands.insert(operand).second) {
+          if (isa<MemRefType>(operand.getType())) {
+            assert(isa<BlockArgument>(operand) && "any MemRefType must be BlockArgument passing from the top-level function");
+            auto memBanks = computeMemBanks(rewriter, operand, bankingFactor, scfParOp);
+            // TODO: how to do it properly
+            assert(memBanks.has_value() && "memory banks must exist");
+            curFuncArgTys.push_back((*memBanks)[idx % bankingFactor].getType());
+          }
+          else
+            curFuncArgTys.push_back(operand.getType());
+          //llvm::errs() << "is defined outside scf parallel region: \n";
+          //operand.dump();
+        }
+      }
+
+      return WalkResult::advance();
+    });
+    auto retTys = computeParFuncRetTys(scfParOp);
+    return rewriter.getFunctionType(curFuncArgTys, retTys);
+  }
+  
+  void mapFuncAndParOpBody(IRMapping &mapping, uint &argPos, Operation *op, FuncOp parFunc, DenseSet<Value> &seenOperands, DenseMap<Value, uint> &operandToArgPos, scf::ParallelOp scfParOp) const {
+    //llvm::errs() << "need to compute function type\n";
+    auto inductVars = scfParOp.getInductionVars();
+    for (auto operand : op->getOperands()) {
+      // Scenario 1: inductive var;
+      bool isInductVar = std::find(inductVars.begin(), inductVars.end(), operand) != inductVars.end();
+      if (isInductVar) {
+        if (seenOperands.insert(operand).second) {
+          assert(operandToArgPos.find(operand) == operandToArgPos.end() && "must have not seen");
+          mapping.map(operand, parFunc.getArgument(argPos));
+          operandToArgPos[operand] = argPos;
+          argPos++;
+        }
+        else {
+          mapping.map(operand, parFunc.getArgument(operandToArgPos[operand]));
+        }
+        continue;
+      }
+      // Scenario 2: defined outside of scf::parallel;
+      bool isDefinedInside = isDefinedInsideRegion(operand, &scfParOp->getRegion(0));
+      if (!isDefinedInside) {
+        if (seenOperands.insert(operand).second) {
+          if (isa<MemRefType>(operand.getType())) {
+            assert(isa<BlockArgument>(operand) && "any MemRefType must be BlockArgument passing from the top-level function");
+            assert(operandToArgPos.find(operand) == operandToArgPos.end() && "must have not seen");
+            mapping.map(operand, parFunc.getArgument(argPos));
+            operandToArgPos[operand] = argPos;
+            argPos++;
+          }
+          else {
+            assert(operandToArgPos.find(operand) == operandToArgPos.end() && "must have not seen");
+            mapping.map(operand, parFunc.getArgument(argPos));
+            operandToArgPos[operand] = argPos;
+            argPos++;
+          }
+        }
+        else {
+          if (isa<MemRefType>(operand.getType())) {
+            assert(isa<BlockArgument>(operand) && "any MemRefType must be BlockArgument passing from the top-level function");
+            mapping.map(operand, parFunc.getArgument(operandToArgPos[operand]));
+          }
+          else {
+            mapping.map(operand, parFunc.getArgument(operandToArgPos[operand]));
+          }
+        }
+      }
+    }
+  }
+};
+
 class BuildIfGroups : public calyx::FuncOpPartialLoweringPattern {
   using FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern;
 
@@ -1664,7 +2277,8 @@ private:
         getState<ComponentLoweringState>().getBlockScheduleables(block);
     auto loc = block->front().getLoc();
 
-    if (compBlockScheduleables.size() > 1) {
+    if (compBlockScheduleables.size() > 1 &&
+        !isa<scf::ParallelOp>(block->getParentOp())) {
       auto seqOp = rewriter.create<calyx::SeqOp>(loc);
       parentCtrlBlock = seqOp.getBodyBlock();
     }
@@ -1724,6 +2338,15 @@ private:
             getState<ComponentLoweringState>().getForLoopLatchGroup(forOp);
         rewriter.create<calyx::EnableOp>(forLatchGroup.getLoc(),
                                          forLatchGroup.getName());
+        if (res.failed())
+          return res;
+      } else if (auto *parSchedPtr = std::get_if<ParScheduleable>(&group)) {
+        auto parOp = parSchedPtr->parOp;
+
+        auto calyxParOp = rewriter.create<calyx::ParOp>(parOp.getLoc());
+        LogicalResult res =
+            buildCFGControl(path, rewriter, calyxParOp.getBodyBlock(), block,
+                            &parOp.getRegion().getBlocks().front());
         if (res.failed())
           return res;
       } else if (auto *ifSchedPtr = std::get_if<IfScheduleable>(&group);
@@ -2347,6 +2970,9 @@ void SCFToCalyxPass::runOnOperation() {
   DenseMap<FuncOp, calyx::ComponentOp> funcMap;
   SmallVector<LoweringPattern, 8> loweringPatterns;
   calyx::PatternApplicationState patternState;
+
+  addOncePattern<BuildParGroups>(loweringPatterns, patternState, funcMap,
+                                 *loweringState);
 
   /// Creates a new Calyx component for each FuncOp in the inpurt module.
   addOncePattern<FuncOpConversion>(loweringPatterns, patternState, funcMap,
