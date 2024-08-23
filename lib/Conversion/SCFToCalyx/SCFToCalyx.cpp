@@ -16,6 +16,7 @@
 #include "circt/Dialect/Calyx/CalyxOps.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
+#include "circt/Support/LLVM.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -23,17 +24,29 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/Visitors.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/MathExtras.h"
+#include "llvm/Support/raw_ostream.h"
 #include <fstream>
+#include <bitset>
 
+#include <limits>
+#include <optional>
+#include <string>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <variant>
 
 namespace circt {
@@ -1619,6 +1632,203 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
                            PatternRewriter &rewriter) const override {
     LogicalResult res = success();
     auto moduleOp = funcOp->getParentOfType<ModuleOp>();
+    
+    // TraceBanks algorithm
+    uint availableBanks = 4;
+    SmallVector<scf::ParallelOp> scfParOps;
+    DenseSet<Operation *> memories;
+    funcOp.walk([&](Operation *op){
+      if (!isa<scf::ParallelOp, memref::AllocOp, memref::AllocaOp, memref::GetGlobalOp>(op))
+        return WalkResult::advance();
+      
+      if (auto scfParOp = dyn_cast<scf::ParallelOp>(op)) {
+        auto newParOp = partialEval(rewriter, scfParOp);
+        scfParOps.push_back(newParOp);
+      }
+      else
+       memories.insert(op);
+
+      return WalkResult::advance();
+    });
+
+    llvm::errs() << "all memories: \n";
+    for (auto *mem : memories) {
+      mem->dump();
+    }
+
+    for (auto *mem : memories) {
+      traceBankAlgo(scfParOps, mem);
+      //auto banksOfMemAccess = getBankOfMemAccess(mem)
+      //replaceMemWithBanks()
+    }
+
+    IRMapping mapping;
+    for (auto *mem : memories) {
+      for (auto *user : mem->getUsers()) {
+        llvm::errs() << "find using memoryOp: \n";
+        user->dump();
+        Value accessIndex;
+        uint bankID = 0;
+        if (auto loadOp = dyn_cast<memref::LoadOp>(user)) {
+          assert(loadOp.getIndices().size() == 1);
+          accessIndex = loadOp.getIndices().front();
+          bankID = getBankOfMemAccess(mem, accessIndex);
+          if (getBanksForMem(mem).empty()) {
+            llvm::errs() << "have not allocated banks yet\n";
+
+            auto memTy = cast<MemRefType>(loadOp.getMemRef().getType());
+    // Allocate new banks
+    auto origShape = memTy.getShape();
+    if (origShape.front() % availableBanks != 0) {
+      mem->emitError() << "memory shape must be divisible by the banking factor";
+    }
+    assert(origShape.size() == 1 && "memref must be flattened before scf-to-calyx pass");
+    auto bankSize = origShape.front() / availableBanks;
+
+    // Create new `allocOp`s to the proper top-level function
+    auto moduleOp = mem->getParentOfType<ModuleOp>();
+    auto funcOp = mem->getParentOfType<FuncOp>();
+    auto topLevelFn = cast<FuncOp>(SymbolTable::lookupSymbolIn(
+                            moduleOp, loweringState().getTopLevelFunction()));
+
+    SmallVector<Value, 4> memBankOperands, memBankArgs;
+    SmallVector<Type, 4> memBankArgTys;
+    Block *curFnBody = &funcOp.getBody().front();
+    Block *topLevelEntryBlock = &topLevelFn.getBody().front();
+    auto builder = OpBuilder::atBlockBegin(topLevelEntryBlock); 
+            SmallVector<Operation *> banks;
+    for (uint bankCnt = 1; bankCnt <= availableBanks; bankCnt++) {
+      // TODO: change to alloc, alloca, getglobal
+      auto allocOp = builder.create<memref::AllocOp>(
+            topLevelFn.getLoc(), MemRefType::get(bankSize, memTy.getElementType(),
+                                              memTy.getLayout(), memTy.getMemorySpace()));
+              banks.push_back(allocOp);
+
+      memBankOperands.push_back(allocOp.getResult());
+        curFnBody->addArgument(allocOp.getType(), funcOp.getLoc());
+        BlockArgument newBodyArg = curFnBody->getArguments().back();
+        memBankArgs.push_back(newBodyArg); 
+        memBankArgTys.push_back(newBodyArg.getType());
+      }
+            setBanksForMem(mem, banks);
+
+      // Update the `funcOp`/callee type to get ready to be called by new operands
+      SmallVector<Type, 4> updatedCurFnArgTys(
+        funcOp.getFunctionType().getInputs());
+      updatedCurFnArgTys.append(memBankArgTys.begin(), memBankArgTys.end());
+      funcOp.setType(FunctionType::get(funcOp.getContext(), updatedCurFnArgTys,
+                                     funcOp.getFunctionType().getResults()));
+
+      // Update the `callOp` from the topl-level function with the newly created
+      // `allocOp`s' result      
+      topLevelFn.walk([&](Operation *op) {
+        if (auto callOp = dyn_cast<CallOp>(op)) {
+          if (callOp.getCallee() == funcOp.getName()) {
+            SmallVector<Value, 4> newOperands(callOp.getOperands());
+            newOperands.append(memBankOperands.begin(), memBankOperands.end());
+
+            callOp->setOperands(newOperands);
+            assert(callOp.getNumOperands() == funcOp.getNumArguments() &&
+              "number of operands and block arguments should match after appending new memory banks");
+          }
+        }
+      });
+          }
+          rewriter.setInsertionPoint(loadOp);
+          Value constDivVal = rewriter.create<arith::ConstantOp>(
+                               rewriter.getUnknownLoc(), rewriter.getIndexAttr(availableBanks)).getResult();
+          Value newAddr = rewriter.create<arith::DivUIOp>(
+                           rewriter.getUnknownLoc(), accessIndex, constDivVal).getResult();
+          auto newMemRef = getBankForMemAndID(mem, bankID - 1)->getResult(0);
+          Value newLoadResult = rewriter.replaceOpWithNewOp<memref::LoadOp>(
+                    loadOp, newMemRef, SmallVector<Value>{newAddr});
+          mapping.map(loadOp.getResult(), newLoadResult);
+        }
+        else if (auto storeOp = dyn_cast<memref::StoreOp>(user)) {
+          assert(storeOp.getIndices().size() == 1);
+          accessIndex = storeOp.getIndices().front();
+          bankID = getBankOfMemAccess(mem, accessIndex);
+          if (getBanksForMem(mem).empty()) {
+            llvm::errs() << "have not allocated banks yet\n";
+
+            auto memTy = cast<MemRefType>(storeOp.getMemRef().getType());
+    // Allocate new banks
+    auto origShape = memTy.getShape();
+    if (origShape.front() % availableBanks != 0) {
+      mem->emitError() << "memory shape must be divisible by the banking factor";
+    }
+    assert(origShape.size() == 1 && "memref must be flattened before scf-to-calyx pass");
+    auto bankSize = origShape.front() / availableBanks;
+
+    // Create new `allocOp`s to the proper top-level function
+    auto moduleOp = mem->getParentOfType<ModuleOp>();
+    auto funcOp = mem->getParentOfType<FuncOp>();
+    auto topLevelFn = cast<FuncOp>(SymbolTable::lookupSymbolIn(
+                            moduleOp, loweringState().getTopLevelFunction()));
+
+    SmallVector<Value, 4> memBankOperands, memBankArgs;
+    SmallVector<Type, 4> memBankArgTys;
+    Block *curFnBody = &funcOp.getBody().front();
+    Block *topLevelEntryBlock = &topLevelFn.getBody().front();
+    auto builder = OpBuilder::atBlockBegin(topLevelEntryBlock); 
+            SmallVector<Operation *> banks;
+    for (uint bankCnt = 1; bankCnt <= availableBanks; bankCnt++) {
+      // TODO: change to alloc, alloca, getglobal
+      auto allocOp = builder.create<memref::AllocOp>(
+            topLevelFn.getLoc(), MemRefType::get(bankSize, memTy.getElementType(),
+                                              memTy.getLayout(), memTy.getMemorySpace()));
+              banks.push_back(allocOp);
+
+      memBankOperands.push_back(allocOp.getResult());
+        curFnBody->addArgument(allocOp.getType(), funcOp.getLoc());
+        BlockArgument newBodyArg = curFnBody->getArguments().back();
+        memBankArgs.push_back(newBodyArg); 
+        memBankArgTys.push_back(newBodyArg.getType());
+      }
+            setBanksForMem(mem, banks);
+
+      // Update the `funcOp`/callee type to get ready to be called by new operands
+      SmallVector<Type, 4> updatedCurFnArgTys(
+        funcOp.getFunctionType().getInputs());
+      updatedCurFnArgTys.append(memBankArgTys.begin(), memBankArgTys.end());
+      funcOp.setType(FunctionType::get(funcOp.getContext(), updatedCurFnArgTys,
+                                     funcOp.getFunctionType().getResults()));
+
+      // Update the `callOp` from the topl-level function with the newly created
+      // `allocOp`s' result      
+      topLevelFn.walk([&](Operation *op) {
+        if (auto callOp = dyn_cast<CallOp>(op)) {
+          if (callOp.getCallee() == funcOp.getName()) {
+            SmallVector<Value, 4> newOperands(callOp.getOperands());
+            newOperands.append(memBankOperands.begin(), memBankOperands.end());
+
+            callOp->setOperands(newOperands);
+            assert(callOp.getNumOperands() == funcOp.getNumArguments() &&
+              "number of operands and block arguments should match after appending new memory banks");
+          }
+        }
+      });
+          }
+          auto newMemRef = getBankForMemAndID(mem, bankID - 1)->getResult(0);
+          rewriter.setInsertionPoint(storeOp);
+          Value constDivVal = rewriter.create<arith::ConstantOp>(
+                               rewriter.getUnknownLoc(), rewriter.getIndexAttr(availableBanks)).getResult();
+          Value newAddr = rewriter.create<arith::DivUIOp>(
+                           rewriter.getUnknownLoc(), accessIndex, constDivVal).getResult();
+          Value valForStore = mapping.lookupOrNull(storeOp.getValue());
+          if (!valForStore)
+            valForStore = storeOp.getValue();
+          rewriter.replaceOpWithNewOp<memref::StoreOp>(
+                storeOp, valForStore, newMemRef, SmallVector<Value>{newAddr});
+        }
+        else {
+          llvm_unreachable("Cannot reach this");
+        }
+      }
+    }
+    llvm::errs() << "after replacing with new memory access indices\n";
+    moduleOp.dump();
+
     funcOp.walk([&](Operation *op) {
       if (!isa<scf::ParallelOp>(op))
         return WalkResult::advance();
@@ -1688,7 +1898,7 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
        *
       ***/
 
-      /*** Affine analysis 
+      /*** TraceBank & Affine analysis 
        *
        * Need the layout of all access patterns by doing static analysis; one access pattern per memory,
        * then we can decide how many banks we need for each memory. 
@@ -1700,23 +1910,8 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
        *         - if we can't get the constant value statically, we make the banking factor = 1
        *       - Insert the static value to the map 
        *
-       *  2. For each mem, need to get the minimum interval for two identical values between all patterns of affine access.
-       *      - For example, if we have three patterns of affine access:
-       *        step: 0, 1   2,  3,  4
-       *        -----------------------
-       *        i:    0, 1,  2,  3,  4  ==> (1)
-       *        2i+3: 3, 5,  7,  9, 11  ==> (2)
-       *        5i+4: 4, 9, 14, 19, 24  ==> (3)
+       *  2. For each mem, use the TraceBank algorithm
        *
-       *        we want the min of:
-       *          - (1) & (2):
-       *            - s3 - s0 = 3
-       *          - (1) & (3):
-       *            - s4 - s0 = 4
-       *          - (2) & (3):
-       *            - s3 - s1 = 2
-       *       which is 2
-       * 
        ***************************************************
        *
        * Overall algorithm
@@ -1740,6 +1935,21 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
       // Implementation
       // 1. Calculate `access_indicies`, the `combinations` of all loop inductive variables.
       //    Note, we need to guarantee that all memories are one-dim. So the size of `access_indicies` = #memories.
+
+      llvm::errs() << "parallel Op: \n";
+      scfParOp->dump();
+      for (auto &innerOp : scfParOp.getOps()) {
+        for (auto attr : innerOp.getAttrs()) {
+          attr.getName().dump();
+          attr.getValue().dump();
+        }
+        if (innerOp.getAttr("unroll_indices")) {
+          llvm::errs() << "has attribute: \n";
+          innerOp.dump();
+        }
+      } 
+
+      return WalkResult::advance();
       auto [lowerBounds, upperBounds, steps] = getLoopBounds(scfParOp);
       auto inductVarCombs =
           genInductVarCombinations(lowerBounds, upperBounds, steps);
@@ -1748,8 +1958,7 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
       uint roundRobin = 0;
       uint newParOpCnt = 0;
       auto ivToArithConst = createIVConsts(rewriter, scfParOp);
-      partialEval(rewriter, ivToArithConst, scfParOp);
-      auto bankingFactor = computeBankingFactor(ivToArithConst, scfParOp);
+      auto bankingFactor = computeBankingFactor(rewriter, ivToArithConst, scfParOp);
       rewriter.setInsertionPointAfter(scfParOp);
       SmallVector<FuncOp> funcsInPar;
       DenseSet<Value> seenOperands;
@@ -1764,24 +1973,12 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
           parFuncOp = rewriter.create<FuncOp>(scfParOp.getLoc(),
               llvm::join_items("_", "" "par_func", std::to_string(newParOpCnt),
                              std::to_string(ivCombIdx % bankingFactor)), parFuncTy);
+          parFuncOp.addEntryBlock();
           parFuncs.push_back(parFuncOp);
         }
         else
           parFuncOp = parFuncs[ivCombIdx % bankingFactor];
-        if (parFuncOp.getBlocks().empty()) {
-          IRMapping funcParBodyMap;
-          parFuncOp.addEntryBlock();
-          //rewriter.setInsertionPointToStart(entryBlock);
-          //DenseSet<Value> seenOperands;
-          //DenseMap<Value, uint> operandToArgPos;
-          //uint argPos = 0;
-          //for (Operation &op : scfParOp.getBody()->getOperations()) {
-            //if (isa<scf::ReduceOp, scf::ParallelOp>(op))
-              //continue;
-            //mapFuncAndParOpBody(funcParBodyMap, argPos, &op, parFuncOp, seenOperands, operandToArgPos);
-            //rewriter.clone(op, funcParBodyMap);
-          //}
-        }
+
         Block *entryBlock = &parFuncOp.getBlocks().front();
         funcsInPar.push_back(parFuncOp);
         IRMapping mapping;
@@ -1813,45 +2010,70 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
             }
           }
         }
-        rewriter.setInsertionPointToEnd(entryBlock);
-        //rewriter.setInsertionPointAfter(scfParOp);
-        SmallVector<Operation *> clonedOps;
         for (Operation &op : scfParOp.getBody()->getOperations()) {
           if (!isa<scf::ReduceOp>(op)) {
-            Operation *clonedOp = rewriter.clone(op, mapping);
-            clonedOps.push_back(clonedOp);
+            rewriter.setInsertionPointToEnd(entryBlock);
+            Operation * clonedOp = rewriter.clone(op, mapping);
+            if (auto loadOp = dyn_cast_if_present<memref::LoadOp>(clonedOp)) {
+              assert(loadOp.getIndices().size() == 1 &&
+                    "all memref::load operations should get flattened before this pass");
+              auto loadAddr = loadOp.getIndices().front();
+              rewriter.setInsertionPoint(loadOp);
+              Value constDivVal = rewriter.create<arith::ConstantOp>(
+                               loadOp.getLoc(), rewriter.getIndexAttr(bankingFactor))
+                               .getResult();
+              Value newAddr = rewriter.create<arith::DivUIOp>(
+                           loadOp.getLoc(), loadAddr, constDivVal)
+                           .getResult();
+              Value newLoadResult = rewriter.replaceOpWithNewOp<memref::LoadOp>(
+                    loadOp, loadOp.getMemRef(), SmallVector<Value>{newAddr});
+              mapping.map(loadOp.getResult(), newLoadResult);
+            }
+
+            if (auto storeOp = dyn_cast_if_present<memref::StoreOp>(clonedOp)) {
+              assert(storeOp.getIndices().size() == 1 &&
+                     "all memref::store operations should get flattened before this pass");
+              auto storeAddr = storeOp.getIndices().front();
+              rewriter.setInsertionPoint(storeOp);
+              Value constDivVal = rewriter.create<arith::ConstantOp>(
+                               storeOp.getLoc(), rewriter.getIndexAttr(bankingFactor))
+                               .getResult();
+              Value newAddr = rewriter.create<arith::DivUIOp>(
+                           storeOp.getLoc(), storeAddr, constDivVal)
+                           .getResult();
+              Value valForStore = mapping.lookupOrNull(storeOp.getValue());
+              if (!valForStore)
+                valForStore = storeOp.getValue();
+              rewriter.replaceOpWithNewOp<memref::StoreOp>(
+                  storeOp, valForStore, storeOp.getMemRef(), SmallVector<Value>{newAddr});
+            }
           }
         }
-        //llvm::errs() << "par_func at: " << ivCombIdx << " is: \n";
-        //parFuncOp->dump();
         roundRobin = (roundRobin + 1) % bankingFactor;
         assert(inductVarCombs.size() % bankingFactor == 0);
       }
-      rewriter.setInsertionPointAfter(scfParOp);
-      for (size_t bF = 0; bF < bankingFactor; bF++) {
-          // the actual steps and everything doesn't really matter for the newly created parallel ops now
-          auto newParOp = rewriter.create<scf::ParallelOp>(
-            scfParOp.getLoc(), scfParOp.getLowerBound(), scfParOp.getUpperBound(), scfParOp.getStep());
-          rewriter.setInsertionPointToStart(&newParOp.getRegion().getBlocks().front());
-          auto calleeName =
-                  SymbolRefAttr::get(rewriter.getContext(), funcsInPar.front().getSymName());
-          auto resultTypes = funcsInPar.front().getResultTypes();
-          rewriter.create<CallOp>(newParOp.getLoc(), calleeName, resultTypes, fnOperands);
-          for (auto parFunc : funcsInPar) {
-            //parFunc->moveAfter(&newParOp.getRegion().getBlocks().front().back());
-          }
+      
+      scf::ParallelOp newParOp;
+      for (size_t fnCnt = 0; fnCnt < funcsInPar.size(); fnCnt++) {
+        if (fnCnt % bankingFactor == 0) {
+          rewriter.setInsertionPointAfter(scfParOp);
+          // the actual steps and stuff doesn't really matter for the newly created par
+          newParOp = rewriter.create<scf::ParallelOp>(
+                scfParOp.getLoc(), scfParOp.getLowerBound(),
+                scfParOp.getUpperBound(), scfParOp.getStep());
           newParOpCnt++;
-          funcsInPar.clear();
-          //rewriter.setInsertionPointAfter(newParOp);
-          // llvm::errs() << "need to create a scf parallel; par func count: " << newParCnt << "\n";
+        }
+        rewriter.setInsertionPointToStart(&newParOp.getRegion().getBlocks().front());
+        auto calleeName = SymbolRefAttr::get(rewriter.getContext(),
+                                            funcsInPar[fnCnt].getSymName());
+        auto resultTypes = funcsInPar[fnCnt].getResultTypes();
+        rewriter.create<CallOp>(newParOp.getLoc(), calleeName, resultTypes, fnOperands);
       }
 
       rewriter.eraseOp(scfParOp);
       
       return WalkResult::advance();
     });
-    //llvm::errs() << "moduleOp: \n";
-    //moduleOp.dump();
     return res;
 };
 
@@ -1881,27 +2103,29 @@ private:
       return std::make_tuple(indices[Is]...);
   }
   
-  SmallVector<std::tuple<int64_t, int64_t>, 4>
+  SmallVector<std::tuple<int64_t, int64_t>>
   genInductVarCombinations(const SmallVector<int64_t, 4> &lowerBounds,
                         const SmallVector<int64_t, 4> &upperBounds,
                         const SmallVector<int64_t, 4> &steps) const {
-      SmallVector<std::tuple<int64_t, int64_t>, 4> accessIndices;
-      std::vector<int64_t> currIndices(lowerBounds.size());
+    SmallVector<std::tuple<int64_t, int64_t>> accessIndices;
+    auto numDims = lowerBounds.size();
+    std::vector<int64_t> currIndices(numDims);
   
-      std::function<void(size_t)> generateCombinations = [&](size_t currDim) {
-          if (currDim == lowerBounds.size()) {
-              accessIndices.push_back(generateTuple(currIndices, std::make_index_sequence<2>{}));
-              return;
-          }
+    std::function<void(size_t)> generateCombinations = [&](size_t currDim) {
+      if (currDim == lowerBounds.size()) {
+        // TODO: change 2 with the tuple size tgt
+        accessIndices.push_back(generateTuple(currIndices, std::make_index_sequence<2>{}));
+        return;
+      }
   
-          for (auto s = lowerBounds[currDim]; s < upperBounds[currDim]; s += steps[currDim]) {
-              currIndices[currDim] = s;
-              generateCombinations(currDim + 1);
-          }
-      };
+      for (auto s = lowerBounds[currDim]; s < upperBounds[currDim]; s += steps[currDim]) {
+          currIndices[currDim] = s;
+          generateCombinations(currDim + 1);
+      }
+    };
   
-      generateCombinations(0);
-      return accessIndices;
+    generateCombinations(0);
+    return accessIndices;
   }
 
   bool isDefinedInsideRegion(Value value, Region *targetRegion) const {
@@ -1935,7 +2159,7 @@ private:
     auto [lowerBounds, upperBounds, steps] = getLoopBounds(scfParOp);
     auto inductVarCombs =
           genInductVarCombinations(lowerBounds, upperBounds, steps);
-    rewriter.setInsertionPointToStart(scfParOp.getOperation()->getBlock());
+    rewriter.setInsertionPointToStart(scfParOp.getBody());
     for (auto ivComb : inductVarCombs) {
       auto [lbVal, ubVal] = ivComb;
       auto lbConst = rewriter.create<arith::ConstantIndexOp>(scfParOp.getLoc(), lbVal);
@@ -1945,92 +2169,623 @@ private:
     return ivToArithConst;
   }
 
-  void partialEval(PatternRewriter &rewriter, DenseMap<std::tuple<int64_t, int64_t>, std::tuple<arith::ConstantIndexOp, arith::ConstantIndexOp>>& ivToArithConst, scf::ParallelOp scfParOp) const {
-    std::function<uint(Value)> evaluateIndex = [&](Value val) -> uint {
-      if (auto constIndexOp = dyn_cast<arith::ConstantIndexOp>(val.getDefiningOp())) {
-        return constIndexOp.value();
-      }
-      if (auto addOp = dyn_cast<arith::AddIOp>(val.getDefiningOp())) {
-        uint lhsValue = evaluateIndex(addOp.getLhs());
-        uint rhsValue = evaluateIndex(addOp.getRhs());
-        return lhsValue + rhsValue;
-      }
-      if (auto mulOp = dyn_cast<arith::MulIOp>(val.getDefiningOp())) {
-        uint lhsValue = evaluateIndex(mulOp.getLhs());
-        uint rhsValue = evaluateIndex(mulOp.getRhs());
-        return lhsValue * rhsValue;
-      }
-      // Add more cases. We can do this only because we would have got error if we
-      // failed to get induction variables as constants.
-      llvm_unreachable("Unsupported operation for index evaluation");
-    };
+  scf::ParallelOp partialEval(PatternRewriter &rewriter, scf::ParallelOp scfParOp) const {
+    DenseMap<Operation *, SmallVector<uint>> memOpAccessIndices;
+    auto *body = scfParOp.getBody();
+    auto loc = scfParOp.getLoc();
+    auto parOpIVs = scfParOp.getInductionVars();
+    assert(scfParOp.getLoopSteps() && "must have steps");
+    auto steps = scfParOp.getStep();
+    auto lowerBounds = scfParOp.getLowerBound();
+    auto upperBounds = scfParOp.getUpperBound();
+    rewriter.setInsertionPointAfter(scfParOp);
+    auto newPloop = rewriter.create<scf::ParallelOp>(
+      loc, lowerBounds, upperBounds, steps, 
+      [&](OpBuilder &insideBuilder, Location loc, ValueRange ploopIVs) {
+        IRMapping operandMap;
 
-    auto [lowerBounds, upperBounds, steps] = getLoopBounds(scfParOp);
-    auto inductVarCombs =
-          genInductVarCombinations(lowerBounds, upperBounds, steps);
-    auto inductVars = scfParOp.getInductionVars();
- //   rewriter.setInsertionPointAfter(scfParOp);
- //   for (const auto &ivComb : inductVarCombs) {
- //     auto ivCombConst = ivToArithConst[ivComb];
- //     IRMapping mapping;
- //     mapping.map(scfParOp.getInductionVars()[0], std::get<0>(ivCombConst));
- //     mapping.map(scfParOp.getInductionVars()[1], std::get<1>(ivCombConst));
- //     for (Operation &op : scfParOp.getBody()->getOperations()) {
- //       if (isa<scf::ReduceOp, scf::ParallelOp>(op))
- //         continue;
- //       Operation *clonedOp = rewriter.clone(op, mapping);
- //       if (auto loadOp = dyn_cast<memref::LoadOp>(clonedOp)) {
- //         assert(loadOp.getIndices().size() == 1);
- //         auto loadAddr = loadOp.getIndices().front();
- //         auto constIntAddr = evaluateIndex(loadAddr); 
- //       }
- //       else if (auto storeOp = dyn_cast<memref::StoreOp>(clonedOp)) {
- //         assert(storeOp.getIndices().size() == 1);
- //         auto storeAddr = storeOp.getIndices().front();
- //         auto constIntAddr = evaluateIndex(storeAddr); 
- //       }
- //     }
- //   }
-    // TODO: return a mapping from memory values to their access indices, 
-    // to be ready for computing the banking factor
+        std::function<void(SmallVector<int64_t, 4>&, unsigned)> generateCombinations;
+        generateCombinations = [&](SmallVector<int64_t, 4>& indices, unsigned dim) {
+          if (dim == lowerBounds.size()) {
+            for (unsigned i = 0; i < indices.size(); ++i) {
+              Value ivConstant = insideBuilder.create<arith::ConstantIndexOp>(loc, indices[i]);
+              operandMap.map(parOpIVs[i], ivConstant);
+            }
+
+            Operation *lastOp = nullptr;
+
+            for (auto it = body->begin(); it != std::prev(body->end()); ++it) {
+              Operation *clonedOp = insideBuilder.clone(*it, operandMap);
+              lastOp = clonedOp; // Track the last operation
+            }
+
+            // Set an ArrayAttr on the last operation of this unrolled instance.
+            if (lastOp) {
+              SmallVector<Attribute, 4> indexAttrs;
+              for (int64_t idx : indices) {
+                indexAttrs.push_back(insideBuilder.getI64IntegerAttr(idx));
+              }
+              ArrayAttr indicesAttr = insideBuilder.getArrayAttr(indexAttrs);
+              lastOp->setAttr("unroll_indices", indicesAttr);
+            }
+
+            return;
+          }
+
+          for (int64_t iv = *getConstantIntValue(lowerBounds[dim]); 
+               iv < *getConstantIntValue(upperBounds[dim]); 
+               iv += *getConstantIntValue(steps[dim])) {
+            indices[dim] = iv;
+            generateCombinations(indices, dim + 1);
+          }
+        };
+
+        SmallVector<int64_t, 4> indices(lowerBounds.size());
+        generateCombinations(indices, 0);
+      });
+
+    rewriter.replaceOp(scfParOp, newPloop);
+    return newPloop;
   }
 
-  uint computeBankingFactor(DenseMap<std::tuple<int64_t, int64_t>, std::tuple<arith::ConstantIndexOp, arith::ConstantIndexOp>>& ivToArithConst, scf::ParallelOp scfParOp) const {
+  std::function<int(Value)> evaluateIndex = [&](Value val) -> int {
+    if (auto constIndexOp = dyn_cast<arith::ConstantIndexOp>(val.getDefiningOp()))
+        return constIndexOp.value();
+    if (auto addOp = dyn_cast<arith::AddIOp>(val.getDefiningOp())) {
+      int lhsValue = evaluateIndex(addOp.getLhs());
+      int rhsValue = evaluateIndex(addOp.getRhs());
+      return lhsValue + rhsValue;
+    }
+    if (auto mulOp = dyn_cast<arith::MulIOp>(val.getDefiningOp())) {
+      int lhsValue = evaluateIndex(mulOp.getLhs());
+      int rhsValue = evaluateIndex(mulOp.getRhs());
+      return lhsValue * rhsValue;
+    }
+    if (auto shlIOp = dyn_cast<arith::ShLIOp>(val.getDefiningOp())) {
+      int lhsValue = evaluateIndex(shlIOp.getLhs());
+      int rhsValue = evaluateIndex(shlIOp.getRhs());
+      return lhsValue << rhsValue;
+    }
+    if (auto subIOp = dyn_cast<arith::SubIOp>(val.getDefiningOp())) {
+      int lhsValue = evaluateIndex(subIOp.getLhs());
+      int rhsValue = evaluateIndex(subIOp.getRhs());
+      return lhsValue - rhsValue;
+    }
+    // Add more cases. We can do this only because we would have got error if we
+    // failed to get induction variables as constants.
+    llvm_unreachable("unsupported operation for index evaluation");
+  };
+
+  // Computes the raw traces of a given memory in a step
+  SmallVector<uint> computeRawTrace(scf::ParallelOp scfParOp, Value memResult) const {
+    SmallVector<uint> rawTraces;
+    for (auto &innerOp : scfParOp.getOps()) {
+      if (llvm::find(memResult.getUsers(), &innerOp) != memResult.getUsers().end()) {
+        Value memAddr;
+        if (auto loadOp = dyn_cast<memref::LoadOp>(&innerOp)) {
+          assert(loadOp.getIndices().size() == 1);
+          memAddr = loadOp.getIndices().front();
+        }
+        else {
+          auto storeOp = dyn_cast<memref::StoreOp>(&innerOp);
+          assert(storeOp.getIndices().size() == 1);
+          memAddr = storeOp.getIndices().front();
+        }
+        auto intMemAddr = evaluateIndex(memAddr); 
+        rawTraces.push_back(intMemAddr);
+      }
+    }
+    return rawTraces;
+  }
+
+  SmallVector<Value> computeRawTraceInValue(scf::ParallelOp scfParOp, Value memResult) const {
+    SmallVector<Value> rawTraces;
+    for (auto &innerOp : scfParOp.getOps()) {
+      if (llvm::find(memResult.getUsers(), &innerOp) != memResult.getUsers().end()) {
+        Value memAddr;
+        if (auto loadOp = dyn_cast<memref::LoadOp>(&innerOp)) {
+          assert(loadOp.getIndices().size() == 1);
+          memAddr = loadOp.getIndices().front();
+        }
+        else {
+          auto storeOp = dyn_cast<memref::StoreOp>(&innerOp);
+          assert(storeOp.getIndices().size() == 1);
+          memAddr = storeOp.getIndices().front();
+        }
+        rawTraces.push_back(memAddr);
+      }
+    }
+    return rawTraces;
+  }
+
+  SmallVector<SmallVector<uint>> initCompress(SmallVector<SmallVector<uint>> &unCompressedTraces) const {
+    // TODO
+    return unCompressedTraces;
+  }
+
+  SmallVector<std::string> generateAllMaskBits(int numMasks, int addrSize) const {
+    SmallVector<std::string> result;
+
+    std::string bitmask(numMasks, '1');
+    bitmask.resize(addrSize, '0');
+
+    do {
+        result.push_back(bitmask);
+    } while (std::prev_permutation(bitmask.begin(), bitmask.end()));
+
+    return result;
+  }
+
+  uint calculateConflicts(SmallVector<SmallVector<uint>> &compressedTraces, const std::string &maskBits) const {
+    uint numConflicts = 0;
+    for (const auto &traceInStep : compressedTraces) {
+      DenseSet<StringRef> seenMaskIDs;
+      for (auto trace : traceInStep) {
+        std::bitset<32> bitsetTrace(trace);
+        auto binTrace = bitsetTrace.to_string();
+        auto sizedBinTrace = binTrace.substr(binTrace.size() - maskBits.length());
+        std::string bitWiseAnd;
+        for (size_t i = 0; i < maskBits.length(); ++i) {
+          if (sizedBinTrace[i] == '1' && maskBits[i] == '1')
+            bitWiseAnd += '1';
+          else
+            bitWiseAnd += '0';
+        }
+        numConflicts += seenMaskIDs.insert(bitWiseAnd).second ? 0 : 1;
+      }
+    }
+    return numConflicts;
+  }
+
+
+  std::string extractMaskIDs(const std::string &sizedBinTrace, const std::string &maskBits) const {
+    std::string maskedBits;
+    for (size_t i = 0; i < maskBits.length(); ++i) {
+        if (maskBits[i] == '1') {
+            maskedBits += sizedBinTrace[i];
+        }
+    }
+    return maskedBits;
+  }
+
+  struct ConflictGraph {
+    struct PairHash {
+      template <class T1, class T2>
+      std::size_t operator () (const std::pair<T1, T2> &pair) const {
+        return std::hash<T1>()(pair.first) ^ std::hash<T2>()(pair.second);
+      }
+    };
+    std::unordered_map<std::string, SmallVector<std::string>> adjList;
+    std::unordered_map<std::pair<std::string, std::string>, uint, PairHash> edgeWeights;
+    void addEdge(const std::string& id1, const std::string& id2) {
+        if (id1 == id2) return;  // No self-loops
+        
+        // Add edge to adjacency list
+        adjList[id1].push_back(id2);
+        adjList[id2].push_back(id1);
+
+        // Create a consistent ordering for the edge
+        auto edgeKey = std::make_pair(std::min(id1, id2), std::max(id1, id2));
+
+        // Increment edge weight or set it to 1 if it doesn't exist
+        edgeWeights[edgeKey]++;
+    }
+    void printGraph() const {
+        llvm::errs() << "Conflict Graph:\n";
+        for (const auto &node : adjList) {
+            llvm::errs() << "Mask ID: " << node.first << " -> [";
+            for (const auto &adjNode : node.second) {
+                llvm::errs() << adjNode << " ";
+            }
+            llvm::errs() << "]\n";
+        }
+
+        llvm::errs() << "Edge Weights:\n";
+        for (const auto &edge : edgeWeights) {
+            llvm::errs() << "Edge: (" << edge.first.first << ", " << edge.first.second 
+                         << ") Weight: " << edge.second << "\n";
+        }
+    }
+
+    std::vector<std::string> findMaxClique() const {
+      std::vector<std::string> maxClique;
+      std::vector<std::string> potentialClique;
+      std::vector<std::string> candidates;
+      std::vector<std::string> alreadyProcessed;
+
+        for (const auto& node : adjList) {
+            candidates.push_back(node.first);
+        }
+
+        findClique(potentialClique, candidates, alreadyProcessed, maxClique);
+        return maxClique;
+    }
+  private:
+      void findClique(std::vector<std::string>& potentialClique,
+                    std::vector<std::string>& candidates,
+                    std::vector<std::string>& alreadyProcessed,
+                    std::vector<std::string>& maxClique) const {
+        if (candidates.empty() && alreadyProcessed.empty()) {
+            if (potentialClique.size() > maxClique.size()) {
+                maxClique = potentialClique;
+            }
+            return;
+        }
+
+        auto candidatesCopy = candidates;
+    for (const auto& candidate : candidatesCopy) {
+        // Remove candidate from candidates and add to potentialClique
+        candidates.erase(std::remove(candidates.begin(), candidates.end(), candidate), candidates.end());
+        potentialClique.push_back(candidate);
+
+        // Build new candidates and alreadyProcessed lists
+        std::vector<std::string> newCandidates;
+        std::vector<std::string> newAlreadyProcessed;
+
+        for (const auto& adjNode : adjList.at(candidate)) {
+            if (std::find(candidates.begin(), candidates.end(), adjNode) != candidates.end()) {
+                newCandidates.push_back(adjNode);
+            }
+            if (std::find(alreadyProcessed.begin(), alreadyProcessed.end(), adjNode) != alreadyProcessed.end()) {
+                newAlreadyProcessed.push_back(adjNode);
+            }
+        }
+
+        // Recursive call
+        findClique(potentialClique, newCandidates, newAlreadyProcessed, maxClique);
+
+        // Backtrack: remove candidate from potentialClique and add to alreadyProcessed
+        potentialClique.pop_back();
+        alreadyProcessed.push_back(candidate);
+      }
+    }
+  };
+
+  ConflictGraph constructGraph(SmallVector<SmallVector<uint>> &compressedTraces, const std::string &maskBits) const {
+    ConflictGraph graph;
+    for (const auto &traceInStep : compressedTraces) {
+      std::unordered_set<std::string> seenMaskIDs;
+      for (auto trace : traceInStep) {
+        std::bitset<32> bitsetTrace(trace);
+        auto binTrace = bitsetTrace.to_string();
+        auto sizedBinTrace = binTrace.substr(binTrace.size() - maskBits.length());
+
+        std::string maskID = extractMaskIDs(sizedBinTrace, maskBits);
+
+        for (const auto &otherMaskID : seenMaskIDs) {
+          graph.adjList[maskID].push_back(otherMaskID);
+          graph.adjList[otherMaskID].push_back(maskID);
+          auto edgeKey = std::make_pair(maskID, otherMaskID);
+          if (maskID > otherMaskID)
+            edgeKey = std::make_pair(otherMaskID, maskID);
+          if (graph.edgeWeights.find(edgeKey) != graph.edgeWeights.end())
+            graph.edgeWeights[edgeKey]++;
+          else
+            graph.edgeWeights[edgeKey] = 1;
+        }
+        seenMaskIDs.insert(maskID);
+      }
+    }
+    return graph;
+  }
+
+  std::string findMasksBits(uint availableBanks, SmallVector<SmallVector<uint>> &compressedTraces, Operation *memory) const {
+    uint nA = 0;
+    for (const auto &traceInStep : compressedTraces) {
+      if (traceInStep.size() > nA)
+        nA = llvm::Log2_32_Ceil(traceInStep.size());
+    }
+    
+    ArrayRef<int64_t> memRefShape;
+    if (auto allocOp = dyn_cast<memref::AllocOp>(memory))
+      memRefShape = allocOp.getMemref().getType().getShape();
+    else if (auto allocaOp = dyn_cast<memref::AllocaOp>(memory))
+      memRefShape = allocaOp.getMemref().getType().getShape();
+    else {
+      auto getGlobalOp = dyn_cast<memref::GetGlobalOp>(memory);
+      memRefShape = getGlobalOp.getType().getShape();
+    }
+    assert(memRefShape.size() == 1 && "memref type must be flattened before this pass");
+    auto addrSize = llvm::Log2_32_Ceil(memRefShape.front());
+    uint overallMinCliques = std::numeric_limits<uint>::max();
+    std::string bestMaskBits;
+    for (auto nBits = nA; nBits < addrSize; nBits++) {
+      auto allMaskBits = generateAllMaskBits(nBits, addrSize);
+      uint minConflicts = std::numeric_limits<uint>::max();
+      for (auto &maskBits : allMaskBits) {
+        auto numConflicts = calculateConflicts(compressedTraces, maskBits);
+        if (numConflicts <= minConflicts) {
+          minConflicts = numConflicts;
+          auto graph = constructGraph(compressedTraces, maskBits);
+          auto numCliques = graph.findMaxClique().size();
+          if (minConflicts == 0 && numCliques <= availableBanks) {
+            if (numCliques < overallMinCliques) {
+              overallMinCliques = numCliques;
+              bestMaskBits = maskBits;
+              break;
+            }
+          }
+        }
+      }
+    }
+    llvm::errs() << "best: " << bestMaskBits << " with minCliques: " << overallMinCliques << "\n";
+    return bestMaskBits;
+  }
+
+  SmallVector<SmallVector<std::string>> maskCompress(const SmallVector<SmallVector<std::string>> &unCompressedMasks) const {
+    std::set<SmallVector<std::string>> seenMaskIDs;
+    SmallVector<SmallVector<std::string>> compressedMasks;
+    for (const auto &step : unCompressedMasks) {
+      if (seenMaskIDs.insert(step).second) {
+        compressedMasks.push_back(step);
+      }
+    }
+    return compressedMasks;
+  }
+
+  ConflictGraph constructConflictGraph(const SmallVector<SmallVector<std::string>>& compressedTrace) const {
+    ConflictGraph graph;
+
+    for (const auto& step : compressedTrace) {
+        std::unordered_set<std::string> seenMaskIDs;
+
+        for (const auto& maskID : step) {
+            for (const auto& otherID : seenMaskIDs) {
+                graph.addEdge(maskID, otherID);
+            }
+            seenMaskIDs.insert(maskID);
+        }
+    }
+
+    return graph;
+  }
+
+  bool isSafe(const std::string &node, const std::unordered_map<std::string, int> &color, const ConflictGraph &graph, int c) const {
+    for (const auto &adjNode : graph.adjList.at(node)) {
+        if (color.at(adjNode) == c) {
+            return false;
+        }
+    }
+    return true;
+  }
+
+  bool graphColoringUtil(const ConflictGraph &graph, int m, std::unordered_map<std::string, int> &color, std::vector<std::string> &nodes, uint pos) const {
+    if (pos == nodes.size()) {
+        return true; // All nodes are colored
+    }
+
+    const std::string &node = nodes[pos];
+
+    for (int c = 1; c <= m; c++) {
+        if (isSafe(node, color, graph, c)) {
+            color[node] = c;
+
+            if (graphColoringUtil(graph, m, color, nodes, pos + 1)) {
+                return true;
+            }
+
+            // If assigning color c doesn't lead to a solution, backtrack
+            color[node] = 0;
+        }
+    }
+
+    return false; // If no color can be assigned
+  }
+
+  std::optional<std::unordered_map<std::string, int>> graphColoring(const ConflictGraph &graph, uint m) const {
+    std::unordered_map<std::string, int> color;
+    for (const auto &pair : graph.adjList) {
+        color[pair.first] = 0; // Initialize all colors to 0 (no color)
+    }
+
+    std::vector<std::string> nodes;
+    for (const auto &pair : graph.adjList) {
+        nodes.push_back(pair.first);
+    }
+
+    if (graphColoringUtil(graph, m, color, nodes, 0)) {
+      return std::make_optional(color);
+    }
+    return std::nullopt;
+  }
+
+  std::string bestFirstSearch(SmallVector<SmallVector<uint>> &compressedTraces, std::string &mask) const {
+    // TODO
+    return mask;
+  }
+
+  std::unordered_map<std::string, int> mapMaskIDsToBanks(uint availableBanks, SmallVector<SmallVector<uint>> &compressedTraces, std::string &mask) const {
+    bool canBeColored = false;
+    std::unordered_map<std::string, int> maskToBanks;
+    do {
+      SmallVector<SmallVector<std::string>> rawMaskIDs;
+      for (const auto &step : compressedTraces) {
+        SmallVector<std::string> maskIDInStep;
+        for (auto trace : step) {
+          std::bitset<32> bitsetTrace(trace);
+          auto binTrace = bitsetTrace.to_string();
+          auto sizedBinTrace = binTrace.substr(binTrace.size() - mask.length());
+
+          auto maskID = extractMaskIDs(sizedBinTrace, mask);
+          maskIDInStep.push_back(maskID);
+        }
+        rawMaskIDs.push_back(maskIDInStep);
+      }
+      auto compressedMasks = maskCompress(rawMaskIDs);
+      auto conflictGraph = constructConflictGraph(compressedMasks);
+
+      auto colorRes = graphColoring(conflictGraph, availableBanks);
+      canBeColored = colorRes.has_value();
+      if (canBeColored) {
+        llvm::errs() << "Graph can be colored with " << availableBanks << " colors." << "\n"; 
+        maskToBanks = *colorRes;
+      }
+      auto isAllOnes = [](const std::string& binaryString) -> bool {
+        return std::all_of(binaryString.begin(), binaryString.end(), [](char c) {
+            return c == '1';
+        });
+      };
+
+      if (isAllOnes(mask))
+        break;
+      if (!canBeColored) {
+        llvm::errs() << "cannot be colored\n";
+        mask = bestFirstSearch(compressedTraces, mask);
+      }
+    } while (!canBeColored);
+
+    assert(!maskToBanks.empty() && "The number of vailable banks is not sufficient for banking");
+    llvm::errs() << "can be colored; mask ID and color mapping is: \n";
+    for (const auto &[id, color] : maskToBanks) {
+      llvm::errs() << id << ": " << color << "\n";
+    }
+    return maskToBanks;
+  }
+
+  mutable DenseMap<Operation *, DenseMap<Value, uint>> memoryToBankIDs;
+  uint getBankOfMemAccess(Operation *memory, Value accessIndex) const {
+    return memoryToBankIDs[memory][accessIndex];
+  }
+
+  mutable DenseMap<Operation *, SmallVector<Operation *>> memoryToBanks;
+  SmallVector<Operation *> getBanksForMem(Operation *memory) const {
+    return memoryToBanks[memory];
+  }
+  Operation* getBankForMemAndID(Operation *memory, uint bankID) const {
+    return memoryToBanks[memory][bankID];
+  }
+  void setBanksForMem(Operation *memory, SmallVector<Operation *> &allocatedBanks) const {
+    memoryToBanks[memory] = allocatedBanks;
+  }
+
+  // Given `scf.parallel`s (all `step`)s and a memory in the `scf.parallel`s, computes the addresses to banks mapping
+  void traceBankAlgo(SmallVector<scf::ParallelOp> &scfParOps, Operation *memory) const {
+    // Raw trace of a given memory at all steps
+    Value memRes;
+    MemRefType memTy;
+    if (auto allocOp = dyn_cast<memref::AllocOp>(memory)) {
+      memRes = allocOp.getResult();
+      memTy = cast<MemRefType>(allocOp.getType());
+    }
+    else if (auto allocaOp = dyn_cast<memref::AllocaOp>(memory)) {
+      memRes = allocaOp.getResult();
+      memTy = cast<MemRefType>(allocaOp.getType());
+    }
+    else {
+      auto getGlobalOp = dyn_cast<memref::GetGlobalOp>(memory);
+      memRes = getGlobalOp.getResult();
+      memTy = cast<MemRefType>(getGlobalOp.getType());
+    }
+    SmallVector<SmallVector<uint>> rawTraces;
+    for (auto step : scfParOps) {
+      auto rawTrace = computeRawTrace(step, memRes);
+      rawTraces.push_back(rawTrace);
+    }
+
+    SmallVector<SmallVector<Value>> rawTracesInValue;
+    for (auto step : scfParOps) {
+      auto rawTrace = computeRawTraceInValue(step, memRes);
+      rawTracesInValue.push_back(rawTrace);
+    }
+
+    llvm::errs() << "raw traces: \n";
+    for (const auto &step : rawTraces) {
+      for (auto traceInStep : step) {
+        llvm::errs() << traceInStep << " ";
+      }
+      llvm::errs() << "\n";
+    }
+
+    auto compressedTraces = initCompress(rawTraces);
+
+    uint availableBanks = 4; // TODO: can be passed as a user-input
+    std::string masksBits = findMasksBits(availableBanks, compressedTraces, memory);
+
+    auto maskIDsToBanks = mapMaskIDsToBanks(availableBanks, compressedTraces, masksBits);
+
+    SmallVector<SmallVector<uint>> accessIndicesToBanks;
+    for (const auto &step : rawTraces) {
+      SmallVector<uint> banksInStep;
+      for (auto trace : step) {
+        std::bitset<32> bitsetTrace(trace);
+        auto binTrace = bitsetTrace.to_string();
+        auto sizedBinTrace = binTrace.substr(binTrace.size() - masksBits.length());
+
+        auto maskID = extractMaskIDs(sizedBinTrace, masksBits);
+        banksInStep.push_back(maskIDsToBanks[maskID]);
+      }
+      accessIndicesToBanks.push_back(banksInStep);
+    }
+
+    for (uint bankCnt = 1; bankCnt <= availableBanks; bankCnt++) {
+      for (uint i = 0; i < accessIndicesToBanks.size(); i++) {
+        auto curStep = accessIndicesToBanks[i];
+        for (uint j = 0; j < curStep.size(); j++) {
+          if (accessIndicesToBanks[i][j] == bankCnt) {
+            if (memoryToBankIDs.find(memory) == memoryToBankIDs.end()) {
+              memoryToBankIDs[memory][rawTracesInValue[i][j]] = bankCnt;
+            }
+            else {
+              if (memoryToBankIDs[memory].find(rawTracesInValue[i][j]) == memoryToBankIDs[memory].end()) {
+                assert(memoryToBankIDs[memory][rawTracesInValue[i][j]] == 0);
+                memoryToBankIDs[memory][rawTracesInValue[i][j]] = bankCnt;
+              }
+              else {
+                assert(memoryToBankIDs[memory][rawTracesInValue[i][j]] == bankCnt);
+              }
+            }
+          }
+        }
+      }
+    }
+
+  }
+
+  uint computeBankingFactor(PatternRewriter &rewriter, DenseMap<std::tuple<int64_t, int64_t>, std::tuple<arith::ConstantIndexOp, arith::ConstantIndexOp>>& ivToArithConst, scf::ParallelOp scfParOp) const {
     DenseMap<Operation *, SmallVector<uint>> memOpAccessIndices;
     auto [lowerBounds, upperBounds, steps] = getLoopBounds(scfParOp);
     auto inductVarCombs =
           genInductVarCombinations(lowerBounds, upperBounds, steps);
-    bool knowAddrsStatically = true;
+    DenseMap<Value, SmallVector<int>> accessPatterns;
     for (size_t ivCombIdx = 0; ivCombIdx < inductVarCombs.size(); ivCombIdx++) {
-      scfParOp.walk([&](Operation *innerOp) {
-        if (auto loadOp = dyn_cast<memref::LoadOp>(innerOp)) {
+      const auto &ivComb = inductVarCombs[ivCombIdx];
+      auto ivCombConst = ivToArithConst[ivComb];
+      // auto firstElm =  std::get<0>(inductVarCombs[ivCombIdx]);
+      // auto secondElm = std::get<1>(inductVarCombs[ivCombIdx]);
+      IRMapping mapping;
+      mapping.map(scfParOp.getInductionVars()[0], std::get<0>(ivCombConst));
+      mapping.map(scfParOp.getInductionVars()[1], std::get<1>(ivCombConst));
+      for (Operation &innerOp : scfParOp.getBody()->getOperations()) {
+        if (isa<scf::ParallelOp, scf::ReduceOp>(innerOp))
+          continue;
+
+        Operation *clonedOp = rewriter.clone(innerOp, mapping);
+        if (auto loadOp = dyn_cast_if_present<memref::LoadOp>(clonedOp)) {
           assert(loadOp.getIndices().size() == 1 && "all memref::load operations should get flattened before this pass");
           auto loadAddr = loadOp.getIndices().front();
-          OpFoldResult foldRes = getAsOpFoldResult(loadAddr);
-          auto constIntAddr = getConstantIntValue(foldRes); 
-          if (!constIntAddr.has_value()) {
-            // llvm::errs() << "cannot know statically: \n";
-            //loadAddr.dump();
-            knowAddrsStatically = false;
-            return WalkResult::interrupt();
-          }
-          //llvm::errs() << "constant int value: " << constIntAddr << "\n";
+          auto constIntAddr = evaluateIndex(loadAddr); 
+          accessPatterns[loadOp.getMemRef()].push_back(constIntAddr);
         }
 
-        if (auto storeOp = dyn_cast<memref::StoreOp>(innerOp)) {
+        if (auto storeOp = dyn_cast_if_present<memref::StoreOp>(clonedOp)) {
           assert(storeOp.getIndices().size() == 1 && "all memref::store operations should get flattened before this pass");
           auto storeAddr = storeOp.getIndices().front();
-          //llvm::errs() << "store address is: " << storeAddr << "\n";
+          auto constStoreAddr = evaluateIndex(storeAddr);
+          accessPatterns[storeOp.getMemRef()].push_back(constStoreAddr);
         }
-
-        return WalkResult::advance();
-      });
+      }
     }
    
-    if (!knowAddrsStatically)
-      // conservatively set the `bankingFactor` to 1 if we don't know the value statically
-      return 1;
-    return 7;
+    for (const auto &[memref, accessIndices] : accessPatterns) {
+      llvm::errs() << "memory: \n";
+      memref.dump();
+      llvm::errs() << "access indices: \n";
+      for (auto idx : accessIndices) {
+        llvm::errs() << idx << " ";
+      }
+      llvm::errs() << "\n";
+    }
+    return 8;
   }
 
   mutable DenseMap<Value, uint> memToBankSize;
@@ -2132,7 +2887,7 @@ private:
         bool isDefinedInside = isDefinedInsideRegion(operand, &scfParOp->getRegion(0));
         if (!isDefinedInside && seenOperands.insert(operand).second) {
           if (isa<MemRefType>(operand.getType())) {
-            assert(isa<BlockArgument>(operand) && "any MemRefType must be BlockArgument passing from the top-level function");
+            //assert(isa<BlockArgument>(operand) && "any MemRefType must be BlockArgument passing from the top-level function");
             auto memBanks = computeMemBanks(rewriter, operand, bankingFactor, scfParOp);
             // TODO: how to do it properly
             assert(memBanks.has_value() && "memory banks must exist");
@@ -2140,8 +2895,6 @@ private:
           }
           else
             curFuncArgTys.push_back(operand.getType());
-          //llvm::errs() << "is defined outside scf parallel region: \n";
-          //operand.dump();
         }
       }
 
