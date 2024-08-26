@@ -332,6 +332,8 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
       llvm::errs() << "Unable to open file for writing\n";
     }
 
+    llvm::errs() << "component state: \n";
+    getState<ComponentLoweringState>().getComponentOp().dump();
     return success(opBuiltSuccessfully);
   }
 
@@ -1665,8 +1667,6 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
     IRMapping mapping;
     for (auto *mem : memories) {
       for (auto *user : mem->getUsers()) {
-        llvm::errs() << "find using memoryOp: \n";
-        user->dump();
         Value accessIndex;
         uint bankID = 0;
         if (auto loadOp = dyn_cast<memref::LoadOp>(user)) {
@@ -1937,17 +1937,7 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
       //    Note, we need to guarantee that all memories are one-dim. So the size of `access_indicies` = #memories.
 
       llvm::errs() << "parallel Op: \n";
-      scfParOp->dump();
-      for (auto &innerOp : scfParOp.getOps()) {
-        for (auto attr : innerOp.getAttrs()) {
-          attr.getName().dump();
-          attr.getValue().dump();
-        }
-        if (innerOp.getAttr("unroll_indices")) {
-          llvm::errs() << "has attribute: \n";
-          innerOp.dump();
-        }
-      } 
+      moduleOp.dump();
 
       return WalkResult::advance();
       auto [lowerBounds, upperBounds, steps] = getLoopBounds(scfParOp);
@@ -2179,35 +2169,36 @@ private:
     auto lowerBounds = scfParOp.getLowerBound();
     auto upperBounds = scfParOp.getUpperBound();
     rewriter.setInsertionPointAfter(scfParOp);
-    auto newPloop = rewriter.create<scf::ParallelOp>(
-      loc, lowerBounds, upperBounds, steps, 
-      [&](OpBuilder &insideBuilder, Location loc, ValueRange ploopIVs) {
-        IRMapping operandMap;
+    scf::ParallelOp newPloop = scfParOp.cloneWithoutRegions();
+    rewriter.insert(newPloop);
+    OpBuilder insideBuilder(newPloop);
+    Block *currBlock = nullptr;
+    Block *predBlock = nullptr;
+    auto &region = newPloop.getRegion();
+    IRMapping operandMap;
 
-        std::function<void(SmallVector<int64_t, 4>&, unsigned)> generateCombinations;
-        generateCombinations = [&](SmallVector<int64_t, 4>& indices, unsigned dim) {
+    std::function<void(SmallVector<int64_t, 4> &, unsigned)>
+        generateCombinations;
+    generateCombinations =
+        [&](SmallVector<int64_t, 4> &indices, unsigned dim) {
           if (dim == lowerBounds.size()) {
+            currBlock = &region.emplaceBlock();
+            insideBuilder.setInsertionPointToEnd(currBlock);
             for (unsigned i = 0; i < indices.size(); ++i) {
               Value ivConstant = insideBuilder.create<arith::ConstantIndexOp>(loc, indices[i]);
               operandMap.map(parOpIVs[i], ivConstant);
             }
 
-            Operation *lastOp = nullptr;
-
             for (auto it = body->begin(); it != std::prev(body->end()); ++it) {
-              Operation *clonedOp = insideBuilder.clone(*it, operandMap);
-              lastOp = clonedOp; // Track the last operation
+              insideBuilder.clone(*it, operandMap);
             }
 
-            // Set an ArrayAttr on the last operation of this unrolled instance.
-            if (lastOp) {
-              SmallVector<Attribute, 4> indexAttrs;
-              for (int64_t idx : indices) {
-                indexAttrs.push_back(insideBuilder.getI64IntegerAttr(idx));
-              }
-              ArrayAttr indicesAttr = insideBuilder.getArrayAttr(indexAttrs);
-              lastOp->setAttr("unroll_indices", indicesAttr);
+            if (predBlock) {
+              OpBuilder predBuilder(predBlock, predBlock->end());
+              predBuilder.create<mlir::cf::BranchOp>(loc, currBlock);
             }
+
+            predBlock = currBlock;
 
             return;
           }
@@ -2220,9 +2211,8 @@ private:
           }
         };
 
-        SmallVector<int64_t, 4> indices(lowerBounds.size());
-        generateCombinations(indices, 0);
-      });
+    SmallVector<int64_t, 4> indices(lowerBounds.size());
+    generateCombinations(indices, 0);
 
     rewriter.replaceOp(scfParOp, newPloop);
     return newPloop;
