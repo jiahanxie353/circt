@@ -1682,11 +1682,8 @@ public:
       return WalkResult::advance();
     });
 
-    for (auto *mem : memories) {
+    for (auto *mem : memories)
       traceBankAlgo(scfParOps, mem);
-      //auto banksOfMemAccess = getBankOfMemAccess(mem)
-      //replaceMemWithBanks()
-    }
 
     // Create banks for each memory and replace the use of all old memories
     IRMapping mapping;
@@ -1715,266 +1712,204 @@ public:
         moduleOp.walk([&](FuncOp otherFn) {
           otherFn.walk([&](mlir::Operation *op) {
             if (auto callOp = dyn_cast<CallOp>(op)) {
-              if (callOp.getCallee() == funcOp.getName()) {
+              if (callOp.getCallee() == funcOp.getName())
                 origMemDef = callOp.getOperand(blockArg.getArgNumber()).getDefiningOp();
-              }
             }
           });
         });
       }
-      else {
+      else
         origMemDef = memOperand.getDefiningOp();
-      }
+
       Value accessIndex;
       uint bankID = 0;
+
+      // Allocate new banks for `memOp` into `block`
+      auto allocateBanks = [&](Operation *memOp, MemRefType memTy, Block *insertBlock) -> SmallVector<Operation *> {
+        auto origShape = memTy.getShape();
+        if (origShape.front() % availableBanks != 0)
+          memOp->emitError() << "memory shape must be divisible by the banking factor";
+        assert(origShape.size() == 1 && "memref must be flattened before scf-to-calyx pass");
+
+        uint bankSize = origShape.front() / availableBanks;
+        SmallVector<Operation *> banks;
+        OpBuilder builder = OpBuilder::atBlockBegin(insertBlock);
+        for (uint bankCnt = 0; bankCnt < availableBanks; bankCnt++) {
+          auto allocOp = builder.create<memref::AllocOp>(insertBlock->getParentOp()->getLoc(), MemRefType::get(bankSize, memTy.getElementType(), memTy.getLayout(), memTy.getMemorySpace())); // TODO: consider GetGlobal and Alloca
+          banks.push_back(allocOp);
+        }
+
+        return banks;
+      };
+
+      auto updateFnType = [&](FuncOp funcOp, SmallVector<Value> &banks) -> FunctionType {
+        SmallVector<Type, 4> updatedCurFnArgTys(funcOp.getArgumentTypes());
+        SmallVector<Type, 4> memBankArgTys;
+        for (auto bank : banks) {
+          funcOp.getBody().addArgument(bank.getType(), funcOp.getLoc());
+          memBankArgTys.push_back(bank.getType());
+        }
+
+        updatedCurFnArgTys.append(memBankArgTys.begin(), memBankArgTys.end());
+
+        return FunctionType::get(funcOp.getContext(), updatedCurFnArgTys, funcOp.getResultTypes());
+      };
+
+      auto eraseOperandInCallerCallees = [&](ModuleOp moduleOp, FuncOp callee, Value operand) {
+        SmallVector<Type, 4> updatedCurFnArgTys(callee.getArgumentTypes());
+        moduleOp.walk([&](FuncOp otherFn) {
+          otherFn.walk([&](mlir::Operation *op) {
+            if (auto callOp = dyn_cast<CallOp>(op)) {
+              if (callOp.getCallee() == callee.getName()) {
+                auto pos = llvm::find(callOp.getOperands(), operand) - callOp.getOperands().begin();
+                updatedCurFnArgTys.erase(updatedCurFnArgTys.begin() + pos);
+                callee.getBlocks().front().eraseArgument(pos);
+                callOp->eraseOperand(pos);
+                operand.getDefiningOp()->erase();
+              }
+            }
+          });
+        });
+        
+        return FunctionType::get(callee.getContext(), updatedCurFnArgTys, callee.getFunctionType().getResults());
+      };
+
+      auto updateCallSites = [&](ModuleOp moduleOp, FuncOp callee, SmallVector<Value> &newOperands) {
+        moduleOp.walk([&](FuncOp otherFn) {
+          otherFn.walk([&](mlir::Operation *op) {
+            if (auto callOp = dyn_cast<CallOp>(op)) {
+              if (callOp.getCallee() == callee.getName()) {
+                SmallVector<Value> callerOperands(callOp.getOperands());
+                callerOperands.append(newOperands);
+                callOp->setOperands(callerOperands);
+                assert(callOp.getNumOperands() == callee.getNumArguments() &&
+                    "number of operands and block arguments should match after appending new memory banks");
+              }
+            }
+          });
+        });
+      };
+
+      auto findNewMemRef = [&](FuncOp caller, FuncOp callee, Value newMemRef) -> std::optional<Value> {
+        std::optional<Value> foundValue;
+        caller.walk([&](mlir::Operation *op) {
+          if (auto callOp = dyn_cast<CallOp>(op)) {
+            if (callOp.getCallee() == callee.getName()) {
+              auto pos = llvm::find(callOp.getOperands(), newMemRef) - callOp.getOperands().begin();
+              foundValue = callee.getArgument(pos);
+              return mlir::WalkResult::interrupt();
+            }
+          }
+          return mlir::WalkResult::advance();
+        });
+
+        return foundValue;
+      };
+
+      auto replaceMemoryOp = [&](Operation *memOp, Value newMemRef, Value newAddr, IRMapping mapping) {
+        if (auto loadOp = dyn_cast<memref::LoadOp>(memOp)) {
+            Value newLoadResult = rewriter.replaceOpWithNewOp<memref::LoadOp>(loadOp, newMemRef, SmallVector<Value>{newAddr});
+            mapping.map(loadOp.getResult(), newLoadResult);
+        } else if (auto storeOp = dyn_cast<memref::StoreOp>(memOp)) {
+            Value valForStore = mapping.lookupOrNull(storeOp.getValue());
+            if (!valForStore) {
+                valForStore = storeOp.getValue();
+            }
+            rewriter.replaceOpWithNewOp<memref::StoreOp>(storeOp, valForStore, newMemRef, SmallVector<Value>{newAddr});
+        }
+      };
+
+      auto topLevelFn = cast<FuncOp>(SymbolTable::lookupSymbolIn(
+                          moduleOp, loweringState().getTopLevelFunction()));
+
       if (auto loadOp = dyn_cast<memref::LoadOp>(user)) {
         assert(loadOp.getIndices().size() == 1);
         accessIndex = loadOp.getIndices().front();
-        //llvm::errs() << "user is a loadOp: \n";
-        //loadOp.dump();
         bankID = getBankOfMemAccess(origMemDef, accessIndex);
+        
         if (getBanksForMem(origMemDef).empty()) {
-          //llvm::errs() << "have not allocated banks yet\n";
-
-          auto memTy = cast<MemRefType>(loadOp.getMemRef().getType());
-          // Allocate new banks
-          auto origShape = memTy.getShape();
-          if (origShape.front() % availableBanks != 0) {
-            origMemDef->emitError() << "memory shape must be divisible by the banking factor";
+          auto allocatedBanks = allocateBanks(loadOp, cast<MemRefType>(loadOp.getMemRefType()), &topLevelFn.getBlocks().front()); // we assume there is only one block in the top-level function
+          SmallVector<Value> allocatedResults;
+          for (auto *memOp : allocatedBanks) {
+            TypeSwitch<Operation *>(memOp)
+              .Case<memref::AllocOp>([&](memref::AllocOp allocOp) {
+                allocatedResults.push_back(allocOp.getResult());
+              });
           }
-          assert(origShape.size() == 1 && "memref must be flattened before scf-to-calyx pass");
-          auto bankSize = origShape.front() / availableBanks;
-
-          // Create new `allocOp`s to the proper top-level function
-          auto topLevelFn = cast<FuncOp>(SymbolTable::lookupSymbolIn(
-                            moduleOp, loweringState().getTopLevelFunction()));
-
-          SmallVector<Value, 4> memBankOperands, memBankArgs;
-          SmallVector<Type, 4> memBankArgTys;
-          Block *curFnBody = &funcOp.getBody().front();
-          Block *topLevelEntryBlock = &topLevelFn.getBody().front();
-          OpBuilder builder = OpBuilder::atBlockBegin(topLevelEntryBlock);
-          SmallVector<Operation *> banks;
-          for (uint bankCnt = 1; bankCnt <= availableBanks; bankCnt++) {
-            // TODO: change to alloc, alloca, getglobal
-            auto allocOp = builder.create<memref::AllocOp>(
-              topLevelFn.getLoc(), MemRefType::get(bankSize, memTy.getElementType(),
-                                              memTy.getLayout(), memTy.getMemorySpace()));
-            banks.push_back(allocOp);
-
-            memBankOperands.push_back(allocOp.getResult());
-            curFnBody->addArgument(allocOp.getType(), funcOp.getLoc());
-            BlockArgument newBodyArg = curFnBody->getArguments().back();
-            memBankArgs.push_back(newBodyArg); 
-            memBankArgTys.push_back(newBodyArg.getType());
-          }
-          // For each function that calls curFn, drop the operand in the caller;
-          // erase the block argument in the callee
-          setBanksForMem(origMemDef, banks);
+          setBanksForMem(origMemDef, allocatedBanks);
 
           rewriter.setInsertionPoint(loadOp);
           Value constDivVal = rewriter.create<arith::ConstantOp>(
-                               rewriter.getUnknownLoc(), rewriter.getIndexAttr(availableBanks)).getResult();
+                rewriter.getUnknownLoc(), rewriter.getIndexAttr(availableBanks)).getResult();
           Value newAddr = rewriter.create<arith::DivUIOp>(
                            rewriter.getUnknownLoc(), accessIndex, constDivVal).getResult();
-          Value newMemRef = getBankForMemAndID(origMemDef, bankID - 1)->getResult(0);
+          Value newMemRef = getBankForMemAndID(origMemDef, bankID);
 
-          // Update the `funcOp`/callee type to get ready to be called by new operands
-          SmallVector<Type, 4> updatedCurFnArgTys(funcOp.getFunctionType().getInputs());
-          updatedCurFnArgTys.append(memBankArgTys.begin(), memBankArgTys.end());
-          moduleOp.walk([&](FuncOp otherFn) {
-            otherFn.walk([&](mlir::Operation *op) {
-              if (auto callOp = dyn_cast<CallOp>(op)) {
-                if (callOp.getCallee() == funcOp.getName()) {
-                  auto pos = llvm::find(callOp.getOperands(), origMemDef->getResult(0)) - callOp.getOperands().begin();
-                  assert(callOp.getOperands()[pos].getType() == updatedCurFnArgTys[pos]);
-                }
-              }
-            });
-          });
-          funcOp.setType(FunctionType::get(funcOp.getContext(), updatedCurFnArgTys,
-                                     funcOp.getFunctionType().getResults()));
+          auto newFnType = updateFnType(funcOp, allocatedResults);
+          funcOp.setType(newFnType);
+          llvm::errs() << "new funcOp type: \n";
+          funcOp.getFunctionType().dump();
 
-          // Update the `callOp` from the topl-level function with the newly created
-          // `allocOp`s' result      
-          topLevelFn.walk([&](Operation *op) {
-            if (auto callOp = dyn_cast<CallOp>(op)) {
-              if (callOp.getCallee() == funcOp.getName()) {
-                SmallVector<Value, 4> newOperands(callOp.getOperands());
-                newOperands.append(memBankOperands.begin(), memBankOperands.end());
-                callOp->setOperands(newOperands);
-                assert(callOp.getNumOperands() == funcOp.getNumArguments() &&
-                  "number of operands and block arguments should match after appending new memory banks");
-              }
-            }
-          });
-          if (!memOperand.getDefiningOp()) {
-            // Find out the block argument number for the newly created memref
-            moduleOp.walk([&](FuncOp otherFn) {
-              otherFn.walk([&](mlir::Operation *op) {
-                if (auto callOp = dyn_cast<CallOp>(op)) {
-                  if (callOp.getCallee() == funcOp.getName()) {
-                    auto pos = llvm::find(callOp.getOperands(), newMemRef) - callOp.getOperands().begin();
-                    newMemRef = funcOp.getArgument(pos);
-                  }
-                }
-              });
-            });
+          updateCallSites(moduleOp, funcOp, allocatedResults);
+          if (isa<BlockArgument>(memOperand)) {
+            if (auto foundValue = findNewMemRef(topLevelFn, funcOp, newMemRef))
+              newMemRef = *foundValue;
           }
-          Value newLoadResult = rewriter.replaceOpWithNewOp<memref::LoadOp>(
-                    loadOp, newMemRef, SmallVector<Value>{newAddr});
-          mapping.map(loadOp.getResult(), newLoadResult);
-          }
+
+          replaceMemoryOp(loadOp, newMemRef, newAddr, mapping);
+        }
         else {
           rewriter.setInsertionPoint(loadOp);
           Value constDivVal = rewriter.create<arith::ConstantOp>(
                                rewriter.getUnknownLoc(), rewriter.getIndexAttr(availableBanks)).getResult();
           Value newAddr = rewriter.create<arith::DivUIOp>(
                            rewriter.getUnknownLoc(), accessIndex, constDivVal).getResult();
-          Value newMemRef = getBankForMemAndID(origMemDef, bankID - 1)->getResult(0);
-          if (!memOperand.getDefiningOp()) {
-            // Find out the block argument number for the newly created memref
-            moduleOp.walk([&](FuncOp otherFn) {
-              otherFn.walk([&](mlir::Operation *op) {
-                if (auto callOp = dyn_cast<CallOp>(op)) {
-                  if (callOp.getCallee() == funcOp.getName()) {
-                    auto pos = llvm::find(callOp.getOperands(), newMemRef) - callOp.getOperands().begin();
-                    newMemRef = funcOp.getArgument(pos);
-                  }
-                }
-              });
-            });
+          Value newMemRef = getBankForMemAndID(origMemDef, bankID);
+          if (isa<BlockArgument>(memOperand)) {
+            if (auto foundValue = findNewMemRef(topLevelFn, funcOp, newMemRef))
+              newMemRef = *foundValue;
           }
-          Value newLoadResult = rewriter.replaceOpWithNewOp<memref::LoadOp>(
-                    loadOp, newMemRef, SmallVector<Value>{newAddr});
-          mapping.map(loadOp.getResult(), newLoadResult);
+
+          replaceMemoryOp(loadOp, newMemRef, newAddr, mapping);
           if (memOperand.use_empty()) {
-          SmallVector<Type, 4> updatedCurFnArgTys(funcOp.getFunctionType().getInputs());
-          moduleOp.walk([&](FuncOp otherFn) {
-            otherFn.walk([&](mlir::Operation *op) {
-              if (auto callOp = dyn_cast<CallOp>(op)) {
-                if (callOp.getCallee() == funcOp.getName()) {
-                  auto pos = llvm::find(callOp.getOperands(), origMemDef->getResult(0)) - callOp.getOperands().begin();
-                  updatedCurFnArgTys.erase(updatedCurFnArgTys.begin() + pos);
-                  funcOp.getRegion().getBlocks().front().eraseArgument(pos);
-                SmallVector<Value, 4> newOperands(callOp.getOperands());
-                newOperands.erase(newOperands.begin() + pos);
-                callOp->setOperands(newOperands);
-                    origMemDef->erase();
-                }
-              }
-            });
-          });
-          funcOp.setType(FunctionType::get(funcOp.getContext(), updatedCurFnArgTys,
-                                     funcOp.getFunctionType().getResults()));
+            auto newFnType = eraseOperandInCallerCallees(moduleOp, funcOp, origMemDef->getResult(0));
+            funcOp.setFunctionType(newFnType);
           }
         }
-        }
-        else if (auto storeOp = dyn_cast<memref::StoreOp>(user)) {
-          assert(storeOp.getIndices().size() == 1);
-          accessIndex = storeOp.getIndices().front();
-          bankID = getBankOfMemAccess(origMemDef, accessIndex);
+      }
+      else if (auto storeOp = dyn_cast<memref::StoreOp>(user)) {
+        assert(storeOp.getIndices().size() == 1);
+        accessIndex = storeOp.getIndices().front();
+        bankID = getBankOfMemAccess(origMemDef, accessIndex);
+        
         if (getBanksForMem(origMemDef).empty()) {
-          auto memTy = cast<MemRefType>(storeOp.getMemRef().getType());
-          // Allocate new banks
-          auto origShape = memTy.getShape();
-          if (origShape.front() % availableBanks != 0) {
-            origMemDef->emitError() << "memory shape must be divisible by the banking factor";
+          auto allocatedBanks = allocateBanks(storeOp, cast<MemRefType>(storeOp.getMemRefType()), &topLevelFn.getBlocks().front()); // we assume there is only one block in the top-level function
+          SmallVector<Value> allocatedResults;
+          for (auto *memOp : allocatedBanks) {
+            TypeSwitch<Operation *>(memOp)
+              .Case<memref::AllocOp>([&](memref::AllocOp allocOp) {
+                allocatedResults.push_back(allocOp.getResult());
+              });
           }
-          assert(origShape.size() == 1 && "memref must be flattened before scf-to-calyx pass");
-          auto bankSize = origShape.front() / availableBanks;
-
-          // Create new `allocOp`s to the proper top-level function
-          auto topLevelFn = cast<FuncOp>(SymbolTable::lookupSymbolIn(
-                            moduleOp, loweringState().getTopLevelFunction()));
-
-          SmallVector<Value, 4> memBankOperands, memBankArgs;
-          SmallVector<Type, 4> memBankArgTys;
-          Block *curFnBody = &funcOp.getBody().front();
-          Block *topLevelEntryBlock = &topLevelFn.getBody().front();
-          OpBuilder builder = OpBuilder::atBlockBegin(topLevelEntryBlock);
-          SmallVector<Operation *> banks;
-          for (uint bankCnt = 1; bankCnt <= availableBanks; bankCnt++) {
-            // TODO: change to alloc, alloca, getglobal
-            auto allocOp = builder.create<memref::AllocOp>(
-              topLevelFn.getLoc(), MemRefType::get(bankSize, memTy.getElementType(),
-                                              memTy.getLayout(), memTy.getMemorySpace()));
-            banks.push_back(allocOp);
-
-            memBankOperands.push_back(allocOp.getResult());
-            curFnBody->addArgument(allocOp.getType(), funcOp.getLoc());
-            BlockArgument newBodyArg = curFnBody->getArguments().back();
-            memBankArgs.push_back(newBodyArg); 
-            memBankArgTys.push_back(newBodyArg.getType());
-          }
-          // For each function that calls curFn, drop the operand in the caller;
-          // erase the block argument in the callee
-          llvm::errs() << "setting banks for: ";
-          origMemDef->dump();
-          llvm::errs() << "banks size: " << banks.size() << "\n";
-          setBanksForMem(origMemDef, banks);
+          setBanksForMem(origMemDef, allocatedBanks);
 
           rewriter.setInsertionPoint(storeOp);
           Value constDivVal = rewriter.create<arith::ConstantOp>(
                                rewriter.getUnknownLoc(), rewriter.getIndexAttr(availableBanks)).getResult();
           Value newAddr = rewriter.create<arith::DivUIOp>(
                            rewriter.getUnknownLoc(), accessIndex, constDivVal).getResult();
-          llvm::errs() << "bankID: " << bankID << "\n";
-          Value newMemRef = getBankForMemAndID(origMemDef, bankID - 1)->getResult(0);
+          Value newMemRef = getBankForMemAndID(origMemDef, bankID);
 
-          // Update the `funcOp`/callee type to get ready to be called by new operands
-          SmallVector<Type, 4> updatedCurFnArgTys(funcOp.getFunctionType().getInputs());
-          updatedCurFnArgTys.append(memBankArgTys.begin(), memBankArgTys.end());
-          moduleOp.walk([&](FuncOp otherFn) {
-            otherFn.walk([&](mlir::Operation *op) {
-              if (auto callOp = dyn_cast<CallOp>(op)) {
-                if (callOp.getCallee() == funcOp.getName()) {
-                  auto pos = llvm::find(callOp.getOperands(), origMemDef->getResult(0)) - callOp.getOperands().begin();
-                  assert(callOp.getOperands()[pos].getType() == updatedCurFnArgTys[pos]);
-                  //updatedCurFnArgTys.erase(updatedCurFnArgTys.begin() + pos);
-                  //funcOp.getRegion().getBlocks().front().eraseArgument(pos);
-                }
-              }
-            });
-          });
-          funcOp.setType(FunctionType::get(funcOp.getContext(), updatedCurFnArgTys,
-                                     funcOp.getFunctionType().getResults()));
+          auto newFnType = updateFnType(funcOp, allocatedResults);
+          funcOp.setType(newFnType);
 
-          // Update the `callOp` from the topl-level function with the newly created
-          // `allocOp`s' result      
-          topLevelFn.walk([&](Operation *op) {
-            if (auto callOp = dyn_cast<CallOp>(op)) {
-              if (callOp.getCallee() == funcOp.getName()) {
-                SmallVector<Value, 4> newOperands(callOp.getOperands());
-                newOperands.append(memBankOperands.begin(), memBankOperands.end());
-                callOp->setOperands(newOperands);
-                assert(callOp.getNumOperands() == funcOp.getNumArguments() &&
-                  "number of operands and block arguments should match after appending new memory banks");
-              }
-            }
-          });
-          if (!memOperand.getDefiningOp()) {
-            // Find out the block argument number for the newly created memref
-            moduleOp.walk([&](FuncOp otherFn) {
-              otherFn.walk([&](mlir::Operation *op) {
-                if (auto callOp = dyn_cast<CallOp>(op)) {
-                  if (callOp.getCallee() == funcOp.getName()) {
-                    auto pos = llvm::find(callOp.getOperands(), newMemRef) - callOp.getOperands().begin();
-                    llvm::errs() << "argument pos: " << pos << "\n";
-                    newMemRef = funcOp.getArgument(pos);
-                    //auto pos = llvm::find(newOperands, origMemDef->getResult(0)) - newOperands.begin();
-                    //newOperands.erase(newOperands.begin() + pos);
-                  }
-                }
-              });
-            });
+          updateCallSites(moduleOp, funcOp, allocatedResults);
+          if (isa<BlockArgument>(memOperand)) {
+            if (auto foundValue = findNewMemRef(topLevelFn, funcOp, newMemRef))
+              newMemRef = *foundValue;
           }
-          Value valForStore = mapping.lookupOrNull(storeOp.getValue());
-          if (!valForStore)
-            valForStore = storeOp.getValue();
-          rewriter.replaceOpWithNewOp<memref::StoreOp>(
-                storeOp, valForStore, newMemRef, SmallVector<Value>{newAddr});
 
+          replaceMemoryOp(storeOp, newMemRef, newAddr, mapping);
         }
         else {
           rewriter.setInsertionPoint(storeOp);
@@ -1982,308 +1917,27 @@ public:
                                rewriter.getUnknownLoc(), rewriter.getIndexAttr(availableBanks)).getResult();
           Value newAddr = rewriter.create<arith::DivUIOp>(
                            rewriter.getUnknownLoc(), accessIndex, constDivVal).getResult();
-          llvm::errs() << "bankID: " << bankID << "\n";
-          Value newMemRef = getBankForMemAndID(origMemDef, bankID - 1)->getResult(0);
-          if (!memOperand.getDefiningOp()) {
-            // Find out the block argument number for the newly created memref
-            moduleOp.walk([&](FuncOp otherFn) {
-              otherFn.walk([&](mlir::Operation *op) {
-                if (auto callOp = dyn_cast<CallOp>(op)) {
-                  if (callOp.getCallee() == funcOp.getName()) {
-                    auto pos = llvm::find(callOp.getOperands(), newMemRef) - callOp.getOperands().begin();
-                    llvm::errs() << "argument pos: " << pos << "\n";
-                    newMemRef = funcOp.getArgument(pos);
-                    //auto pos = llvm::find(newOperands, origMemDef->getResult(0)) - newOperands.begin();
-                    //newOperands.erase(newOperands.begin() + pos);
-                  }
-                }
-              });
-            });
+          Value newMemRef = getBankForMemAndID(origMemDef, bankID);
+          if (isa<BlockArgument>(memOperand)) {
+            if (auto foundValue = findNewMemRef(topLevelFn, funcOp, newMemRef))
+              newMemRef = *foundValue;
           }
-          Value valForStore = mapping.lookupOrNull(storeOp.getValue());
-          if (!valForStore)
-            valForStore = storeOp.getValue();
-          rewriter.replaceOpWithNewOp<memref::StoreOp>(
-                storeOp, valForStore, newMemRef, SmallVector<Value>{newAddr});
-          llvm::errs() << "moduleOp\n";
-          moduleOp.dump();
-          llvm::errs() << "memOperand: \n";
-          memOperand.dump();
-          llvm::errs() << "printing users: \n";
-          for (auto &use : memOperand.getUses()) {
-            use.get().dump();
-          }
+
+          replaceMemoryOp(storeOp, newMemRef, newAddr, mapping);
+
           if (memOperand.use_empty()) {
-            llvm::errs() << "in Store, memOperand: \n";
-            memOperand.dump();
-            llvm::errs() << "has no uses\n";
-          SmallVector<Type, 4> updatedCurFnArgTys(funcOp.getFunctionType().getInputs());
-          moduleOp.walk([&](FuncOp otherFn) {
-            otherFn.walk([&](mlir::Operation *op) {
-              if (auto callOp = dyn_cast<CallOp>(op)) {
-                if (callOp.getCallee() == funcOp.getName()) {
-                  auto pos = llvm::find(callOp.getOperands(), origMemDef->getResult(0)) - callOp.getOperands().begin();
-                  updatedCurFnArgTys.erase(updatedCurFnArgTys.begin() + pos);
-                    llvm::errs() << "erased arg type\n";
-                  funcOp.getRegion().getBlocks().front().eraseArgument(pos);
-                    llvm::errs() << "erased argument\n";
-                SmallVector<Value, 4> newOperands(callOp.getOperands());
-                newOperands.erase(newOperands.begin() + pos);
-                    llvm::errs() << "erased operands\n";
-                callOp->setOperands(newOperands);
-                    origMemDef->erase();
-                    llvm::errs() << "erased original memory operation\n";
-                }
-              }
-            });
-          });
-          funcOp.setType(FunctionType::get(funcOp.getContext(), updatedCurFnArgTys,
-                                     funcOp.getFunctionType().getResults()));
+            auto newFnType = eraseOperandInCallerCallees(moduleOp, funcOp, origMemDef->getResult(0));
+            funcOp.setFunctionType(newFnType);
           }
         }
-        }
-        else {
-          llvm_unreachable("unreachable use of memref type operand.");
-        }
+      }
+      else
+        llvm_unreachable("cannot reach this memref operation");
       }
     //llvm::errs() << "after replacing with new memory access indices\n";
-    //moduleOp.dump();
+    
+    moduleOp.dump();
 
-    funcOp.walk([&](Operation *op) {
-      if (!isa<scf::ParallelOp>(op))
-        return WalkResult::advance();
-
-      auto scfParOp = cast<scf::ParallelOp>(op);
-
-      // If there is no memory inside `scf.parallel` region, we make everything parallel:
-      /*** seq {
-       *    par {
-       *      call par_func0;
-       *      call par_func1;
-       *      ...
-       *      call par_func(access indices - 1);
-       *    }
-       *  }
-       *  
-       *  par_func0 {
-       *    same as scf.paralle's body, but with specific induction variables substituted
-       *  }
-       *  ...
-       *  par_func(access indicies - 1) {
-       *    ...
-       *  }
-       *
-      ***/
-      //
-      // If we have memories involved, the number of `par_func` we can execute simultaneously == the banking factor:
-      //   since all the `par_func`s embedded in a `calyx.par` will be executed in parallel;
-      //   and we need to make sure that all banks can always get executed in parallel so we have to analyze
-      //   the access patterns, which we need to look at user input and correct that.
-      // One exception about the number of `par_func`s executed in parallel is the ones got "leftover",
-      //   when the size of `access indices` is not divisible by the banking factor.
-      // If we have multiple memories, the number of parallelism is min{bf}, for bf \in {all banking_factors}.
-      // FWIW, the number of `par_func`s can be executed in parallel equals the `width` in a `calyx.par`.
-      //
-      // On the other hand, the instructions within a `par_func` are executed in sequence. These body-instructions
-      //   can share the same bank and the same induction variables.
-      // FWIW, the number of instructions in `par_func`'s == the number of instructions in the original `scf.parallel`.
-      //
-      // Then, the number of `calyx.par` equals `ceil(access indicies / banking factor)` 
-      //
-      // Note: if we don't know either one of lower bound/upper bound/step, we need to be conservative.
-      //
-      /*** seq {
-       *    par {
-       *      call par_func0(iv0, bank0);
-       *      call par_func1(iv1, bank1);
-       *      ...
-       *      call par_funcj(iv{z}, bank{z});               // z <= banking factor - 1
-       *    }
-       *    par {
-       *      call par_func0(iv{z+1}, bank0);
-       *      call par_func1(iv{z+2}, bank1)
-       *    }
-       *    ...
-       *    par {
-       *      call par_func0(iv{m},, bank0);                // m = access indicies - l - 1
-       *      ...
-       *      call par_func(iv{access indicies-1}, bank{l}) // l = min{z, access indicies % z} - 1
-       *    }
-       *  }
-       *
-       *
-       * par_func0 {
-       *  same as scf.parallel's body, but with memory bank 0 and specific induction variables
-       * }
-       *
-      ***/
-
-      /*** TraceBank & Affine analysis 
-       *
-       * Need the layout of all access patterns by doing static analysis; one access pattern per memory,
-       * then we can decide how many banks we need for each memory. 
-       *
-       * Algorithm:
-       *  1. Iterate all memories, for each memory:
-       *       - Obtain the access index;
-       *       - Compute the static constant value for this index
-       *         - if we can't get the constant value statically, we make the banking factor = 1
-       *       - Insert the static value to the map 
-       *
-       *  2. For each mem, use the TraceBank algorithm
-       *
-       ***************************************************
-       *
-       * Overall algorithm
-       *  1. Determine the total number of access indicies combinations;
-       *  2. Determine the number of banking factors by doing affine analaysis (above);
-       *  3. int round_robin = 0, new_pars = 0
-       *     for access_idx in range(0, access_indicies.size) {
-       *        1. create operands
-       *          - inductive operand: create arith.constant;
-       *          - operands that are defined outside the scf.parallel region
-       *          - memref banked operands: pass in round_robin'th bank
-       *        2. create `par_func` and pass in operands
-       *        3. round_robin += 1
-       *           if (round_robin + 1) % banking_factor == 0:
-       *             round_robin = 0
-       *             new_pars += 1
-       *    }
-       *
-       ***/ 
-      
-      // Implementation
-      // 1. Calculate `access_indicies`, the `combinations` of all loop inductive variables.
-      //    Note, we need to guarantee that all memories are one-dim. So the size of `access_indicies` = #memories.
-
-      llvm::errs() << "parallel Op: \n";
-      moduleOp.dump();
-
-      return WalkResult::advance();
-      auto [lowerBounds, upperBounds, steps] = getLoopBounds(scfParOp);
-      auto inductVarCombs =
-          genInductVarCombinations(lowerBounds, upperBounds, steps);
-
-      // 2. Iterate through the induct vars, create a `par_func` when the banking factor is divisible by `round_robin` 
-      uint roundRobin = 0;
-      uint newParOpCnt = 0;
-      auto ivToArithConst = createIVConsts(rewriter, scfParOp);
-      auto bankingFactor = computeBankingFactor(rewriter, ivToArithConst, scfParOp);
-      rewriter.setInsertionPointAfter(scfParOp);
-      SmallVector<FuncOp> funcsInPar;
-      DenseSet<Value> seenOperands;
-      DenseMap<Value, uint> operandToArgPos;
-      uint argPos = 0;
-      SmallVector<Value> fnOperands;
-      for (size_t ivCombIdx = 0; ivCombIdx < inductVarCombs.size(); ivCombIdx++) {
-        FuncOp parFuncOp;
-        if (parFuncs.begin() + ivCombIdx % bankingFactor == parFuncs.end()) {
-          FunctionType parFuncTy = computeParFuncTy(rewriter, ivCombIdx, bankingFactor, scfParOp);
-          rewriter.setInsertionPointAfter(funcOp);
-          parFuncOp = rewriter.create<FuncOp>(scfParOp.getLoc(),
-              llvm::join_items("_", "" "par_func", std::to_string(newParOpCnt),
-                             std::to_string(ivCombIdx % bankingFactor)), parFuncTy);
-          parFuncOp.addEntryBlock();
-          parFuncs.push_back(parFuncOp);
-        }
-        else
-          parFuncOp = parFuncs[ivCombIdx % bankingFactor];
-
-        Block *entryBlock = &parFuncOp.getBlocks().front();
-        funcsInPar.push_back(parFuncOp);
-        IRMapping mapping;
-        const auto &ivComb = inductVarCombs[ivCombIdx];
-        rewriter.setInsertionPointToEnd(entryBlock);
-        for (auto ivComb : inductVarCombs) {
-          auto [lbVal, ubVal] = ivComb;
-          auto lbConst = rewriter.create<arith::ConstantIndexOp>(scfParOp.getLoc(), lbVal);
-          auto ubConst = rewriter.create<arith::ConstantIndexOp>(scfParOp.getLoc(), ubVal);
-          ivToArithConst[ivComb] = std::make_tuple(lbConst, ubConst);
-        }
-        auto ivCombConst = ivToArithConst[ivComb];
-        mapping.map(scfParOp.getInductionVars()[0], std::get<0>(ivCombConst));
-        mapping.map(scfParOp.getInductionVars()[1], std::get<1>(ivCombConst));
-        auto inductVars = scfParOp.getInductionVars();
-        for (Operation &innerOp : scfParOp.getBody()->getOperations()) {
-          for (auto operand : innerOp.getOperands()) {
-            bool isDefinedInside = isDefinedInsideRegion(operand, &scfParOp->getRegion(0));
-            if (!isDefinedInside) {
-              if (seenOperands.insert(operand).second) {
-                assert(operandToArgPos.find(operand) == operandToArgPos.end() && "must have not seen");
-                mapping.map(operand, parFuncOp.getArgument(argPos));
-                operandToArgPos[operand] = argPos;
-                argPos++;
-                fnOperands.push_back(operand);
-              }
-              else
-                mapping.map(operand, parFuncOp.getArgument(operandToArgPos[operand]));
-            }
-          }
-        }
-        for (Operation &op : scfParOp.getBody()->getOperations()) {
-          if (!isa<scf::ReduceOp>(op)) {
-            rewriter.setInsertionPointToEnd(entryBlock);
-            Operation * clonedOp = rewriter.clone(op, mapping);
-            if (auto loadOp = dyn_cast_if_present<memref::LoadOp>(clonedOp)) {
-              assert(loadOp.getIndices().size() == 1 &&
-                    "all memref::load operations should get flattened before this pass");
-              auto loadAddr = loadOp.getIndices().front();
-              rewriter.setInsertionPoint(loadOp);
-              Value constDivVal = rewriter.create<arith::ConstantOp>(
-                               loadOp.getLoc(), rewriter.getIndexAttr(bankingFactor))
-                               .getResult();
-              Value newAddr = rewriter.create<arith::DivUIOp>(
-                           loadOp.getLoc(), loadAddr, constDivVal)
-                           .getResult();
-              Value newLoadResult = rewriter.replaceOpWithNewOp<memref::LoadOp>(
-                    loadOp, loadOp.getMemRef(), SmallVector<Value>{newAddr});
-              mapping.map(loadOp.getResult(), newLoadResult);
-            }
-
-            if (auto storeOp = dyn_cast_if_present<memref::StoreOp>(clonedOp)) {
-              assert(storeOp.getIndices().size() == 1 &&
-                     "all memref::store operations should get flattened before this pass");
-              auto storeAddr = storeOp.getIndices().front();
-              rewriter.setInsertionPoint(storeOp);
-              Value constDivVal = rewriter.create<arith::ConstantOp>(
-                               storeOp.getLoc(), rewriter.getIndexAttr(bankingFactor))
-                               .getResult();
-              Value newAddr = rewriter.create<arith::DivUIOp>(
-                           storeOp.getLoc(), storeAddr, constDivVal)
-                           .getResult();
-              Value valForStore = mapping.lookupOrNull(storeOp.getValue());
-              if (!valForStore)
-                valForStore = storeOp.getValue();
-              rewriter.replaceOpWithNewOp<memref::StoreOp>(
-                  storeOp, valForStore, storeOp.getMemRef(), SmallVector<Value>{newAddr});
-            }
-          }
-        }
-        roundRobin = (roundRobin + 1) % bankingFactor;
-        assert(inductVarCombs.size() % bankingFactor == 0);
-      }
-      
-      scf::ParallelOp newParOp;
-      for (size_t fnCnt = 0; fnCnt < funcsInPar.size(); fnCnt++) {
-        if (fnCnt % bankingFactor == 0) {
-          rewriter.setInsertionPointAfter(scfParOp);
-          // the actual steps and stuff doesn't really matter for the newly created par
-          newParOp = rewriter.create<scf::ParallelOp>(
-                scfParOp.getLoc(), scfParOp.getLowerBound(),
-                scfParOp.getUpperBound(), scfParOp.getStep());
-          newParOpCnt++;
-        }
-        rewriter.setInsertionPointToStart(&newParOp.getRegion().getBlocks().front());
-        auto calleeName = SymbolRefAttr::get(rewriter.getContext(),
-                                            funcsInPar[fnCnt].getSymName());
-        auto resultTypes = funcsInPar[fnCnt].getResultTypes();
-        rewriter.create<CallOp>(newParOp.getLoc(), calleeName, resultTypes, fnOperands);
-      }
-
-      rewriter.eraseOp(scfParOp);
-      
-      return WalkResult::advance();
-    });
     return res;
 };
 
@@ -2468,7 +2122,6 @@ private:
 
   // Computes the raw traces of a given memory in a step
   SmallVector<uint> computeRawTrace(scf::ParallelOp scfParOp, Value memResult) const {
-    llvm::errs() << "computing raw trace\n";
     auto moduleOp = scfParOp->getParentOfType<ModuleOp>();
     auto funcOp = scfParOp->getParentOfType<FuncOp>();
     for (auto blockArg : funcOp.getBody().getArguments()) {
@@ -2478,8 +2131,6 @@ private:
           if (auto callOp = dyn_cast<CallOp>(op)) {
               if (callOp.getCallee() == funcOp.getName()) {
                 if (llvm::find(callOp.getOperands(), memResult) != callOp.getOperands().end()) {
-                  llvm::errs() << "callOp is passing memresult: \n";
-                  memResult.dump();
                   auto pos = llvm::find(callOp.getOperands(), memResult) - callOp.getOperands().begin();
                   memResult = funcOp.getArgument(pos);
                 }
@@ -2510,7 +2161,7 @@ private:
   }
 
   SmallVector<Value> computeRawTraceInValue(scf::ParallelOp scfParOp, Value memResult) const {
-    llvm::errs() << "computing raw traces in value: \n";
+    //llvm::errs() << "computing raw traces in value: \n";
     auto moduleOp = scfParOp->getParentOfType<ModuleOp>();
     auto funcOp = scfParOp->getParentOfType<FuncOp>();
     for (auto blockArg : funcOp.getBody().getArguments()) {
@@ -2587,7 +2238,6 @@ private:
     }
     return numConflicts;
   }
-
 
   std::string extractMaskIDs(const std::string &sizedBinTrace, const std::string &maskBits) const {
     std::string maskedBits;
@@ -2761,7 +2411,7 @@ private:
         }
       }
     }
-    llvm::errs() << "best: " << bestMaskBits << " with minCliques: " << overallMinCliques << "\n";
+    //llvm::errs() << "best: " << bestMaskBits << " with minCliques: " << overallMinCliques << "\n";
     return bestMaskBits;
   }
 
@@ -2848,7 +2498,7 @@ private:
   }
 
   std::unordered_map<std::string, int> mapMaskIDsToBanks(const uint availableBanks, SmallVector<SmallVector<uint>> &compressedTraces, std::string &mask) const {
-    llvm::errs() << "availableBanks in mapping mask IDs to banks: " << availableBanks << "\n";
+    //llvm::errs() << "availableBanks in mapping mask IDs to banks: " << availableBanks << "\n";
     bool canBeColored = false;
     std::unordered_map<std::string, int> maskToBanks;
     do {
@@ -2871,7 +2521,7 @@ private:
       auto colorRes = graphColoring(conflictGraph, availableBanks);
       canBeColored = colorRes.has_value();
       if (canBeColored) {
-        llvm::errs() << "Graph can be colored with " << availableBanks << " colors." << "\n"; 
+        //llvm::errs() << "Graph can be colored with " << availableBanks << " colors." << "\n"; 
         maskToBanks = *colorRes;
       }
       auto isAllOnes = [](const std::string& binaryString) -> bool {
@@ -2888,10 +2538,10 @@ private:
     } while (!canBeColored);
 
     assert(!maskToBanks.empty() && "The number of vailable banks is not sufficient for banking");
-    llvm::errs() << "can be colored; mask ID and color mapping is: \n";
-    for (const auto &[id, color] : maskToBanks) {
-      llvm::errs() << id << ": " << color << "\n";
-    }
+    //llvm::errs() << "can be colored; mask ID and color mapping is: \n";
+//    for (const auto &[id, color] : maskToBanks) {
+//      llvm::errs() << id << ": " << color << "\n";
+//    }
     return maskToBanks;
   }
 
@@ -2904,9 +2554,26 @@ private:
   SmallVector<Operation *> getBanksForMem(Operation *memory) const {
     return memoryToBanks[memory];
   }
-  Operation* getBankForMemAndID(Operation *memory, uint bankID) const {
-    return memoryToBanks[memory][bankID];
+
+  Value getBankForMemAndID(Operation *memory, uint bankID) const {
+    auto *op = memoryToBanks[memory][bankID];
+    return TypeSwitch<Operation *, Value>(op)
+    .Case<memref::AllocOp>([](memref::AllocOp allocOp) {
+      return allocOp.getResult();
+    })
+    .Case<memref::AllocaOp>([](memref::AllocaOp allocaOp) {
+      return allocaOp.getResult();
+    })
+    .Case<memref::GetGlobalOp>([](memref::GetGlobalOp getGlobalOp) {
+      return getGlobalOp.getResult();
+    })
+    .Default([](Operation *op) -> Value {
+      // Handle the default case, such as throwing an error or returning a nullptr.
+      op->emitError("Unsupported memory operation type");
+      return nullptr;
+    });
   }
+
   void setBanksForMem(Operation *memory, SmallVector<Operation *> &allocatedBanks) const {
     memoryToBanks[memory] = allocatedBanks;
   }
@@ -2957,7 +2624,7 @@ private:
     std::unordered_map<std::string, int> maskIDsToBanks = mapMaskIDsToBanks(availableBanks, compressedTraces, masksBits);
 
     SmallVector<SmallVector<uint>> accessIndicesToBanks;
-    llvm::errs() << "computing accessIndicesToBanks\n";
+    //llvm::errs() << "computing accessIndicesToBanks\n";
     for (const auto &step : rawTraces) {
       SmallVector<uint> banksInStep;
       for (auto trace : step) {
@@ -2971,28 +2638,28 @@ private:
       accessIndicesToBanks.push_back(banksInStep);
     }
 
-    llvm::errs() << "accessIndicesToBanks: \n";
-    for (auto i : accessIndicesToBanks) {
-      for (auto j : i) {
-        llvm::errs() << j << " ";
-      }
-      llvm::errs() << "\n";
-    }
-    llvm::errs() << "rawTraces: \n";
-    for (auto i  : rawTraces) {
-      for (auto j : i) {
-        llvm::errs() << j << " ";
-      }
-      llvm::errs() << "\n";
-    }
-    llvm::errs() << "rawTracesInValue: \n";
-    for (auto i  : rawTracesInValue) {
-      for (auto j : i) {
-        j.dump();
-      }
-      llvm::errs() << "\n";
-    }
-    for (uint bankCnt = 1; bankCnt <= availableBanks; bankCnt++) {
+//    llvm::errs() << "accessIndicesToBanks: \n";
+//    for (auto i : accessIndicesToBanks) {
+//      for (auto j : i) {
+//        llvm::errs() << j << " ";
+//      }
+//      llvm::errs() << "\n";
+//    }
+//    llvm::errs() << "rawTraces: \n";
+//    for (auto i  : rawTraces) {
+//      for (auto j : i) {
+//        llvm::errs() << j << " ";
+//      }
+//      llvm::errs() << "\n";
+//    }
+//    llvm::errs() << "rawTracesInValue: \n";
+//    for (auto i  : rawTracesInValue) {
+//      for (auto j : i) {
+//        j.dump();
+//      }
+//      llvm::errs() << "\n";
+//    }
+    for (uint bankCnt = 0; bankCnt < availableBanks; bankCnt++) {
       for (uint i = 0; i < accessIndicesToBanks.size(); i++) {
         auto curStep = accessIndicesToBanks[i];
         for (uint j = 0; j < curStep.size(); j++) {
@@ -3009,219 +2676,6 @@ private:
                 assert(memoryToBankIDs[memory][rawTracesInValue[i][j]] == bankCnt);
               }
             }
-          }
-        }
-      }
-    }
-
-  }
-
-  uint computeBankingFactor(PatternRewriter &rewriter, DenseMap<std::tuple<int64_t, int64_t>, std::tuple<arith::ConstantIndexOp, arith::ConstantIndexOp>>& ivToArithConst, scf::ParallelOp scfParOp) const {
-    DenseMap<Operation *, SmallVector<uint>> memOpAccessIndices;
-    auto [lowerBounds, upperBounds, steps] = getLoopBounds(scfParOp);
-    auto inductVarCombs =
-          genInductVarCombinations(lowerBounds, upperBounds, steps);
-    DenseMap<Value, SmallVector<int>> accessPatterns;
-    for (size_t ivCombIdx = 0; ivCombIdx < inductVarCombs.size(); ivCombIdx++) {
-      const auto &ivComb = inductVarCombs[ivCombIdx];
-      auto ivCombConst = ivToArithConst[ivComb];
-      // auto firstElm =  std::get<0>(inductVarCombs[ivCombIdx]);
-      // auto secondElm = std::get<1>(inductVarCombs[ivCombIdx]);
-      IRMapping mapping;
-      mapping.map(scfParOp.getInductionVars()[0], std::get<0>(ivCombConst));
-      mapping.map(scfParOp.getInductionVars()[1], std::get<1>(ivCombConst));
-      for (Operation &innerOp : scfParOp.getBody()->getOperations()) {
-        if (isa<scf::ParallelOp, scf::ReduceOp>(innerOp))
-          continue;
-
-        Operation *clonedOp = rewriter.clone(innerOp, mapping);
-        if (auto loadOp = dyn_cast_if_present<memref::LoadOp>(clonedOp)) {
-          assert(loadOp.getIndices().size() == 1 && "all memref::load operations should get flattened before this pass");
-          auto loadAddr = loadOp.getIndices().front();
-          auto constIntAddr = evaluateIndex(loadAddr); 
-          accessPatterns[loadOp.getMemRef()].push_back(constIntAddr);
-        }
-
-        if (auto storeOp = dyn_cast_if_present<memref::StoreOp>(clonedOp)) {
-          assert(storeOp.getIndices().size() == 1 && "all memref::store operations should get flattened before this pass");
-          auto storeAddr = storeOp.getIndices().front();
-          auto constStoreAddr = evaluateIndex(storeAddr);
-          accessPatterns[storeOp.getMemRef()].push_back(constStoreAddr);
-        }
-      }
-    }
-   
-    for (const auto &[memref, accessIndices] : accessPatterns) {
-      llvm::errs() << "memory: \n";
-      memref.dump();
-      llvm::errs() << "access indices: \n";
-      for (auto idx : accessIndices) {
-        llvm::errs() << idx << " ";
-      }
-      llvm::errs() << "\n";
-    }
-    return 8;
-  }
-
-  mutable DenseMap<Value, uint> memToBankSize;
-  mutable DenseMap<Value, SmallVector<Value, 4>> memsToBanks;
-  std::optional<SmallVector<Value, 4>> computeMemBanks(PatternRewriter &rewriter, Value mem, uint bankingFactor, scf::ParallelOp scfParOp) const {
-    if (memsToBanks.find(mem) == memsToBanks.end()) {
-      // Calculate the new shape of each newly created `allocOp`s
-      auto memTy = cast<MemRefType>(mem.getType());
-      auto origShape = memTy.getShape();
-      if (origShape.front() % bankingFactor != 0) {
-        scfParOp.emitError() << "memory shape must be divisible by the banking factor";
-        return std::nullopt;
-      }
-      assert(origShape.size() == 1 && "memref must be flattened before scf-to-calyx pass");
-      auto bankSize = origShape.front() / bankingFactor;
-
-      // Create new `allocOp`s to the proper top-level function
-      auto moduleOp = scfParOp->getParentOfType<ModuleOp>();
-      auto funcOp = scfParOp->getParentOfType<FuncOp>();
-      auto topLevelFn = cast<FuncOp>(SymbolTable::lookupSymbolIn(
-                              moduleOp, loweringState().getTopLevelFunction()));
-
-      SmallVector<Value, 4> memBankOperands, memBankArgs;
-      SmallVector<Type, 4> memBankArgTys;
-      Block *curFnBody = &funcOp.getBody().front();
-      Block *topLevelEntryBlock = &topLevelFn.getBody().front();
-      rewriter.setInsertionPointToStart(topLevelEntryBlock);
-      for (size_t bankCnt = 0; bankCnt < bankingFactor; bankCnt++) {
-        // TODO: change to alloc, alloca, getglobal
-        auto allocOp = rewriter.create<memref::AllocOp>(
-              topLevelFn.getLoc(), MemRefType::get(bankSize, memTy.getElementType(),
-                                                memTy.getLayout(), memTy.getMemorySpace()));
-        memBankOperands.push_back(allocOp.getResult());
-        curFnBody->addArgument(allocOp.getType(), funcOp.getLoc());
-        BlockArgument newBodyArg = curFnBody->getArguments().back();
-        memBankArgs.push_back(newBodyArg); 
-        memBankArgTys.push_back(newBodyArg.getType());
-      }
-
-      // Update the `funcOp`/callee type to get ready to be called by new operands
-      SmallVector<Type, 4> updatedCurFnArgTys(
-        funcOp.getFunctionType().getInputs());
-      updatedCurFnArgTys.append(memBankArgTys.begin(), memBankArgTys.end());
-      funcOp.setType(FunctionType::get(funcOp.getContext(), updatedCurFnArgTys,
-                                     funcOp.getFunctionType().getResults()));
-
-      // Update the `callOp` from the topl-level function with the newly created
-      // `allocOp`s' result      
-      topLevelFn.walk([&](Operation *op) {
-        if (auto callOp = dyn_cast<CallOp>(op)) {
-          if (callOp.getCallee() == funcOp.getName()) {
-            SmallVector<Value, 4> newOperands(callOp.getOperands());
-            newOperands.append(memBankOperands.begin(), memBankOperands.end());
-
-            callOp->setOperands(newOperands);
-            assert(callOp.getNumOperands() == funcOp.getNumArguments() &&
-              "number of operands and block arguments should match after appending new memory banks");
-          }
-        }
-      });
-
-      // Finally set the corresponding memory banks to the given `mem`
-      memsToBanks[mem] = memBankOperands;
-    }
-    return memsToBanks[mem];
-  }
-
-  SmallVector<Type> computeParFuncRetTys(scf::ParallelOp scfParOp) const {
-    SmallVector<Type> parFuncRetTys;
-    scfParOp.walk([&](mlir::Operation *innerOp) {
-      if (isa<scf::ReduceOp>(innerOp)) {
-        auto reduceOp = cast<scf::ReduceOp>(innerOp);
-        reduceOp->getResultTypes();
-        parFuncRetTys.append(reduceOp->getResultTypes().begin(), reduceOp->getResultTypes().end());
-        return WalkResult::advance();
-      }
-    return WalkResult::advance();
-    });
-    return parFuncRetTys;
-  }
-
-  FunctionType computeParFuncTy(PatternRewriter &rewriter, uint idx, uint bankingFactor, scf::ParallelOp scfParOp) const {
-    //llvm::errs() << "need to compute function type\n";
-    SmallVector<Type> curFuncArgTys;
-    auto inductVars = scfParOp.getInductionVars();
-    DenseSet<Value> seenOperands;
-    scfParOp.walk([&](mlir::Operation *innerOp) {
-      if (isa<scf::ParallelOp, scf::ReduceOp>(innerOp))
-        return WalkResult::advance();
-
-      for (auto operand : innerOp->getOperands()) {
-        // Scenario 1: inductive var;
-//        bool isInductVar = std::find(inductVars.begin(), inductVars.end(), operand) != inductVars.end();
-//        if (isInductVar && seenOperands.insert(operand).second) {
-//          curFuncArgTys.push_back(operand.getType());
-//          continue;
-//        }
-        // Scenario 2: defined outside of scf::parallel;
-        bool isDefinedInside = isDefinedInsideRegion(operand, &scfParOp->getRegion(0));
-        if (!isDefinedInside && seenOperands.insert(operand).second) {
-          if (isa<MemRefType>(operand.getType())) {
-            //assert(isa<BlockArgument>(operand) && "any MemRefType must be BlockArgument passing from the top-level function");
-            auto memBanks = computeMemBanks(rewriter, operand, bankingFactor, scfParOp);
-            // TODO: how to do it properly
-            assert(memBanks.has_value() && "memory banks must exist");
-            curFuncArgTys.push_back((*memBanks)[idx % bankingFactor].getType());
-          }
-          else
-            curFuncArgTys.push_back(operand.getType());
-        }
-      }
-
-      return WalkResult::advance();
-    });
-    auto retTys = computeParFuncRetTys(scfParOp);
-    return rewriter.getFunctionType(curFuncArgTys, retTys);
-  }
-  
-  void mapFuncAndParOpBody(IRMapping &mapping, uint &argPos, Operation *op, FuncOp parFunc, DenseSet<Value> &seenOperands, DenseMap<Value, uint> &operandToArgPos, scf::ParallelOp scfParOp) const {
-    //llvm::errs() << "need to compute function type\n";
-    auto inductVars = scfParOp.getInductionVars();
-    for (auto operand : op->getOperands()) {
-      // Scenario 1: inductive var;
-      bool isInductVar = std::find(inductVars.begin(), inductVars.end(), operand) != inductVars.end();
-      if (isInductVar) {
-        if (seenOperands.insert(operand).second) {
-          assert(operandToArgPos.find(operand) == operandToArgPos.end() && "must have not seen");
-          mapping.map(operand, parFunc.getArgument(argPos));
-          operandToArgPos[operand] = argPos;
-          argPos++;
-        }
-        else {
-          mapping.map(operand, parFunc.getArgument(operandToArgPos[operand]));
-        }
-        continue;
-      }
-      // Scenario 2: defined outside of scf::parallel;
-      bool isDefinedInside = isDefinedInsideRegion(operand, &scfParOp->getRegion(0));
-      if (!isDefinedInside) {
-        if (seenOperands.insert(operand).second) {
-          if (isa<MemRefType>(operand.getType())) {
-            assert(isa<BlockArgument>(operand) && "any MemRefType must be BlockArgument passing from the top-level function");
-            assert(operandToArgPos.find(operand) == operandToArgPos.end() && "must have not seen");
-            mapping.map(operand, parFunc.getArgument(argPos));
-            operandToArgPos[operand] = argPos;
-            argPos++;
-          }
-          else {
-            assert(operandToArgPos.find(operand) == operandToArgPos.end() && "must have not seen");
-            mapping.map(operand, parFunc.getArgument(argPos));
-            operandToArgPos[operand] = argPos;
-            argPos++;
-          }
-        }
-        else {
-          if (isa<MemRefType>(operand.getType())) {
-            assert(isa<BlockArgument>(operand) && "any MemRefType must be BlockArgument passing from the top-level function");
-            mapping.map(operand, parFunc.getArgument(operandToArgPos[operand]));
-          }
-          else {
-            mapping.map(operand, parFunc.getArgument(operandToArgPos[operand]));
           }
         }
       }
