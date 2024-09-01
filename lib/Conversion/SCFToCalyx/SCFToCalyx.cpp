@@ -17,6 +17,7 @@
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Support/LLVM.h"
+#include "circt/Transforms/Passes.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -34,11 +35,13 @@
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/FormatVariadic.h"
 #include <fstream>
 #include <bitset>
 
@@ -1633,7 +1636,7 @@ public:
                    calyx::PatternApplicationState &patternState,
                  DenseMap<FuncOp, calyx::ComponentOp> &funcMap, calyx::CalyxLoweringState &pls, uint availableBanks) : 
   calyx::FuncOpPartialLoweringPattern(context, resRef, patternState, funcMap, pls), availableBanks(availableBanks) {
-    llvm::errs() << "number of available banks is: " << availableBanks << "\n";
+    //llvm::errs() << "number of available banks is: " << availableBanks << "\n";
   };
 
   using FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern;
@@ -1734,10 +1737,58 @@ public:
         uint bankSize = origShape.front() / availableBanks;
         SmallVector<Operation *> banks;
         OpBuilder builder = OpBuilder::atBlockBegin(insertBlock);
-        for (uint bankCnt = 0; bankCnt < availableBanks; bankCnt++) {
-          auto allocOp = builder.create<memref::AllocOp>(insertBlock->getParentOp()->getLoc(), MemRefType::get(bankSize, memTy.getElementType(), memTy.getLayout(), memTy.getMemorySpace())); // TODO: consider GetGlobal and Alloca
-          banks.push_back(allocOp);
-        }
+        TypeSwitch<Operation *>(origMemDef)
+          .Case<memref::AllocOp>([&](memref::AllocOp allocOp) {
+            for (uint bankCnt = 0; bankCnt < availableBanks; bankCnt++) {
+              auto bankAllocOp = builder.create<memref::AllocOp>(insertBlock->getParentOp()->getLoc(), MemRefType::get(bankSize, memTy.getElementType(), memTy.getLayout(), memTy.getMemorySpace()));
+              banks.push_back(bankAllocOp);
+            }
+          })
+          .Case<memref::GetGlobalOp>([&](memref::GetGlobalOp getGlobalOp) {
+            OpBuilder::InsertPoint globalOpsInsertPt, getGlobalOpsInsertPt;
+            for (uint bankCnt = 0; bankCnt < availableBanks; bankCnt++) {
+              auto *symbolTableOp = getGlobalOp->getParentWithTrait<OpTrait::SymbolTable>();
+              auto globalOp = dyn_cast_or_null<memref::GlobalOp>(
+                    SymbolTable::lookupSymbolIn(symbolTableOp, getGlobalOp.getNameAttr()));
+
+              MemRefType type = globalOp.getType();
+              assert(circt::isUniDimensional(type) && "GlobalOp must be flattened before the scf-to-calyx pass");
+              auto cstAttr = llvm::dyn_cast_or_null<DenseElementsAttr>(globalOp.getConstantInitValue());
+              uint beginIdx = bankSize * bankCnt;
+              uint endIdx = bankSize * (bankCnt + 1);
+              auto allAttrs = cstAttr.getValues<Attribute>();
+              SmallVector<Attribute, 8> extractedElements;
+              for (auto idx = beginIdx; idx < endIdx; idx++)
+                extractedElements.push_back(allAttrs[idx]);
+
+              auto newMemRefTy = MemRefType::get(SmallVector<int64_t>{endIdx - beginIdx}, type.getElementType());
+              auto newTypeAttr = TypeAttr::get(newMemRefTy);
+              std::string newNameStr = llvm::formatv("{0}_{1}x{2}_{3}", globalOp.getConstantAttrName(), endIdx - beginIdx, type.getElementType(), bankCnt);
+              RankedTensorType tensorType = RankedTensorType::get({static_cast<int64_t>(extractedElements.size())}, type.getElementType());
+              auto newInitValue = DenseElementsAttr::get(tensorType, extractedElements);
+              
+              if (bankCnt == 0) {
+                rewriter.setInsertionPointAfter(globalOp);
+                globalOpsInsertPt = rewriter.saveInsertionPoint();
+                rewriter.setInsertionPointAfter(getGlobalOp);
+                getGlobalOpsInsertPt = rewriter.saveInsertionPoint();
+              }
+              rewriter.restoreInsertionPoint(globalOpsInsertPt);
+              auto newGlobalOp = rewriter.create<memref::GlobalOp>(rewriter.getUnknownLoc(), rewriter.getStringAttr(newNameStr), globalOp.getSymVisibilityAttr(), newTypeAttr, newInitValue, globalOp.getConstantAttr(), globalOp.getAlignmentAttr());
+              rewriter.setInsertionPointAfter(newGlobalOp);
+              globalOpsInsertPt = rewriter.saveInsertionPoint();
+
+              rewriter.restoreInsertionPoint(getGlobalOpsInsertPt);
+              auto newGetGlobalOp = rewriter.create<memref::GetGlobalOp>(rewriter.getUnknownLoc(), newMemRefTy, newGlobalOp.getName());
+              rewriter.setInsertionPointAfter(newGetGlobalOp);
+              getGlobalOpsInsertPt = rewriter.saveInsertionPoint();
+
+              banks.push_back(newGetGlobalOp);
+            }
+          })
+          .Default([](Operation *op) {
+            op->emitError("Unsupported memory operation type");
+          });
 
         return banks;
       };
@@ -1765,7 +1816,15 @@ public:
                 updatedCurFnArgTys.erase(updatedCurFnArgTys.begin() + pos);
                 callee.getBlocks().front().eraseArgument(pos);
                 callOp->eraseOperand(pos);
-                operand.getDefiningOp()->erase();
+                if (auto getGlobalOp = dyn_cast<memref::GetGlobalOp>(operand.getDefiningOp())) {
+                  auto *symbolTableOp = getGlobalOp->getParentWithTrait<mlir::OpTrait::SymbolTable>();
+                  auto globalOp = dyn_cast_or_null<memref::GlobalOp>(
+                        SymbolTable::lookupSymbolIn(symbolTableOp, getGlobalOp.getNameAttr()));
+                  getGlobalOp.erase();
+                  globalOp.erase();
+                }
+                else
+                  operand.getDefiningOp()->erase();
               }
             }
           });
@@ -1811,11 +1870,7 @@ public:
             Value newLoadResult = rewriter.replaceOpWithNewOp<memref::LoadOp>(loadOp, newMemRef, SmallVector<Value>{newAddr});
             mapping.map(loadOp.getResult(), newLoadResult);
         } else if (auto storeOp = dyn_cast<memref::StoreOp>(memOp)) {
-            Value valForStore = mapping.lookupOrNull(storeOp.getValue());
-            if (!valForStore) {
-                valForStore = storeOp.getValue();
-            }
-            rewriter.replaceOpWithNewOp<memref::StoreOp>(storeOp, valForStore, newMemRef, SmallVector<Value>{newAddr});
+            rewriter.replaceOpWithNewOp<memref::StoreOp>(storeOp, storeOp.getValue(), newMemRef, SmallVector<Value>{newAddr});
         }
       };
 
@@ -1834,6 +1889,9 @@ public:
             TypeSwitch<Operation *>(memOp)
               .Case<memref::AllocOp>([&](memref::AllocOp allocOp) {
                 allocatedResults.push_back(allocOp.getResult());
+              })
+              .Case<memref::GetGlobalOp>([&](memref::GetGlobalOp getGlobalOp) {
+                allocatedResults.push_back(getGlobalOp.getResult());
               });
           }
           setBanksForMem(origMemDef, allocatedBanks);
@@ -1845,12 +1903,13 @@ public:
                            rewriter.getUnknownLoc(), accessIndex, constDivVal).getResult();
           Value newMemRef = getBankForMemAndID(origMemDef, bankID);
 
-          auto newFnType = updateFnType(funcOp, allocatedResults);
-          funcOp.setType(newFnType);
-          llvm::errs() << "new funcOp type: \n";
-          funcOp.getFunctionType().dump();
+          if (topLevelFn.getName() != funcOp.getName()) {
+            auto newFnType = updateFnType(funcOp, allocatedResults);
+            funcOp.setType(newFnType);
 
-          updateCallSites(moduleOp, funcOp, allocatedResults);
+            updateCallSites(moduleOp, funcOp, allocatedResults);
+          }
+
           if (isa<BlockArgument>(memOperand)) {
             if (auto foundValue = findNewMemRef(topLevelFn, funcOp, newMemRef))
               newMemRef = *foundValue;
@@ -1872,8 +1931,20 @@ public:
 
           replaceMemoryOp(loadOp, newMemRef, newAddr, mapping);
           if (memOperand.use_empty()) {
-            auto newFnType = eraseOperandInCallerCallees(moduleOp, funcOp, origMemDef->getResult(0));
-            funcOp.setFunctionType(newFnType);
+            if (memOperand.getDefiningOp()) {
+              if (auto getGlobalOp = dyn_cast<memref::GetGlobalOp>(memOperand.getDefiningOp())) {
+                auto *symbolTableOp = getGlobalOp->getParentWithTrait<mlir::OpTrait::SymbolTable>();
+                auto globalOp = dyn_cast_or_null<memref::GlobalOp>(SymbolTable::lookupSymbolIn(symbolTableOp, getGlobalOp.getNameAttr()));
+                getGlobalOp->remove();
+                globalOp->remove();
+              }
+              else
+                memOperand.getDefiningOp()->remove();
+            }
+            else {
+              auto newFnType = eraseOperandInCallerCallees(moduleOp, funcOp, origMemDef->getResult(0));
+              funcOp.setFunctionType(newFnType);
+            }
           }
         }
       }
@@ -1889,6 +1960,9 @@ public:
             TypeSwitch<Operation *>(memOp)
               .Case<memref::AllocOp>([&](memref::AllocOp allocOp) {
                 allocatedResults.push_back(allocOp.getResult());
+              })
+              .Case<memref::GetGlobalOp>([&](memref::GetGlobalOp getGlobalOp) {
+                allocatedResults.push_back(getGlobalOp.getResult());
               });
           }
           setBanksForMem(origMemDef, allocatedBanks);
@@ -1900,10 +1974,13 @@ public:
                            rewriter.getUnknownLoc(), accessIndex, constDivVal).getResult();
           Value newMemRef = getBankForMemAndID(origMemDef, bankID);
 
-          auto newFnType = updateFnType(funcOp, allocatedResults);
-          funcOp.setType(newFnType);
+          if (topLevelFn.getName() != funcOp.getName()) {
+            auto newFnType = updateFnType(funcOp, allocatedResults);
+            funcOp.setType(newFnType);
 
-          updateCallSites(moduleOp, funcOp, allocatedResults);
+            updateCallSites(moduleOp, funcOp, allocatedResults);
+          }
+
           if (isa<BlockArgument>(memOperand)) {
             if (auto foundValue = findNewMemRef(topLevelFn, funcOp, newMemRef))
               newMemRef = *foundValue;
@@ -1926,8 +2003,20 @@ public:
           replaceMemoryOp(storeOp, newMemRef, newAddr, mapping);
 
           if (memOperand.use_empty()) {
-            auto newFnType = eraseOperandInCallerCallees(moduleOp, funcOp, origMemDef->getResult(0));
-            funcOp.setFunctionType(newFnType);
+            if (memOperand.getDefiningOp()) {
+              if (auto getGlobalOp = dyn_cast<memref::GetGlobalOp>(memOperand.getDefiningOp())) {
+                auto *symbolTableOp = getGlobalOp->getParentWithTrait<mlir::OpTrait::SymbolTable>();
+                auto globalOp = dyn_cast_or_null<memref::GlobalOp>(SymbolTable::lookupSymbolIn(symbolTableOp, getGlobalOp.getNameAttr()));
+                getGlobalOp->remove();
+                globalOp->remove();
+              }
+              else
+                memOperand.getDefiningOp()->remove();
+            }
+            else {
+              auto newFnType = eraseOperandInCallerCallees(moduleOp, funcOp, origMemDef->getResult(0));
+              funcOp.setFunctionType(newFnType);
+            }
           }
         }
       }
@@ -1936,7 +2025,12 @@ public:
       }
     //llvm::errs() << "after replacing with new memory access indices\n";
     
+    llvm::errs() << "lowering result: \n";
     moduleOp.dump();
+    for (auto &b : scfParOps.front().getRegion().getBlocks()) {
+      b.dump();
+      llvm::errs() << b.getOperations().size() << "\n";
+    }
 
     return res;
 };
@@ -2047,7 +2141,6 @@ private:
     rewriter.insert(newPloop);
     OpBuilder insideBuilder(newPloop);
     Block *currBlock = nullptr;
-    Block *predBlock = nullptr;
     auto &region = newPloop.getRegion();
     IRMapping operandMap;
 
@@ -2066,13 +2159,6 @@ private:
             for (auto it = body->begin(); it != std::prev(body->end()); ++it) {
               insideBuilder.clone(*it, operandMap);
             }
-
-            if (predBlock) {
-              OpBuilder predBuilder(predBlock, predBlock->end());
-              predBuilder.create<mlir::cf::BranchOp>(loc, currBlock);
-            }
-
-            predBlock = currBlock;
 
             return;
           }
@@ -2121,65 +2207,7 @@ private:
   };
 
   // Computes the raw traces of a given memory in a step
-  SmallVector<uint> computeRawTrace(scf::ParallelOp scfParOp, Value memResult) const {
-    auto moduleOp = scfParOp->getParentOfType<ModuleOp>();
-    auto funcOp = scfParOp->getParentOfType<FuncOp>();
-    for (auto blockArg : funcOp.getBody().getArguments()) {
-      if (isa<MemRefType>(blockArg.getType())) {
-        moduleOp.walk([&](FuncOp otherFn) {
-          otherFn.walk([&](mlir::Operation *op) {
-          if (auto callOp = dyn_cast<CallOp>(op)) {
-              if (callOp.getCallee() == funcOp.getName()) {
-                if (llvm::find(callOp.getOperands(), memResult) != callOp.getOperands().end()) {
-                  auto pos = llvm::find(callOp.getOperands(), memResult) - callOp.getOperands().begin();
-                  memResult = funcOp.getArgument(pos);
-                }
-              }
-            }
-          });
-        });
-      }
-    }
-    SmallVector<uint> rawTraces;
-    for (auto &innerOp : scfParOp.getOps()) {
-      if (llvm::find(memResult.getUsers(), &innerOp) != memResult.getUsers().end()) {
-        Value memAddr;
-        if (auto loadOp = dyn_cast<memref::LoadOp>(&innerOp)) {
-          assert(loadOp.getIndices().size() == 1);
-          memAddr = loadOp.getIndices().front();
-        }
-        else {
-          auto storeOp = dyn_cast<memref::StoreOp>(&innerOp);
-          assert(storeOp.getIndices().size() == 1);
-          memAddr = storeOp.getIndices().front();
-        }
-        auto intMemAddr = evaluateIndex(memAddr); 
-        rawTraces.push_back(intMemAddr);
-      }
-    }
-    return rawTraces;
-  }
-
-  SmallVector<Value> computeRawTraceInValue(scf::ParallelOp scfParOp, Value memResult) const {
-    //llvm::errs() << "computing raw traces in value: \n";
-    auto moduleOp = scfParOp->getParentOfType<ModuleOp>();
-    auto funcOp = scfParOp->getParentOfType<FuncOp>();
-    for (auto blockArg : funcOp.getBody().getArguments()) {
-      if (isa<MemRefType>(blockArg.getType())) {
-        moduleOp.walk([&](FuncOp otherFn) {
-          otherFn.walk([&](mlir::Operation *op) {
-          if (auto callOp = dyn_cast<CallOp>(op)) {
-              if (callOp.getCallee() == funcOp.getName()) {
-                if (llvm::find(callOp.getOperands(), memResult) != callOp.getOperands().end()) {
-                  auto pos = llvm::find(callOp.getOperands(), memResult) - callOp.getOperands().begin();
-                  memResult = funcOp.getArgument(pos);
-                }
-              }
-            }
-          });
-        });
-      }
-    }
+  SmallVector<Value> computeRawTrace(scf::ParallelOp scfParOp, Value memResult) const {
     SmallVector<Value> rawTraces;
     for (auto &innerOp : scfParOp.getOps()) {
       if (llvm::find(memResult.getUsers(), &innerOp) != memResult.getUsers().end()) {
@@ -2193,13 +2221,14 @@ private:
           assert(storeOp.getIndices().size() == 1);
           memAddr = storeOp.getIndices().front();
         }
+        //auto intMemAddr = evaluateIndex(memAddr); 
         rawTraces.push_back(memAddr);
       }
     }
     return rawTraces;
   }
 
-  SmallVector<SmallVector<uint>> initCompress(SmallVector<SmallVector<uint>> &unCompressedTraces) const {
+  SmallVector<SmallVector<Value>> initCompress(SmallVector<SmallVector<Value>> &unCompressedTraces) const {
     // TODO
     return unCompressedTraces;
   }
@@ -2218,14 +2247,13 @@ private:
   }
 
   // Evaluate the conflicts by counting the number of times when two addresses in the same step have the same mask ID
-  uint calculateConflicts(SmallVector<SmallVector<uint>> &compressedTraces, const std::string &maskBits) const {
+  uint calculateConflicts(SmallVector<SmallVector<Value>> &compressedTraces, const std::string &maskBits) const {
     uint numConflicts = 0;
     for (const auto &traceInStep : compressedTraces) {
       DenseSet<StringRef> seenMaskIDs;
       for (auto trace : traceInStep) {
-        std::bitset<32> bitsetTrace(trace);
-        auto binTrace = bitsetTrace.to_string();
-        auto sizedBinTrace = binTrace.substr(binTrace.size() - maskBits.length());
+        auto sizedBinTrace = getSizedTrace(trace, maskBits.length());
+        llvm::errs() << "sized trace: " << sizedBinTrace << "\n";
         std::string bitWiseAnd;
         for (size_t i = 0; i < maskBits.length(); ++i) {
           if (sizedBinTrace[i] == '1' && maskBits[i] == '1')
@@ -2236,6 +2264,7 @@ private:
         numConflicts += seenMaskIDs.insert(bitWiseAnd).second ? 0 : 1;
       }
     }
+    llvm::errs() << "number of conflicts when maskBits is: " << maskBits << " " << numConflicts << "\n";
     return numConflicts;
   }
 
@@ -2342,14 +2371,12 @@ private:
     }
   };
 
-  ConflictGraph constructGraph(SmallVector<SmallVector<uint>> &compressedTraces, const std::string &maskBits) const {
+  ConflictGraph constructGraph(SmallVector<SmallVector<Value>> &compressedTraces, const std::string &maskBits) const {
     ConflictGraph graph;
     for (const auto &traceInStep : compressedTraces) {
       std::unordered_set<std::string> seenMaskIDs;
       for (auto trace : traceInStep) {
-        std::bitset<32> bitsetTrace(trace);
-        auto binTrace = bitsetTrace.to_string();
-        auto sizedBinTrace = binTrace.substr(binTrace.size() - maskBits.length());
+        auto sizedBinTrace = getSizedTrace(trace, maskBits.length());
 
         std::string maskID = extractMaskIDs(sizedBinTrace, maskBits);
 
@@ -2370,7 +2397,7 @@ private:
     return graph;
   }
 
-  std::string findMasksBits(const uint availableBanks, SmallVector<SmallVector<uint>> &compressedTraces, Operation *memory) const {
+  std::string findMasksBits(const uint availableBanks, SmallVector<SmallVector<Value>> &compressedTraces, Operation *memory) const {
     // `nA` is the maximum number of memory accesses in all steps in the compressed memory trace
     uint nA = 0;
     for (const auto &traceInStep : compressedTraces) {
@@ -2411,7 +2438,9 @@ private:
         }
       }
     }
-    //llvm::errs() << "best: " << bestMaskBits << " with minCliques: " << overallMinCliques << "\n";
+    if (bestMaskBits.length() == 0)
+      bestMaskBits.assign(addrSize, '1');
+    llvm::errs() << "best: " << bestMaskBits << " with minCliques: " << overallMinCliques << "\n";
     return bestMaskBits;
   }
 
@@ -2492,13 +2521,19 @@ private:
     return std::nullopt;
   }
 
-  std::string bestFirstSearch(SmallVector<SmallVector<uint>> &compressedTraces, std::string &mask) const {
+  std::string bestFirstSearch(SmallVector<SmallVector<Value>> &compressedTraces, std::string &mask) const {
     // TODO
     return mask;
   }
 
-  std::unordered_map<std::string, int> mapMaskIDsToBanks(const uint availableBanks, SmallVector<SmallVector<uint>> &compressedTraces, std::string &mask) const {
-    //llvm::errs() << "availableBanks in mapping mask IDs to banks: " << availableBanks << "\n";
+  std::string getSizedTrace(Value trace, uint len) const {
+    auto traceInt = evaluateIndex(trace);
+    std::bitset<32> bitsetTrace(traceInt);
+    auto binTrace = bitsetTrace.to_string();
+    return binTrace.substr(binTrace.size() - len);
+  }
+
+  std::unordered_map<std::string, int> mapMaskIDsToBanks(const uint availableBanks, SmallVector<SmallVector<Value>> &compressedTraces, std::string &mask) const {
     bool canBeColored = false;
     std::unordered_map<std::string, int> maskToBanks;
     do {
@@ -2506,9 +2541,7 @@ private:
       for (const auto &step : compressedTraces) {
         SmallVector<std::string> maskIDInStep;
         for (auto trace : step) {
-          std::bitset<32> bitsetTrace(trace);
-          auto binTrace = bitsetTrace.to_string();
-          auto sizedBinTrace = binTrace.substr(binTrace.size() - mask.length());
+          auto sizedBinTrace = getSizedTrace(trace, mask.length());
 
           auto maskID = extractMaskIDs(sizedBinTrace, mask);
           maskIDInStep.push_back(maskID);
@@ -2568,7 +2601,6 @@ private:
       return getGlobalOp.getResult();
     })
     .Default([](Operation *op) -> Value {
-      // Handle the default case, such as throwing an error or returning a nullptr.
       op->emitError("Unsupported memory operation type");
       return nullptr;
     });
@@ -2578,59 +2610,81 @@ private:
     memoryToBanks[memory] = allocatedBanks;
   }
 
+  BlockArgument getCalleeBlockArg(FuncOp callerFnOp, FuncOp calleeFnOp, Value opRes) const {
+    bool foundCalleeBlockArg = false;
+    BlockArgument foundBlockArg;
+    callerFnOp.walk([&](Operation *op) {
+    if (auto callOp = dyn_cast<CallOp>(op)) {
+      if (callOp.getCallee() == calleeFnOp.getName()) {
+        assert(callOp.getOperandTypes() == calleeFnOp.getBody().getArgumentTypes() && "function call operand types must match callee's block argument types");
+        if (llvm::find(callOp.getOperands(), opRes) != callOp.getOperands().end()) {
+            auto pos = llvm::find(callOp.getOperands(), opRes) - callOp.getOperands().begin();
+            foundBlockArg = calleeFnOp.getArgument(pos);
+            foundCalleeBlockArg = true;
+            return WalkResult::interrupt();
+          }
+        }
+      }
+      return WalkResult::advance();
+    });
+    assert(foundCalleeBlockArg && "must have found the corresponding block arg");
+    return foundBlockArg;
+  }
+
   // Given `scf.parallel`s (all `step`)s and a memory in the `scf.parallel`s, computes the addresses to banks mapping
   void traceBankAlgo(SmallVector<scf::ParallelOp> &scfParOps, Operation *memory) const {
     // Raw trace of a given memory at all steps
     Value memRes;
     MemRefType memTy;
-    if (auto allocOp = dyn_cast<memref::AllocOp>(memory)) {
-      memRes = allocOp.getResult();
-      memTy = cast<MemRefType>(allocOp.getType());
-    }
-    else if (auto allocaOp = dyn_cast<memref::AllocaOp>(memory)) {
-      memRes = allocaOp.getResult();
-      memTy = cast<MemRefType>(allocaOp.getType());
-    }
-    else {
-      auto getGlobalOp = dyn_cast<memref::GetGlobalOp>(memory);
-      memRes = getGlobalOp.getResult();
-      memTy = cast<MemRefType>(getGlobalOp.getType());
-    }
-    SmallVector<SmallVector<uint>> rawTraces;
+    TypeSwitch<Operation *>(memory)
+      .Case<memref::AllocOp>([&](memref::AllocOp allocOp) {
+        memRes = allocOp.getResult();
+        memTy = cast<MemRefType>(allocOp.getType());
+      })
+      .Case<memref::AllocaOp>([&](memref::AllocaOp allocaOp) {
+        memRes = allocaOp.getResult();
+        memTy = cast<MemRefType>(allocaOp.getType());
+      })
+      .Case<memref::GetGlobalOp>([&](memref::GetGlobalOp getGlobalOp) {
+        memRes = getGlobalOp.getResult();
+        memTy = cast<MemRefType>(getGlobalOp.getType());
+      })
+      .Default([](Operation *) {
+        llvm_unreachable("Unhandled memory operation type");
+      });
+
+    SmallVector<SmallVector<Value>> rawTraces;
     for (auto step : scfParOps) {
+      auto calleeFnOp = step->getParentOfType<FuncOp>();
+      if (!isDefinedInsideRegion(memRes, &calleeFnOp.getRegion())) {
+        // If `memRes` is passed as a fn arg to the par op
+        auto callerFnOp = memRes.getDefiningOp()->getParentOfType<FuncOp>();
+        memRes = getCalleeBlockArg(callerFnOp, calleeFnOp, memRes);
+      }
+
       auto rawTrace = computeRawTrace(step, memRes);
       rawTraces.push_back(rawTrace);
     }
 
-    SmallVector<SmallVector<Value>> rawTracesInValue;
-    for (auto step : scfParOps) {
-      auto rawTrace = computeRawTraceInValue(step, memRes);
-      rawTracesInValue.push_back(rawTrace);
-    }
-
-    llvm::errs() << "raw traces size: " << rawTraces.size() << "\n";
-    llvm::errs() << "raw traces: \n";
-    for (const auto &step : rawTraces) {
-      for (auto traceInStep : step) {
-        llvm::errs() << traceInStep << " ";
-      }
-      llvm::errs() << "\n";
-    }
-
     auto compressedTraces = initCompress(rawTraces);
+    //llvm::errs() << "compressed traces: \n";
+    //for (const auto &step : rawTraces) {
+    //  for (auto traceInStep : step) {
+    //    llvm::errs() << evaluateIndex(traceInStep) << " ";
+    //  }
+    //  llvm::errs() << "\n";
+    //}
 
     std::string masksBits = findMasksBits(availableBanks, compressedTraces, memory);
+    llvm::errs() << "masksBits: " << masksBits << "\n";
 
     std::unordered_map<std::string, int> maskIDsToBanks = mapMaskIDsToBanks(availableBanks, compressedTraces, masksBits);
 
     SmallVector<SmallVector<uint>> accessIndicesToBanks;
-    //llvm::errs() << "computing accessIndicesToBanks\n";
     for (const auto &step : rawTraces) {
       SmallVector<uint> banksInStep;
       for (auto trace : step) {
-        std::bitset<32> bitsetTrace(trace);
-        auto binTrace = bitsetTrace.to_string();
-        auto sizedBinTrace = binTrace.substr(binTrace.size() - masksBits.length());
+        auto sizedBinTrace = getSizedTrace(trace, masksBits.length());
 
         auto maskID = extractMaskIDs(sizedBinTrace, masksBits);
         banksInStep.push_back(maskIDsToBanks[maskID]);
@@ -2652,28 +2706,22 @@ private:
 //      }
 //      llvm::errs() << "\n";
 //    }
-//    llvm::errs() << "rawTracesInValue: \n";
-//    for (auto i  : rawTracesInValue) {
-//      for (auto j : i) {
-//        j.dump();
-//      }
-//      llvm::errs() << "\n";
-//    }
+
     for (uint bankCnt = 0; bankCnt < availableBanks; bankCnt++) {
       for (uint i = 0; i < accessIndicesToBanks.size(); i++) {
         auto curStep = accessIndicesToBanks[i];
         for (uint j = 0; j < curStep.size(); j++) {
           if (accessIndicesToBanks[i][j] == bankCnt) {
             if (memoryToBankIDs.find(memory) == memoryToBankIDs.end()) {
-              memoryToBankIDs[memory][rawTracesInValue[i][j]] = bankCnt;
+              memoryToBankIDs[memory][rawTraces[i][j]] = bankCnt;
             }
             else {
-              if (memoryToBankIDs[memory].find(rawTracesInValue[i][j]) == memoryToBankIDs[memory].end()) {
-                assert(memoryToBankIDs[memory][rawTracesInValue[i][j]] == 0);
-                memoryToBankIDs[memory][rawTracesInValue[i][j]] = bankCnt;
+              if (memoryToBankIDs[memory].find(rawTraces[i][j]) == memoryToBankIDs[memory].end()) {
+                assert(memoryToBankIDs[memory][rawTraces[i][j]] == 0);
+                memoryToBankIDs[memory][rawTraces[i][j]] = bankCnt;
               }
               else {
-                assert(memoryToBankIDs[memory][rawTracesInValue[i][j]] == bankCnt);
+                assert(memoryToBankIDs[memory][rawTraces[i][j]] == bankCnt);
               }
             }
           }
@@ -2755,6 +2803,8 @@ private:
                                    const DenseSet<Block *> &path,
                                    mlir::Block *parentCtrlBlock,
                                    mlir::Block *block) const {
+    llvm::errs() << "block in scheduleBasicBlock: \n";
+    block->dump();
     auto compBlockScheduleables =
         getState<ComponentLoweringState>().getBlockScheduleables(block);
     auto loc = block->front().getLoc();
@@ -2826,9 +2876,14 @@ private:
         auto parOp = parSchedPtr->parOp;
 
         auto calyxParOp = rewriter.create<calyx::ParOp>(parOp.getLoc());
-        LogicalResult res =
-            buildCFGControl(path, rewriter, calyxParOp.getBodyBlock(), block,
-                            &parOp.getRegion().getBlocks().front());
+        LogicalResult res = LogicalResult::success();
+        for (auto &innerBlock : parOp.getRegion().getBlocks()) {
+          rewriter.setInsertionPointToEnd(calyxParOp.getBodyBlock());
+          auto seqOp = rewriter.create<calyx::SeqOp>(parOp.getLoc());
+          rewriter.setInsertionPointToEnd(seqOp.getBodyBlock());
+          res = scheduleBasicBlock(rewriter, path, seqOp.getBodyBlock(), &innerBlock);
+        }
+
         if (res.failed())
           return res;
       } else if (auto *ifSchedPtr = std::get_if<IfScheduleable>(&group);
