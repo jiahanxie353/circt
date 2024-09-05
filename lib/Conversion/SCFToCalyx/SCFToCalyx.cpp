@@ -42,10 +42,14 @@
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/JSON.h"
+#include <algorithm>
 #include <fstream>
 #include <bitset>
 
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -1631,13 +1635,11 @@ class BuildForGroups : public calyx::FuncOpPartialLoweringPattern {
 
 class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
 public:
-  uint availableBanks;
   BuildParGroups(MLIRContext *context, LogicalResult &resRef,
-                   calyx::PatternApplicationState &patternState,
-                 DenseMap<FuncOp, calyx::ComponentOp> &funcMap, calyx::CalyxLoweringState &pls, uint availableBanks) : 
-  calyx::FuncOpPartialLoweringPattern(context, resRef, patternState, funcMap, pls), availableBanks(availableBanks) {
-    //llvm::errs() << "number of available banks is: " << availableBanks << "\n";
-  };
+                  calyx::PatternApplicationState &patternState,
+                  DenseMap<FuncOp, calyx::ComponentOp> &funcMap,
+                  calyx::CalyxLoweringState &pls, std::string &availBanksJson) : 
+  calyx::FuncOpPartialLoweringPattern(context, resRef, patternState, funcMap, pls), availBanksJsonValue(parseJsonFile(availBanksJson)) {};
 
   using FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern;
   LogicalResult
@@ -1646,60 +1648,61 @@ public:
     LogicalResult res = success();
     auto moduleOp = funcOp->getParentOfType<ModuleOp>();
     
+    moduleOp.walk([&](Operation *op) {
+      if (isa<memref::AllocOp, memref::AllocaOp, memref::GetGlobalOp>(op))
+        memNum[op] = memNum.size();
+    });
+
     // TraceBanks algorithm
-    SmallVector<scf::ParallelOp> scfParOps;
     DenseSet<Operation *> memories;
-    //llvm::errs() << "printing module to see all the memories\n";
-    //moduleOp.dump();
-    // Gather all the source memory operations that are being used in this FuncOp
-    funcOp.walk([&](Operation *op){
+    funcOp.walk([&](Operation *op) {
+      // Get all source definition of the memories that are used in the current `funcOp` into `memories` to get prepared for running the TraceBank algorithm
       for (auto operand : op->getOperands()) {
         if (op->getDialect()->getNamespace() == memref::MemRefDialect::getDialectNamespace() && isa<MemRefType>(operand.getType())) {
-          Value mem;
           // Find the source definition
-          if (operand.getDefiningOp())
-            mem = operand;
+          if (!isa<BlockArgument>(operand))
+            memories.insert(operand.getDefiningOp());
           else {
-            assert(isa<BlockArgument>(operand));
             auto blockArg = cast<BlockArgument>(operand);
-            moduleOp.walk([&](FuncOp otherFn) {
-              otherFn.walk([&](mlir::Operation *op) {
-                if (auto callOp = dyn_cast<CallOp>(op)) {
-                  if (callOp.getCallee() == funcOp.getName())
-                    mem = callOp.getOperand(blockArg.getArgNumber());
+            for (auto otherFn : moduleOp.getOps<FuncOp>()) {
+              for (auto callOp : otherFn.getOps<CallOp>()) {
+                if (callOp.getCallee() == funcOp.getName()) {
+                  assert(callOp.getOperands().size() == funcOp.getArguments().size() &&
+                         "callOp's operands size must match with the block argument size of the callee function");
+                  auto memRes = callOp.getOperand(blockArg.getArgNumber());
+                  memories.insert(memRes.getDefiningOp());
                 }
-              });
-            });
+              }
+            } 
           }
-          //llvm::errs() << "mem to be considered running the tracebank algo is: \n";
-          //mem.getDefiningOp()->dump();
-          memories.insert(mem.getDefiningOp());
         }
       }
 
-      if (auto scfParOp = dyn_cast<scf::ParallelOp>(op)) {
-        auto newParOp = partialEval(rewriter, scfParOp);
-        scfParOps.push_back(newParOp);
-      }
+      // Partial evaluate the access indices of all parallel ops to get prepared for running the TraceBank algorithm
+      if (auto scfParOp = dyn_cast<scf::ParallelOp>(op))
+        partialEval(rewriter, scfParOp);
 
       return WalkResult::advance();
     });
 
+    // For each external memory instance, run the TraceBank algorithm
+    // Each `scfParOp` is a `step` because all address of `mem`
+    // need to be accessed in parallel in a `scfParOp`
     for (auto *mem : memories)
-      traceBankAlgo(scfParOps, mem);
+      traceBankAlgo(funcOp, mem);
 
     // Create banks for each memory and replace the use of all old memories
     IRMapping mapping;
     // Get all the users, such as load/store/copy, of all memref results
     DenseSet<Operation *> memRefUsers;
     funcOp.walk([&](Operation* op) {
-      for (auto operand : op->getOperands()) {
-        if (op->getDialect()->getNamespace() == memref::MemRefDialect::getDialectNamespace() && isa<MemRefType>(operand.getType())) {
-          memRefUsers.insert(op);
-          break;
-        }
-      }
+      if (op->getDialect()->getNamespace() == memref::MemRefDialect::getDialectNamespace() && 
+        std::any_of(op->getOperands().begin(), op->getOperands().end(), [](Value operand) { return isa<MemRefType>(operand.getType()); }))
+        memRefUsers.insert(op);
+
+      return WalkResult::advance();
     });
+
     for (auto *user : memRefUsers) {
       Value memOperand;
       for (auto operand : user->getOperands()) {
@@ -1726,6 +1729,19 @@ public:
 
       Value accessIndex;
       uint bankID = 0;
+
+      auto *jsonObj = availBanksJsonValue.getAsObject();
+      auto *banks = jsonObj->getArray("banks");
+      uint availableBanks = 0;
+      if (auto bankOpt = (*banks)[memNum.at(origMemDef)].getAsInteger()) {
+        availableBanks = *bankOpt;
+      }
+      else {
+        std::string dumpStr;
+        llvm::raw_string_ostream dumpStream(dumpStr);
+        origMemDef->print(dumpStream);
+        report_fatal_error(llvm::Twine("Cannot find the number of banks associated with memory") + dumpStream.str());
+      }
 
       // Allocate new banks for `memOp` into `block`
       auto allocateBanks = [&](Operation *memOp, MemRefType memTy, Block *insertBlock) -> SmallVector<Operation *> {
@@ -1808,9 +1824,8 @@ public:
 
       auto eraseOperandInCallerCallees = [&](ModuleOp moduleOp, FuncOp callee, Value operand) {
         SmallVector<Type, 4> updatedCurFnArgTys(callee.getArgumentTypes());
-        moduleOp.walk([&](FuncOp otherFn) {
-          otherFn.walk([&](mlir::Operation *op) {
-            if (auto callOp = dyn_cast<CallOp>(op)) {
+        for (auto otherFn : moduleOp.getOps<FuncOp>()) {
+          for (auto callOp : otherFn.getOps<CallOp>()) {
               if (callOp.getCallee() == callee.getName()) {
                 auto pos = llvm::find(callOp.getOperands(), operand) - callOp.getOperands().begin();
                 updatedCurFnArgTys.erase(updatedCurFnArgTys.begin() + pos);
@@ -1820,15 +1835,14 @@ public:
                   auto *symbolTableOp = getGlobalOp->getParentWithTrait<mlir::OpTrait::SymbolTable>();
                   auto globalOp = dyn_cast_or_null<memref::GlobalOp>(
                         SymbolTable::lookupSymbolIn(symbolTableOp, getGlobalOp.getNameAttr()));
-                  getGlobalOp.erase();
-                  globalOp.erase();
+                  getGlobalOp->remove();
+                  globalOp->remove();
                 }
                 else
-                  operand.getDefiningOp()->erase();
+                  operand.getDefiningOp()->remove();
               }
-            }
-          });
-        });
+          }
+        }
         
         return FunctionType::get(callee.getContext(), updatedCurFnArgTys, callee.getFunctionType().getResults());
       };
@@ -1942,6 +1956,9 @@ public:
                 memOperand.getDefiningOp()->remove();
             }
             else {
+              llvm::errs() << "erasing in: " << funcOp.getSymName() << "\n";
+              llvm::errs() << "origMemDef: \n";
+              origMemDef->dump();
               auto newFnType = eraseOperandInCallerCallees(moduleOp, funcOp, origMemDef->getResult(0));
               funcOp.setFunctionType(newFnType);
             }
@@ -2027,15 +2044,34 @@ public:
     
     llvm::errs() << "lowering result: \n";
     moduleOp.dump();
-    for (auto &b : scfParOps.front().getRegion().getBlocks()) {
-      b.dump();
-      llvm::errs() << b.getOperations().size() << "\n";
-    }
 
     return res;
 };
 
 private:
+  mutable DenseMap<Operation *, int> memNum;
+  llvm::json::Value availBanksJsonValue;
+  llvm::json::Value parseJsonFile(const std::string &fileName) const {
+    std::string adjustedFileName = fileName;
+    if (adjustedFileName.find(".json") == std::string::npos) {
+      adjustedFileName += ".json";
+    }
+
+    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> fileOrErr =
+      llvm::MemoryBuffer::getFile(adjustedFileName);
+    if (std::error_code ec = fileOrErr.getError()) {
+      llvm::report_fatal_error(llvm::Twine("Error reading JSON file: ") + adjustedFileName + " - " + ec.message());
+    }
+
+    auto jsonResult = llvm::json::parse(fileOrErr.get()->getBuffer());
+    if (!jsonResult) {
+      llvm::errs() << "Error parsing JSON: " << llvm::toString(jsonResult.takeError()) << "\n";
+      llvm::report_fatal_error(llvm::Twine("Failed to parse JSON file: ") + adjustedFileName);
+    }
+
+    return std::move(*jsonResult);
+  }
+
   mutable SmallVector<FuncOp> parFuncs;
   using LoopBounds =
       std::tuple<SmallVector<int64_t, 4>, SmallVector<int64_t, 4>,
@@ -2130,7 +2166,6 @@ private:
   scf::ParallelOp partialEval(PatternRewriter &rewriter, scf::ParallelOp scfParOp) const {
     DenseMap<Operation *, SmallVector<uint>> memOpAccessIndices;
     auto *body = scfParOp.getBody();
-    auto loc = scfParOp.getLoc();
     auto parOpIVs = scfParOp.getInductionVars();
     assert(scfParOp.getLoopSteps() && "must have steps");
     auto steps = scfParOp.getStep();
@@ -2138,6 +2173,7 @@ private:
     auto upperBounds = scfParOp.getUpperBound();
     rewriter.setInsertionPointAfter(scfParOp);
     scf::ParallelOp newPloop = scfParOp.cloneWithoutRegions();
+    auto loc = newPloop.getLoc();
     rewriter.insert(newPloop);
     OpBuilder insideBuilder(newPloop);
     Block *currBlock = nullptr;
@@ -2209,28 +2245,52 @@ private:
   // Computes the raw traces of a given memory in a step
   SmallVector<Value> computeRawTrace(scf::ParallelOp scfParOp, Value memResult) const {
     SmallVector<Value> rawTraces;
-    for (auto &innerOp : scfParOp.getOps()) {
-      if (llvm::find(memResult.getUsers(), &innerOp) != memResult.getUsers().end()) {
+    scfParOp.walk([&](Operation *innerOp) {
+      if (llvm::find(memResult.getUsers(), innerOp) != memResult.getUsers().end()) {
         Value memAddr;
-        if (auto loadOp = dyn_cast<memref::LoadOp>(&innerOp)) {
+        if (auto loadOp = dyn_cast<memref::LoadOp>(innerOp)) {
           assert(loadOp.getIndices().size() == 1);
           memAddr = loadOp.getIndices().front();
         }
         else {
-          auto storeOp = dyn_cast<memref::StoreOp>(&innerOp);
+          auto storeOp = dyn_cast<memref::StoreOp>(innerOp);
           assert(storeOp.getIndices().size() == 1);
           memAddr = storeOp.getIndices().front();
         }
-        //auto intMemAddr = evaluateIndex(memAddr); 
         rawTraces.push_back(memAddr);
       }
-    }
+    });
+
+    llvm::errs() << "raw traces size after computing: " << rawTraces.size() << "\n";
     return rawTraces;
   }
 
+  // TODO: we can turn `Trace` into a class
   SmallVector<SmallVector<Value>> initCompress(SmallVector<SmallVector<Value>> &unCompressedTraces) const {
-    // TODO
-    return unCompressedTraces;
+    // 1. Remove redundant info: memory access with the same address in the same step
+    SmallVector<SmallVector<Value>> redundantRemoved;
+    for (const auto &step : unCompressedTraces) {
+      DenseSet<int> seenAddr;
+      SmallVector<Value> simplifiedStep;
+      for (const auto addrVal : step) {
+        auto addrInt = evaluateIndex(addrVal);
+        if (seenAddr.insert(addrInt).second)
+          simplifiedStep.push_back(addrVal);
+      }
+      redundantRemoved.push_back(simplifiedStep);
+    }
+    // 2. Combine steps with identical access into a single step
+    std::set<SmallVector<int>> seenStep;
+    SmallVector<SmallVector<Value>> compressedTraces;
+    for (const auto &step : redundantRemoved) {
+      SmallVector<int> stepInt;
+      for (const auto addrVal : step) {
+        stepInt.push_back(evaluateIndex(addrVal));
+      }
+      if (seenStep.insert(stepInt).second)
+        compressedTraces.push_back(step);
+    }
+    return compressedTraces;
   }
 
   SmallVector<std::string> generateAllMaskBits(int numMasks, int addrSize) const {
@@ -2253,7 +2313,6 @@ private:
       DenseSet<StringRef> seenMaskIDs;
       for (auto trace : traceInStep) {
         auto sizedBinTrace = getSizedTrace(trace, maskBits.length());
-        llvm::errs() << "sized trace: " << sizedBinTrace << "\n";
         std::string bitWiseAnd;
         for (size_t i = 0; i < maskBits.length(); ++i) {
           if (sizedBinTrace[i] == '1' && maskBits[i] == '1')
@@ -2399,6 +2458,15 @@ private:
 
   std::string findMasksBits(const uint availableBanks, SmallVector<SmallVector<Value>> &compressedTraces, Operation *memory) const {
     // `nA` is the maximum number of memory accesses in all steps in the compressed memory trace
+    llvm::errs() << "compressedTraces size: " << compressedTraces.size() << "\n for";
+    memory->dump();
+    for (const auto &step : compressedTraces) {
+      for (const auto trace: step) {
+        auto traceInt = evaluateIndex(trace);
+        llvm::errs() << traceInt << " ";
+      }
+      llvm::errs() << "\n";
+    }
     uint nA = 0;
     for (const auto &traceInStep : compressedTraces) {
       if (traceInStep.size() > nA)
@@ -2421,6 +2489,8 @@ private:
     std::string bestMaskBits;
     for (auto nBits = llvm::Log2_32_Ceil(nA); nBits <= addrSize; nBits++) {
       SmallVector<std::string> allMaskBits = generateAllMaskBits(nBits, addrSize);
+      llvm::errs() << "generated all mask bits in:\n";
+      memory->dump();
       uint minConflicts = std::numeric_limits<uint>::max();
       for (auto &maskBits : allMaskBits) {
         auto numConflicts = calculateConflicts(compressedTraces, maskBits);
@@ -2632,7 +2702,7 @@ private:
   }
 
   // Given `scf.parallel`s (all `step`)s and a memory in the `scf.parallel`s, computes the addresses to banks mapping
-  void traceBankAlgo(SmallVector<scf::ParallelOp> &scfParOps, Operation *memory) const {
+  void traceBankAlgo(FuncOp funcOp, Operation *memory) const {
     // Raw trace of a given memory at all steps
     Value memRes;
     MemRefType memTy;
@@ -2653,8 +2723,8 @@ private:
         llvm_unreachable("Unhandled memory operation type");
       });
 
-    SmallVector<SmallVector<Value>> rawTraces;
-    for (auto step : scfParOps) {
+    SmallVector<SmallVector<Value>> rawTraces; // store the raw trace for each "step"/`scfParOp` of the given `memory`
+    for (auto step : funcOp.getOps<scf::ParallelOp>()) {
       auto calleeFnOp = step->getParentOfType<FuncOp>();
       if (!isDefinedInsideRegion(memRes, &calleeFnOp.getRegion())) {
         // If `memRes` is passed as a fn arg to the par op
@@ -2674,6 +2744,19 @@ private:
     //  }
     //  llvm::errs() << "\n";
     //}
+
+    auto *jsonObj = availBanksJsonValue.getAsObject();
+    auto *banks = jsonObj->getArray("banks");
+    uint availableBanks = 0;
+    if (auto bankOpt = (*banks)[memNum.at(memory)].getAsInteger()) {
+      availableBanks = *bankOpt;
+    }
+    else {
+      std::string dumpStr;
+      llvm::raw_string_ostream dumpStream(dumpStr);
+      memory->print(dumpStream);
+      report_fatal_error(llvm::Twine("Cannot find the number of banks associated with memory") + dumpStream.str());
+    }
 
     std::string masksBits = findMasksBits(availableBanks, compressedTraces, memory);
     llvm::errs() << "masksBits: " << masksBits << "\n";
@@ -2803,8 +2886,6 @@ private:
                                    const DenseSet<Block *> &path,
                                    mlir::Block *parentCtrlBlock,
                                    mlir::Block *block) const {
-    llvm::errs() << "block in scheduleBasicBlock: \n";
-    block->dump();
     auto compBlockScheduleables =
         getState<ComponentLoweringState>().getBlockScheduleables(block);
     auto loc = block->front().getLoc();
