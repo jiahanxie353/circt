@@ -35,10 +35,13 @@
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -55,6 +58,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <variant>
 
 namespace circt {
@@ -2242,26 +2246,279 @@ private:
     llvm_unreachable("unsupported operation for index evaluation");
   };
 
-  // Computes the raw traces of a given memory in a step
-  SmallVector<Value> computeRawTrace(scf::ParallelOp scfParOp, Value memResult) const {
-    SmallVector<Value> rawTraces;
-    scfParOp.walk([&](Operation *innerOp) {
-      if (llvm::find(memResult.getUsers(), innerOp) != memResult.getUsers().end()) {
-        Value memAddr;
-        if (auto loadOp = dyn_cast<memref::LoadOp>(innerOp)) {
-          assert(loadOp.getIndices().size() == 1);
-          memAddr = loadOp.getIndices().front();
+SmallVector<scf::ParallelOp, 4> getAncestorParOps(Operation *op) const {
+  SmallVector<scf::ParallelOp, 4> ancestors;
+  while (op) {
+    if (auto parallelOp = dyn_cast<scf::ParallelOp>(op)) {
+      ancestors.push_back(parallelOp);
+    }
+    op = op->getParentOp();
+  }
+  return ancestors;
+}
+
+  std::optional<scf::ParallelOp> closestCommonAncestorParOp(Operation *op, Operation *anotherOp) const {
+    auto opAncestorPars = getAncestorParOps(op);
+    Operation *anotherParent = anotherOp->getParentOp();
+    while (anotherParent) {
+      if (auto anotherAncestorPar = dyn_cast<scf::ParallelOp>(anotherParent)) {
+        for (auto ancestorPar : opAncestorPars) {
+          if (ancestorPar == anotherAncestorPar)
+            return ancestorPar;
         }
-        else {
-          auto storeOp = dyn_cast<memref::StoreOp>(innerOp);
-          assert(storeOp.getIndices().size() == 1);
-          memAddr = storeOp.getIndices().front();
-        }
-        rawTraces.push_back(memAddr);
       }
+      anotherParent = anotherParent->getParentOp();
+    }
+    return std::nullopt;
+  }
+
+  bool containsOperation(Block &block, Operation *op) const {
+    for (Operation &nestedOp : block) {
+      if (&nestedOp == op)
+        return true;
+
+      for (Region &region : nestedOp.getRegions()) {
+        for (Block &nestedBlock : region) {
+          if (containsOperation(nestedBlock, op))
+            return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  bool inTheSameChildBlock(scf::ParallelOp parOp, Operation *op, Operation *anotherOp) const {
+    bool res = false;
+    for (auto &childBlock : parOp.getRegion().getBlocks()) {
+      res |= (containsOperation(childBlock, op) && containsOperation(childBlock, anotherOp));
+    }
+    return res;
+  }
+
+  Value getMemAddr(Operation *memOp) const {
+    Value memAddr;
+    TypeSwitch<Operation *>(memOp)
+      .Case<memref::LoadOp>([&](memref::LoadOp loadOp) {
+        assert(loadOp.getIndices().size() == 1);
+        memAddr = loadOp.getIndices().front();
+      })
+      .Case<memref::StoreOp>([&](memref::StoreOp storeOp) {
+        assert(storeOp.getIndices().size() == 1);
+        memAddr = storeOp.getIndices().front();
+      })
+      .Default([](Operation *) {
+        llvm_unreachable("Unhandled memory operation type");
+    });
+    return memAddr;
+  }
+
+  DenseSet<Operation *> getLargestNonConflictingSubset(Operation *newOp, const DenseSet<Operation *> &innerSet) const {
+    DenseSet<Operation *> nonConflictingSet;
+    for (Operation *existingOp : innerSet) {
+      bool hasConflict = false;
+      if (auto parOp = closestCommonAncestorParOp(newOp, existingOp)) {
+        if (inTheSameChildBlock(*parOp, newOp, existingOp)) {
+          hasConflict = true;
+        } 
+      }
+      if (!hasConflict) {
+        nonConflictingSet.insert(existingOp);
+      }
+    }
+    return nonConflictingSet;
+  }
+
+  bool hasConflict(Operation *newOp, Operation *existingOp) const {
+    if (auto parOp = closestCommonAncestorParOp(newOp, existingOp)) {
+      return inTheSameChildBlock(*parOp, newOp, existingOp);
+    }
+    return true;
+  }
+
+  class IndependentGraph {
+  public:
+    IndependentGraph(SmallVector<Operation *> &inputVertices, SmallVector<std::pair<Operation *, Operation *>> &inputEdges) : vertices(inputVertices) {
+      std::pair<Operation *, Operation *> edge;
+      for (auto inputEdge : inputEdges) {
+        edge.first = inputEdge.first;
+        edge.second = inputEdge.second;
+        edges[edge] = 1;
+        auto *t = edge.first;
+        edge.first = edge.second;
+        edge.second = t;
+        edges[edge] = 1;
+      }
+    };
+
+    std::set<std::set<Operation *>> findAllMaximalISets() {
+      std::set<std::set<Operation *>> maximalISets;
+      std::set<Operation *> tempSolnSet;
+      findAllIndependentSets(1, vertices.size(), tempSolnSet);
+      for (auto &iSet : independentSets) {
+        if (isMaximal(iSet))
+          maximalISets.insert(iSet);
+      }
+
+      return maximalISets;
+    }
+
+    bool isMaximal(std::set<Operation *> potentialMaxISet) {
+      for (auto *vertex : vertices) {
+        if (potentialMaxISet.find(vertex) == potentialMaxISet.end() && isSafeForIndepSet(vertex, potentialMaxISet)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    void findAllIndependentSets(int currV, int setSize, std::set<Operation *> tempSolnSet) {
+      independentSets.insert(tempSolnSet);
+
+      std::set<std::set<Operation *>> iSets;
+      for (int i = currV; i <= setSize; i++) {
+        if (isSafeForIndepSet(vertices[i-1], tempSolnSet)) {
+          tempSolnSet.insert(vertices[i-1]);
+          findAllIndependentSets(i+1, setSize, tempSolnSet);
+          tempSolnSet.erase(vertices[i-1]);
+          //llvm::errs() << "erasing: " << evaluateIndex(getMemAddr(vertices[i-1])) << "\n";
+        }
+      }
+    }
+
+
+  private:
+    DenseMap<std::pair<Operation *, Operation *>, int> edges;
+    SmallVector<Operation *> vertices;
+    std::set<std::set<Operation *>> independentSets;
+    std::set<std::set<Operation *>> maximalIndependentSets;
+    bool isSafeForIndepSet(Operation *vertex, std::set<Operation *> &tempSolnSet) {
+      for (auto *iter : tempSolnSet) {
+        if (edges[std::make_pair(iter, vertex)])
+          return false;
+      }
+      return true;
+    }
+  std::function<int(Value)> evaluateIndex = [&](Value val) -> int {
+    if (auto constIndexOp = dyn_cast<arith::ConstantIndexOp>(val.getDefiningOp()))
+        return constIndexOp.value();
+    if (auto addOp = dyn_cast<arith::AddIOp>(val.getDefiningOp())) {
+      int lhsValue = evaluateIndex(addOp.getLhs());
+      int rhsValue = evaluateIndex(addOp.getRhs());
+      return lhsValue + rhsValue;
+    }
+    if (auto mulOp = dyn_cast<arith::MulIOp>(val.getDefiningOp())) {
+      int lhsValue = evaluateIndex(mulOp.getLhs());
+      int rhsValue = evaluateIndex(mulOp.getRhs());
+      return lhsValue * rhsValue;
+    }
+    if (auto shlIOp = dyn_cast<arith::ShLIOp>(val.getDefiningOp())) {
+      int lhsValue = evaluateIndex(shlIOp.getLhs());
+      int rhsValue = evaluateIndex(shlIOp.getRhs());
+      return lhsValue << rhsValue;
+    }
+    if (auto subIOp = dyn_cast<arith::SubIOp>(val.getDefiningOp())) {
+      int lhsValue = evaluateIndex(subIOp.getLhs());
+      int rhsValue = evaluateIndex(subIOp.getRhs());
+      return lhsValue - rhsValue;
+    }
+    // Add more cases. We can do this only because we would have got error if we
+    // failed to get induction variables as constants.
+    llvm_unreachable("unsupported operation for index evaluation");
+  };
+  Value getMemAddr(Operation *memOp) const {
+    Value memAddr;
+    TypeSwitch<Operation *>(memOp)
+      .Case<memref::LoadOp>([&](memref::LoadOp loadOp) {
+        assert(loadOp.getIndices().size() == 1);
+        memAddr = loadOp.getIndices().front();
+      })
+      .Case<memref::StoreOp>([&](memref::StoreOp storeOp) {
+        assert(storeOp.getIndices().size() == 1);
+        memAddr = storeOp.getIndices().front();
+      })
+      .Default([](Operation *) {
+        llvm_unreachable("Unhandled memory operation type");
+    });
+    return memAddr;
+  }
+
+  };
+
+  // Computes the raw traces of a given memory in a step
+  SmallVector<SmallVector<Value>> computeRawTrace(FuncOp funcOp, Operation *memUser) const {
+    DenseSet<Operation *> potentialOps{memUser};
+    llvm::errs() << "memUser: " << evaluateIndex(getMemAddr(memUser)) << "\n";
+    SmallVector<Value> rawTrace;
+    Value memOperand;
+    TypeSwitch<Operation *>(memUser)
+      .Case<memref::LoadOp>([&](memref::LoadOp loadOp) {
+        memOperand = loadOp.getMemRef();
+        for (auto *otherUser : memOperand.getUsers()) {
+          if (!hasConflict(memUser, otherUser)) {
+            potentialOps.insert(otherUser);
+          }
+        }
+      })
+      .Case<memref::StoreOp>([&](memref::StoreOp storeOp) {
+        memOperand = storeOp.getMemRef();
+        for (auto *otherUser : memOperand.getUsers()) {
+          if (!hasConflict(memUser, otherUser)) {
+            potentialOps.insert(otherUser);
+          }
+        }
+      })
+      .Default([](Operation *) {
+        llvm_unreachable("Unhandled memory operation type");
     });
 
-    llvm::errs() << "raw traces size after computing: " << rawTraces.size() << "\n";
+    SmallVector<Operation *> iSetVertices(potentialOps.begin(), potentialOps.end());
+
+    llvm::errs() << "potentialOps: \n";
+    for (auto *potOp : iSetVertices) {
+      llvm::errs() << evaluateIndex(getMemAddr(potOp)) << " ";
+    }
+    llvm::errs() << "\n";
+
+    SmallVector<std::pair<Operation *, Operation *>> iSetEdges;
+    for (auto *it = iSetVertices.begin(); it < iSetVertices.end(); it++) {
+      for (auto *it2 = it + 1; it2 < iSetVertices.end(); it2++) {
+        auto *pOp = *it;
+        auto *pOp2 = *it2;
+        if (hasConflict(pOp, pOp2)) {
+          iSetEdges.push_back(std::make_pair(pOp, pOp2));
+          // llvm::errs() << "adding edge: " << evaluateIndex(getMemAddr(pOp)) << " and: " << evaluateIndex(getMemAddr(pOp2)) << "\n";
+        }
+      }
+    }
+
+    IndependentGraph iSet(iSetVertices, iSetEdges);
+    std::set<Operation *> tempSolnSet;
+    auto MIS = iSet.findAllMaximalISets();;
+    llvm::errs() << "MIS: \n";
+    for (auto &IS : MIS) {
+      for (auto *elm : IS) {
+        llvm::errs() << evaluateIndex(getMemAddr(elm)) << " ";
+      }
+      llvm::errs() << "\n";
+    }
+
+    // TODO: add a boolean to raw traces to indicate if it will potentially modify the memory
+    SmallVector<SmallVector<Value>> rawTraces;
+    for (auto &innerSet : MIS) {
+      SmallVector<Value> valSet;
+      for (auto *elm : innerSet) {
+        valSet.push_back(getMemAddr(elm));
+      }
+      rawTraces.push_back(valSet);
+    }
+    llvm::errs() << "raw traces returning: \n";
+    for (auto &innerSet : rawTraces) {
+      for(auto elm : innerSet) {
+        llvm::errs() << evaluateIndex(elm) << " ";
+      }
+      llvm::errs() << "\n";
+    }
+    // llvm::errs() << "raw traces size after computing: " << rawTrace.size() << "\n";
     return rawTraces;
   }
 
@@ -2280,12 +2537,12 @@ private:
       redundantRemoved.push_back(simplifiedStep);
     }
     // 2. Combine steps with identical access into a single step
-    std::set<SmallVector<int>> seenStep;
+    std::set<std::set<int>> seenStep;
     SmallVector<SmallVector<Value>> compressedTraces;
     for (const auto &step : redundantRemoved) {
-      SmallVector<int> stepInt;
+      std::set<int> stepInt;
       for (const auto addrVal : step) {
-        stepInt.push_back(evaluateIndex(addrVal));
+        stepInt.insert(evaluateIndex(addrVal));
       }
       if (seenStep.insert(stepInt).second)
         compressedTraces.push_back(step);
@@ -2310,7 +2567,7 @@ private:
   uint calculateConflicts(SmallVector<SmallVector<Value>> &compressedTraces, const std::string &maskBits) const {
     uint numConflicts = 0;
     for (const auto &traceInStep : compressedTraces) {
-      DenseSet<StringRef> seenMaskIDs;
+      std::set<std::string> seenMaskIDs;
       for (auto trace : traceInStep) {
         auto sizedBinTrace = getSizedTrace(trace, maskBits.length());
         std::string bitWiseAnd;
@@ -2344,14 +2601,14 @@ private:
         return std::hash<T1>()(pair.first) ^ std::hash<T2>()(pair.second);
       }
     };
-    std::unordered_map<std::string, SmallVector<std::string>> adjList;
+    std::unordered_map<std::string, std::set<std::string>> adjList;
     std::unordered_map<std::pair<std::string, std::string>, uint, PairHash> edgeWeights;
     void addEdge(const std::string& id1, const std::string& id2) {
         if (id1 == id2) return;  // No self-loops
         
         // Add edge to adjacency list
-        adjList[id1].push_back(id2);
-        adjList[id2].push_back(id1);
+        adjList[id1].insert(id2);
+        adjList[id2].insert(id1);
 
         // Create a consistent ordering for the edge
         auto edgeKey = std::make_pair(std::min(id1, id2), std::max(id1, id2));
@@ -2376,11 +2633,11 @@ private:
         }
     }
 
-    std::vector<std::string> findMaxClique() const {
-      std::vector<std::string> maxClique;
-      std::vector<std::string> potentialClique;
-      std::vector<std::string> candidates;
-      std::vector<std::string> alreadyProcessed;
+    SmallVector<std::string> findMaxClique() const {
+      SmallVector<std::string> maxClique;
+      SmallVector<std::string> potentialClique;
+      SmallVector<std::string> candidates;
+      SmallVector<std::string> alreadyProcessed;
 
         for (const auto& node : adjList) {
             candidates.push_back(node.first);
@@ -2390,58 +2647,58 @@ private:
         return maxClique;
     }
   private:
-      void findClique(std::vector<std::string>& potentialClique,
-                    std::vector<std::string>& candidates,
-                    std::vector<std::string>& alreadyProcessed,
-                    std::vector<std::string>& maxClique) const {
-        if (candidates.empty() && alreadyProcessed.empty()) {
-            if (potentialClique.size() > maxClique.size()) {
-                maxClique = potentialClique;
-            }
-            return;
+    void findClique(SmallVector<std::string>& potentialClique,
+                    SmallVector<std::string>& candidates,
+                    SmallVector<std::string>& alreadyProcessed,
+                    SmallVector<std::string>& maxClique) const {
+      if (candidates.empty() && alreadyProcessed.empty()) {
+        if (potentialClique.size() > maxClique.size()) {
+          maxClique = potentialClique;
         }
+        return;
+      }
 
         auto candidatesCopy = candidates;
-    for (const auto& candidate : candidatesCopy) {
-        // Remove candidate from candidates and add to potentialClique
-        candidates.erase(std::remove(candidates.begin(), candidates.end(), candidate), candidates.end());
-        potentialClique.push_back(candidate);
-
-        // Build new candidates and alreadyProcessed lists
-        std::vector<std::string> newCandidates;
-        std::vector<std::string> newAlreadyProcessed;
-
-        for (const auto& adjNode : adjList.at(candidate)) {
-            if (std::find(candidates.begin(), candidates.end(), adjNode) != candidates.end()) {
-                newCandidates.push_back(adjNode);
-            }
-            if (std::find(alreadyProcessed.begin(), alreadyProcessed.end(), adjNode) != alreadyProcessed.end()) {
-                newAlreadyProcessed.push_back(adjNode);
-            }
+      for (const auto& candidate : candidatesCopy) {
+          // Remove candidate from candidates and add to potentialClique
+          candidates.erase(std::remove(candidates.begin(), candidates.end(), candidate), candidates.end());
+          potentialClique.push_back(candidate);
+  
+          // Build new candidates and alreadyProcessed lists
+          SmallVector<std::string> newCandidates;
+          SmallVector<std::string> newAlreadyProcessed;
+  
+          for (const auto& adjNode : adjList.at(candidate)) {
+              if (std::find(candidates.begin(), candidates.end(), adjNode) != candidates.end()) {
+                  newCandidates.push_back(adjNode);
+              }
+              if (std::find(alreadyProcessed.begin(), alreadyProcessed.end(), adjNode) != alreadyProcessed.end()) {
+                  newAlreadyProcessed.push_back(adjNode);
+              }
+          }
+  
+          // Recursive call
+          findClique(potentialClique, newCandidates, newAlreadyProcessed, maxClique);
+  
+          // Backtrack: remove candidate from potentialClique and add to alreadyProcessed
+          potentialClique.pop_back();
+          alreadyProcessed.push_back(candidate);
         }
-
-        // Recursive call
-        findClique(potentialClique, newCandidates, newAlreadyProcessed, maxClique);
-
-        // Backtrack: remove candidate from potentialClique and add to alreadyProcessed
-        potentialClique.pop_back();
-        alreadyProcessed.push_back(candidate);
       }
-    }
   };
 
   ConflictGraph constructGraph(SmallVector<SmallVector<Value>> &compressedTraces, const std::string &maskBits) const {
     ConflictGraph graph;
     for (const auto &traceInStep : compressedTraces) {
-      std::unordered_set<std::string> seenMaskIDs;
+      std::set<std::string> seenMaskIDs;
       for (auto trace : traceInStep) {
         auto sizedBinTrace = getSizedTrace(trace, maskBits.length());
 
         std::string maskID = extractMaskIDs(sizedBinTrace, maskBits);
 
         for (const auto &otherMaskID : seenMaskIDs) {
-          graph.adjList[maskID].push_back(otherMaskID);
-          graph.adjList[otherMaskID].push_back(maskID);
+          graph.adjList[maskID].insert(otherMaskID);
+          graph.adjList[otherMaskID].insert(maskID);
           auto edgeKey = std::make_pair(maskID, otherMaskID);
           if (maskID > otherMaskID)
             edgeKey = std::make_pair(otherMaskID, maskID);
@@ -2458,8 +2715,7 @@ private:
 
   std::string findMasksBits(const uint availableBanks, SmallVector<SmallVector<Value>> &compressedTraces, Operation *memory) const {
     // `nA` is the maximum number of memory accesses in all steps in the compressed memory trace
-    llvm::errs() << "compressedTraces size: " << compressedTraces.size() << "\n for";
-    memory->dump();
+    llvm::errs() << "compressedTraces size: " << compressedTraces.size() << "\n for: \n";
     for (const auto &step : compressedTraces) {
       for (const auto trace: step) {
         auto traceInt = evaluateIndex(trace);
@@ -2489,15 +2745,16 @@ private:
     std::string bestMaskBits;
     for (auto nBits = llvm::Log2_32_Ceil(nA); nBits <= addrSize; nBits++) {
       SmallVector<std::string> allMaskBits = generateAllMaskBits(nBits, addrSize);
-      llvm::errs() << "generated all mask bits in:\n";
-      memory->dump();
       uint minConflicts = std::numeric_limits<uint>::max();
       for (auto &maskBits : allMaskBits) {
         auto numConflicts = calculateConflicts(compressedTraces, maskBits);
         if (numConflicts <= minConflicts) {
           minConflicts = numConflicts;
           auto graph = constructGraph(compressedTraces, maskBits);
+          if (minConflicts == 0)
+            graph.printGraph();
           auto numCliques = graph.findMaxClique().size();
+          llvm::errs() << "number of cliques: " << numCliques << "\n";
           if (minConflicts == 0 && numCliques <= availableBanks) {
             if (numCliques < overallMinCliques) {
               overallMinCliques = numCliques;
@@ -2722,18 +2979,22 @@ private:
       .Default([](Operation *) {
         llvm_unreachable("Unhandled memory operation type");
       });
+    
+    // Store the raw trace for each "step" of the given `memory`.
+    // A "step" here is a set of blocks that are the descendant of
+    // the same scf::parallelOp
+    SmallVector<SmallVector<Value>> rawTraces; 
+    // For each memory use, get all access indices including this use
+    // and the access indices to this memory if current block and 
+    // that block are both descendant of the same scfParOp
+    if (!isDefinedInsideRegion(memRes, &funcOp.getRegion())) {
+      auto callerFnOp = memRes.getDefiningOp()->getParentOfType<FuncOp>();
+      memRes = getCalleeBlockArg(callerFnOp, funcOp, memRes);
+    }
 
-    SmallVector<SmallVector<Value>> rawTraces; // store the raw trace for each "step"/`scfParOp` of the given `memory`
-    for (auto step : funcOp.getOps<scf::ParallelOp>()) {
-      auto calleeFnOp = step->getParentOfType<FuncOp>();
-      if (!isDefinedInsideRegion(memRes, &calleeFnOp.getRegion())) {
-        // If `memRes` is passed as a fn arg to the par op
-        auto callerFnOp = memRes.getDefiningOp()->getParentOfType<FuncOp>();
-        memRes = getCalleeBlockArg(callerFnOp, calleeFnOp, memRes);
-      }
-
-      auto rawTrace = computeRawTrace(step, memRes);
-      rawTraces.push_back(rawTrace);
+    for (auto *user : memRes.getUsers()) {
+      auto rawTrace = computeRawTrace(funcOp, user);
+      rawTraces.append(rawTrace.begin(), rawTrace.end());
     }
 
     auto compressedTraces = initCompress(rawTraces);
