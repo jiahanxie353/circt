@@ -1960,9 +1960,6 @@ public:
                 memOperand.getDefiningOp()->remove();
             }
             else {
-              llvm::errs() << "erasing in: " << funcOp.getSymName() << "\n";
-              llvm::errs() << "origMemDef: \n";
-              origMemDef->dump();
               auto newFnType = eraseOperandInCallerCallees(moduleOp, funcOp, origMemDef->getResult(0));
               funcOp.setFunctionType(newFnType);
             }
@@ -2078,8 +2075,8 @@ private:
 
   mutable SmallVector<FuncOp> parFuncs;
   using LoopBounds =
-      std::tuple<SmallVector<int64_t, 4>, SmallVector<int64_t, 4>,
-                 SmallVector<int64_t, 4>>;
+      std::tuple<SmallVector<int64_t>, SmallVector<int64_t>,
+                 SmallVector<int64_t>>;
 
   LoopBounds getLoopBounds(scf::ParallelOp scfParOp) const {
     auto getConstantIntValue = [](Value val) -> int64_t {
@@ -2087,7 +2084,7 @@ private:
                    cast<arith::ConstantIndexOp>(val.getDefiningOp()).getValue())
             .getInt();
     };
-    SmallVector<int64_t, 4> lowerBounds, upperBounds, steps;
+    SmallVector<int64_t> lowerBounds, upperBounds, steps;
     for (size_t i = 0; i < scfParOp.getNumLoops(); i++) {
       lowerBounds.push_back(getConstantIntValue(scfParOp.getLowerBound()[i]));
       upperBounds.push_back(getConstantIntValue(scfParOp.getUpperBound()[i]));
@@ -2096,35 +2093,29 @@ private:
     return {lowerBounds, upperBounds, steps};
   }
 
-  template <std::size_t... Is>
-  auto generateTuple(const std::vector<int64_t>& indices, std::index_sequence<Is...>) const {
-      return std::make_tuple(indices[Is]...);
-  }
-  
-  SmallVector<std::tuple<int64_t, int64_t>>
-  genInductVarCombinations(const SmallVector<int64_t, 4> &lowerBounds,
-                        const SmallVector<int64_t, 4> &upperBounds,
-                        const SmallVector<int64_t, 4> &steps) const {
-    SmallVector<std::tuple<int64_t, int64_t>> accessIndices;
+  SmallVector<SmallVector<int64_t>>
+  genInductVarCombinations(const SmallVector<int64_t> &lowerBounds,
+                         const SmallVector<int64_t> &upperBounds,
+                         const SmallVector<int64_t> &steps) const {
+    SmallVector<SmallVector<int64_t>> accessIndices;
     auto numDims = lowerBounds.size();
-    std::vector<int64_t> currIndices(numDims);
-  
+    SmallVector<int64_t> currIndices(numDims);
+
     std::function<void(size_t)> generateCombinations = [&](size_t currDim) {
-      if (currDim == lowerBounds.size()) {
-        // TODO: change 2 with the tuple size tgt
-        accessIndices.push_back(generateTuple(currIndices, std::make_index_sequence<2>{}));
-        return;
-      }
-  
-      for (auto s = lowerBounds[currDim]; s < upperBounds[currDim]; s += steps[currDim]) {
-          currIndices[currDim] = s;
-          generateCombinations(currDim + 1);
-      }
+        if (currDim == lowerBounds.size()) {
+            accessIndices.push_back(currIndices);
+            return;
+        }
+
+        for (auto s = lowerBounds[currDim]; s < upperBounds[currDim]; s += steps[currDim]) {
+            currIndices[currDim] = s;
+            generateCombinations(currDim + 1);
+        }
     };
-  
+
     generateCombinations(0);
     return accessIndices;
-  }
+  } 
 
   bool isDefinedInsideRegion(Value value, Region *targetRegion) const {
     Operation *definingOp = value.getDefiningOp();
@@ -2152,17 +2143,27 @@ private:
     return false;
   }
 
-  DenseMap<std::tuple<int64_t, int64_t>, std::tuple<arith::ConstantIndexOp, arith::ConstantIndexOp>> createIVConsts(PatternRewriter &rewriter, scf::ParallelOp scfParOp) const {
-    DenseMap<std::tuple<int64_t, int64_t>, std::tuple<arith::ConstantIndexOp, arith::ConstantIndexOp>> ivToArithConst;
-    auto [lowerBounds, upperBounds, steps] = getLoopBounds(scfParOp);
+  std::map<SmallVector<int64_t>, SmallVector<arith::ConstantIndexOp>> createIVConsts(PatternRewriter &rewriter, scf::ParallelOp scfParOp) const {
+    std::map<SmallVector<int64_t>, SmallVector<arith::ConstantIndexOp>> ivToArithConst;
+    SmallVector<int64_t> lowerBounds, upperBounds, steps;
+    std::tie(lowerBounds, upperBounds, steps) = getLoopBounds(scfParOp);
     auto inductVarCombs =
           genInductVarCombinations(lowerBounds, upperBounds, steps);
     rewriter.setInsertionPointToStart(scfParOp.getBody());
-    for (auto ivComb : inductVarCombs) {
-      auto [lbVal, ubVal] = ivComb;
-      auto lbConst = rewriter.create<arith::ConstantIndexOp>(scfParOp.getLoc(), lbVal);
-      auto ubConst = rewriter.create<arith::ConstantIndexOp>(scfParOp.getLoc(), ubVal);
-      ivToArithConst[ivComb] = std::make_tuple(lbConst, ubConst);
+    for (const auto &ivComb : inductVarCombs) {
+      SmallVector<arith::ConstantIndexOp> consts;
+      for (int64_t val : ivComb) {
+        auto constOp = rewriter.create<arith::ConstantIndexOp>(scfParOp.getLoc(), val);
+        consts.push_back(constOp);
+      }
+      ivToArithConst[ivComb] = consts;
+    }
+    llvm::errs() << "created iv consts:\n";
+    for (auto &[ints, indicies] : ivToArithConst) {
+      for (size_t i = 0; i < ints.size(); i++) {
+        llvm::errs() << ints[i] << "\n";
+        indicies[i].dump();
+      }
     }
     return ivToArithConst;
   }
@@ -2338,28 +2339,89 @@ SmallVector<scf::ParallelOp, 4> getAncestorParOps(Operation *op) const {
   class IndependentGraph {
   public:
     IndependentGraph(SmallVector<Operation *> &inputVertices, SmallVector<std::pair<Operation *, Operation *>> &inputEdges) : vertices(inputVertices) {
-      std::pair<Operation *, Operation *> edge;
-      for (auto inputEdge : inputEdges) {
-        edge.first = inputEdge.first;
-        edge.second = inputEdge.second;
-        edges[edge] = 1;
-        auto *t = edge.first;
-        edge.first = edge.second;
-        edge.second = t;
-        edges[edge] = 1;
+      for (auto edge : inputEdges) {
+        Operation *u = edge.first;
+        Operation *v = edge.second;
+
+        adjMap[u].push_back(v);
+        adjMap[v].push_back(u);
+
       }
     };
 
-    std::set<std::set<Operation *>> findAllMaximalISets() {
-      std::set<std::set<Operation *>> maximalISets;
-      std::set<Operation *> tempSolnSet;
-      findAllIndependentSets(1, vertices.size(), tempSolnSet);
-      for (auto &iSet : independentSets) {
-        if (isMaximal(iSet))
-          maximalISets.insert(iSet);
-      }
+void buildAdjacencyMap(
+    const SmallVector<std::pair<Operation *, Operation *>> &edges,
+    const SmallVector<Operation *> &allVertices,
+    DenseMap<Operation *, SmallPtrSet<Operation *, 4>> &adjacencyMap,
+    DenseMap<Operation *, SmallPtrSet<Operation *, 32>> &complementAdjacencyMap) {
+  // Initialize adjacency map
+  for (Operation *vertex : allVertices) {
+    adjacencyMap[vertex] = SmallPtrSet<Operation *, 4>();
+  }
 
-      return maximalISets;
+  // Build adjacency map
+  for (const auto &edge : edges) {
+    Operation *u = edge.first;
+    Operation *v = edge.second;
+
+    adjacencyMap[u].insert(v);
+    adjacencyMap[v].insert(u);
+  }
+
+  // Build complement adjacency map
+  SmallPtrSet<Operation *, 32> allVerticesSet(allVertices.begin(), allVertices.end());
+  for (Operation *vertex : allVertices) {
+    SmallPtrSet<Operation *, 32> complementNeighbors = allVerticesSet;
+    complementNeighbors.erase(vertex); // Remove self
+    // Remove neighbors
+    for (Operation *neighbor : adjacencyMap[vertex]) {
+      complementNeighbors.erase(neighbor);
+    }
+    complementAdjacencyMap[vertex] = complementNeighbors;
+  }
+}
+
+    std::vector<SmallPtrSet<Operation *, 32>> findAllMaximalISets(SmallVector<std::pair<Operation *, Operation *>> &iSetEdges, SmallVector<Operation *> &potentialOps) {
+  DenseMap<Operation *, SmallPtrSet<Operation *, 4>> adjacencyMap;
+  DenseMap<Operation *, SmallPtrSet<Operation *, 32>> complementAdjacencyMap;
+  buildAdjacencyMap(iSetEdges, potentialOps, adjacencyMap, complementAdjacencyMap);
+
+  SmallPtrSet<Operation *, 32> R; // Empty set
+  SmallPtrSet<Operation *, 32> P(potentialOps.begin(), potentialOps.end());
+  SmallPtrSet<Operation *, 32> X; // Empty set
+  std::vector<SmallPtrSet<Operation *, 32>> maximalIndependentSets;
+
+  // Run Bron-Kerbosch algorithm
+  bronKerbosch(R, P, X, complementAdjacencyMap, maximalIndependentSets);
+      return maximalIndependentSets;
+//      llvm::errs() << "adj map: \n";
+//      for (auto &entry : adjMap) {
+//        Operation *op = entry.first;
+//        llvm::errs() << op->getName().getStringRef() <<": " << evaluateIndex(getMemAddr(op)) << ": \n";
+//        for (Operation *adjOp : entry.second) {
+//          llvm::errs() << adjOp->getName().getStringRef() << ": " << evaluateIndex(getMemAddr(adjOp)) << " ";
+//        }
+//        llvm::errs() << "\n";
+//      }
+//      std::set<std::set<Operation *>> maximalISets;
+//      std::set<Operation *> tempSolnSet;
+//      llvm::errs() << "vertices size: " << vertices.size() << "\n";
+//      llvm::errs() << "edges size: " << adjMap.size() << "\n";
+//      std::set<std::set<Operation *>> allIndependentSets;
+//      findAllIndependentSets(tempSolnSet, 0, vertices, adjMap, allIndependentSets);
+//      llvm::errs() << "found all isets\n";
+//      for (auto &iSet : allIndependentSets) {
+//        for (auto elm : iSet) {
+//          llvm::errs() << evaluateIndex(getMemAddr(elm)) << " ";
+//        }
+//        llvm::errs() << "\n";
+//      }
+//      for (auto &iSet : allIndependentSets) {
+//        if (isMaximal(iSet))
+//          maximalISets.insert(iSet);
+//      }
+//
+//      return maximalISets;
     }
 
     bool isMaximal(std::set<Operation *> potentialMaxISet) {
@@ -2371,29 +2433,138 @@ SmallVector<scf::ParallelOp, 4> getAncestorParOps(Operation *op) const {
       return true;
     }
 
-    void findAllIndependentSets(int currV, int setSize, std::set<Operation *> tempSolnSet) {
-      independentSets.insert(tempSolnSet);
-
-      std::set<std::set<Operation *>> iSets;
-      for (int i = currV; i <= setSize; i++) {
-        if (isSafeForIndepSet(vertices[i-1], tempSolnSet)) {
-          tempSolnSet.insert(vertices[i-1]);
-          findAllIndependentSets(i+1, setSize, tempSolnSet);
-          tempSolnSet.erase(vertices[i-1]);
-          //llvm::errs() << "erasing: " << evaluateIndex(getMemAddr(vertices[i-1])) << "\n";
+    void findAllIndependentSets(
+      std::set<Operation *> &currentSet,
+      size_t currentIndex,
+      SmallVector<Operation *> &vertices,
+      DenseMap<Operation *, SmallVector<Operation *>> &adjacencyMap,
+      std::set<std::set<Operation *>> &allIndependentSets
+    ) {
+      llvm::errs() << "currV:" << currentIndex << "\n";
+      llvm::errs() << "set Size: " << currentSet.size() << "\n";
+      if (currentIndex >= vertices.size()) {
+        allIndependentSets.insert(currentSet);
+        llvm::errs() << "return currentSet for vertices: \n";
+        for (auto vertex : vertices) {
+          llvm::errs() << vertex->getName().getStringRef() << ": " << evaluateIndex(getMemAddr(vertex)) << " ";
         }
+        llvm::errs() << "\n";
+        for (auto elm : currentSet) {
+          llvm::errs() << elm->getName().getStringRef() << ": " << evaluateIndex(getMemAddr(elm)) << " ";
+        }
+        llvm::errs() << "\n";
+        return;
+      }
+
+      Operation *v = vertices[currentIndex];
+      
+      findAllIndependentSets(currentSet, currentIndex + 1, vertices, adjacencyMap, allIndependentSets);
+
+      bool canInclude = true;
+      for (Operation *u : currentSet) {
+        auto adjIt = adjacencyMap.find(v);
+        if (adjIt != adjacencyMap.end()) {
+          SmallVector<Operation *> &adjacentVertices = adjIt->second;
+          if (std::find(adjacentVertices.begin(), adjacentVertices.end(), u) != adjacentVertices.end()) {
+            canInclude = false;
+            break;
+          }
+        }
+      }
+
+      if (canInclude) {
+        currentSet.insert(v);
+        llvm::errs() << "can include: " << evaluateIndex(getMemAddr(v)) << "\n";
+        findAllIndependentSets(currentSet, currentIndex + 1, vertices, adjacencyMap, allIndependentSets);
+        currentSet.erase(v);
       }
     }
 
+void setDifference(const SmallPtrSet<Operation *, 32> &A,
+                   const SmallPtrSet<Operation *, 32> &B,
+                   SmallPtrSet<Operation *, 32> &Result) {
+  for (Operation *op : A) {
+    if (!B.contains(op)) {
+      Result.insert(op);
+    }
+  }
+}
+
+void setIntersection(const SmallPtrSet<Operation *, 32> &A,
+                     const SmallPtrSet<Operation *, 32> &B,
+                     SmallPtrSet<Operation *, 32> &Result) {
+  for (Operation *op : A) {
+    if (B.contains(op)) {
+      Result.insert(op);
+    }
+  }
+}
+
+void bronKerbosch(
+    SmallPtrSet<Operation *, 32> &R,
+    SmallPtrSet<Operation *, 32> &P,
+    SmallPtrSet<Operation *, 32> &X,
+    const DenseMap<Operation *, SmallPtrSet<Operation *, 32>> &complementAdjacencyMap,
+    std::vector<SmallPtrSet<Operation *, 32>> &maximalIndependentSets) {
+  if (P.empty() && X.empty()) {
+    // R is a maximal independent set
+    maximalIndependentSets.push_back(R);
+    return;
+  }
+
+  // Choose a pivot vertex u from P ∪ X
+  SmallPtrSet<Operation *, 32> union_PX = P;
+  union_PX.insert(X.begin(), X.end());
+
+  if (union_PX.empty()) {
+    return;
+  }
+
+  // Simple pivot selection: choose an arbitrary vertex
+  Operation *u = *union_PX.begin();
+
+  // Neighbors of u in the complement graph
+  const SmallPtrSet<Operation *, 32> &neighbors_u = complementAdjacencyMap.lookup(u);
+
+  // P_without_neighbors = P \ N(u)
+  SmallPtrSet<Operation *, 32> P_without_neighbors;
+  setDifference(P, neighbors_u, P_without_neighbors);
+
+  // Copy of P to avoid modifying it during iteration
+  SmallPtrSet<Operation *, 32> P_copy = P;
+
+  for (Operation *v : P_without_neighbors) {
+    // Create new sets for recursion
+    SmallPtrSet<Operation *, 32> R_new = R;
+    R_new.insert(v);
+
+    const SmallPtrSet<Operation *, 32> &neighbors_v = complementAdjacencyMap.lookup(v);
+
+    // P_new = P ∩ N(v)
+    SmallPtrSet<Operation *, 32> P_new;
+    setIntersection(P, neighbors_v, P_new);
+
+    // X_new = X ∩ N(v)
+    SmallPtrSet<Operation *, 32> X_new;
+    setIntersection(X, neighbors_v, X_new);
+
+    // Recursive call
+    bronKerbosch(R_new, P_new, X_new, complementAdjacencyMap, maximalIndependentSets);
+
+    // Move v from P to X
+    P.erase(v);
+    X.insert(v);
+  }
+}
 
   private:
-    DenseMap<std::pair<Operation *, Operation *>, int> edges;
+    DenseMap<Operation *, SmallVector<Operation *>> adjMap;
     SmallVector<Operation *> vertices;
     std::set<std::set<Operation *>> independentSets;
     std::set<std::set<Operation *>> maximalIndependentSets;
     bool isSafeForIndepSet(Operation *vertex, std::set<Operation *> &tempSolnSet) {
       for (auto *iter : tempSolnSet) {
-        if (edges[std::make_pair(iter, vertex)])
+        if (std::find(adjMap[vertex].begin(), adjMap[vertex].end(), iter) != adjMap[vertex].end())
           return false;
       }
       return true;
@@ -2446,8 +2617,10 @@ SmallVector<scf::ParallelOp, 4> getAncestorParOps(Operation *op) const {
 
   // Computes the raw traces of a given memory in a step
   SmallVector<SmallVector<Value>> computeRawTrace(FuncOp funcOp, Operation *memUser) const {
+    // llvm::errs() << "compute raw trace\n";
+    // funcOp.dump();
     DenseSet<Operation *> potentialOps{memUser};
-    llvm::errs() << "memUser: " << evaluateIndex(getMemAddr(memUser)) << "\n";
+    // llvm::errs() << "memUser: " << memUser->getName().getStringRef() << ": " << evaluateIndex(getMemAddr(memUser)) << "\n";
     SmallVector<Value> rawTrace;
     Value memOperand;
     TypeSwitch<Operation *>(memUser)
@@ -2473,11 +2646,11 @@ SmallVector<scf::ParallelOp, 4> getAncestorParOps(Operation *op) const {
 
     SmallVector<Operation *> iSetVertices(potentialOps.begin(), potentialOps.end());
 
-    llvm::errs() << "potentialOps: \n";
-    for (auto *potOp : iSetVertices) {
-      llvm::errs() << evaluateIndex(getMemAddr(potOp)) << " ";
-    }
-    llvm::errs() << "\n";
+//    llvm::errs() << "potentialOps: " << iSetVertices.size() << "\n";
+//    for (auto *potOp : iSetVertices) {
+//      llvm::errs() << potOp->getName().getStringRef() << ": " << evaluateIndex(getMemAddr(potOp)) << " ";
+//    }
+//    llvm::errs() << "\n";
 
     SmallVector<std::pair<Operation *, Operation *>> iSetEdges;
     for (auto *it = iSetVertices.begin(); it < iSetVertices.end(); it++) {
@@ -2490,17 +2663,21 @@ SmallVector<scf::ParallelOp, 4> getAncestorParOps(Operation *op) const {
         }
       }
     }
+    // llvm::errs() << "iset edges size: " << iSetEdges.size() << "\n";
 
+//    for (auto iSetEdge : iSetEdges) {
+//      llvm::errs() << "first: " << iSetEdge.first->getName().getStringRef() << ": " << evaluateIndex(getMemAddr(iSetEdge.first)) << "\n";
+//      llvm::errs() << "second: " << iSetEdge.second->getName().getStringRef() << ": " << evaluateIndex(getMemAddr(iSetEdge.second)) << "\n";
+//    }
     IndependentGraph iSet(iSetVertices, iSetEdges);
-    std::set<Operation *> tempSolnSet;
-    auto MIS = iSet.findAllMaximalISets();;
-    llvm::errs() << "MIS: \n";
-    for (auto &IS : MIS) {
-      for (auto *elm : IS) {
-        llvm::errs() << evaluateIndex(getMemAddr(elm)) << " ";
-      }
-      llvm::errs() << "\n";
-    }
+    auto MIS = iSet.findAllMaximalISets(iSetEdges, iSetVertices);;
+//    llvm::errs() << "MIS: \n";
+//    for (auto &IS : MIS) {
+//      for (auto *elm : IS) {
+//        llvm::errs() << elm->getName().getStringRef() << ": " << evaluateIndex(getMemAddr(elm)) << " ";
+//      }
+//      llvm::errs() << "\n";
+//    }
 
     // TODO: add a boolean to raw traces to indicate if it will potentially modify the memory
     SmallVector<SmallVector<Value>> rawTraces;
@@ -2511,19 +2688,20 @@ SmallVector<scf::ParallelOp, 4> getAncestorParOps(Operation *op) const {
       }
       rawTraces.push_back(valSet);
     }
-    llvm::errs() << "raw traces returning: \n";
-    for (auto &innerSet : rawTraces) {
-      for(auto elm : innerSet) {
-        llvm::errs() << evaluateIndex(elm) << " ";
-      }
-      llvm::errs() << "\n";
-    }
+//     llvm::errs() << "raw traces returning: \n";
+//     for (auto &innerSet : rawTraces) {
+//       for(auto elm : innerSet) {
+//         llvm::errs() << evaluateIndex(elm) << " ";
+//       }
+//       llvm::errs() << "\n";
+//     }
     // llvm::errs() << "raw traces size after computing: " << rawTrace.size() << "\n";
     return rawTraces;
   }
 
   // TODO: we can turn `Trace` into a class
   SmallVector<SmallVector<Value>> initCompress(SmallVector<SmallVector<Value>> &unCompressedTraces) const {
+    llvm::errs() << "init compress\n";
     // 1. Remove redundant info: memory access with the same address in the same step
     SmallVector<SmallVector<Value>> redundantRemoved;
     for (const auto &step : unCompressedTraces) {
@@ -2580,7 +2758,7 @@ SmallVector<scf::ParallelOp, 4> getAncestorParOps(Operation *op) const {
         numConflicts += seenMaskIDs.insert(bitWiseAnd).second ? 0 : 1;
       }
     }
-    llvm::errs() << "number of conflicts when maskBits is: " << maskBits << " " << numConflicts << "\n";
+    // llvm::errs() << "number of conflicts when maskBits is: " << maskBits << " " << numConflicts << "\n";
     return numConflicts;
   }
 
@@ -2751,10 +2929,7 @@ SmallVector<scf::ParallelOp, 4> getAncestorParOps(Operation *op) const {
         if (numConflicts <= minConflicts) {
           minConflicts = numConflicts;
           auto graph = constructGraph(compressedTraces, maskBits);
-          if (minConflicts == 0)
-            graph.printGraph();
           auto numCliques = graph.findMaxClique().size();
-          llvm::errs() << "number of cliques: " << numCliques << "\n";
           if (minConflicts == 0 && numCliques <= availableBanks) {
             if (numCliques < overallMinCliques) {
               overallMinCliques = numCliques;
@@ -2767,7 +2942,7 @@ SmallVector<scf::ParallelOp, 4> getAncestorParOps(Operation *op) const {
     }
     if (bestMaskBits.length() == 0)
       bestMaskBits.assign(addrSize, '1');
-    llvm::errs() << "best: " << bestMaskBits << " with minCliques: " << overallMinCliques << "\n";
+    //llvm::errs() << "best: " << bestMaskBits << " with minCliques: " << overallMinCliques << "\n";
     return bestMaskBits;
   }
 
