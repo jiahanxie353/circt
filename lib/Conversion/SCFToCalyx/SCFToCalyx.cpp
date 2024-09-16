@@ -2393,49 +2393,48 @@ bool inTheSameChildBlock(scf::ParallelOp parOp, Block *block1, Block *block2) co
   class IndependentGraph {
   public:
     IndependentGraph(
-        DenseSet<Operation *> &inputVertices,
-        DenseMap<Operation *, DenseSet<Operation *>> &inputAdjMap)
+        DenseSet<Block *> &inputVertices,
+        DenseMap<Block *, DenseSet<Block *>> &inputAdjMap)
         : vertices(inputVertices), adjacencyMap(inputAdjMap) {
       // Build complement adjacency map
-      DenseSet<Operation *> allVerticesSet(inputVertices.begin(),
+      DenseSet<Block *> allVerticesSet(inputVertices.begin(),
                                                   inputVertices.end());
-      for (Operation *vertex : inputVertices) {
-        DenseSet<Operation *> complementNeighbors = allVerticesSet;
+      for (Block *vertex : inputVertices) {
+        DenseSet<Block *> complementNeighbors = allVerticesSet;
         complementNeighbors.erase(vertex); // Remove self
         // Remove neighbors
-        for (Operation *neighbor : adjacencyMap[vertex]) {
+        for (Block *neighbor : adjacencyMap[vertex]) {
           complementNeighbors.erase(neighbor);
         }
         complementAdjMap[vertex] = complementNeighbors;
       }
     };
 
-    SmallVector<DenseSet<Operation *>> findAllMaximalISets() const {
+    SmallVector<DenseSet<Block *>> findAllMaximalISets() const {
 
-      DenseSet<Operation *> R; // Empty set
-      DenseSet<Operation *> P(vertices.begin(), vertices.end());
-      DenseSet<Operation *> X; // Empty set
-      SmallVector<DenseSet<Operation *>> maximalIndependentSets;
+      DenseSet<Block *> R; // Empty set
+      DenseSet<Block *> P(vertices.begin(), vertices.end());
+      DenseSet<Block *> X; // Empty set
+      SmallVector<DenseSet<Block *>> maximalIndependentSets;
 
       bronKerbosch(R, P, X, complementAdjMap, maximalIndependentSets);
       return maximalIndependentSets;
     }
 
-
-    void setDifference(const DenseSet<Operation *> &A,
-                       const DenseSet<Operation *> &B,
-                       DenseSet<Operation *> &Result) const {
-      for (Operation *op : A) {
+    void setDifference(const DenseSet<Block *> &A,
+                       const DenseSet<Block *> &B,
+                       DenseSet<Block *> &Result) const {
+      for (Block *op : A) {
         if (!B.contains(op)) {
           Result.insert(op);
         }
       }
     }
 
-    void setIntersection(const DenseSet<Operation *> &A,
-                         const DenseSet<Operation *> &B,
-                         DenseSet<Operation *> &Result) const {
-      for (Operation *op : A) {
+    void setIntersection(const DenseSet<Block *> &A,
+                         const DenseSet<Block *> &B,
+                         DenseSet<Block *> &Result) const {
+      for (Block *op : A) {
         if (B.contains(op)) {
           Result.insert(op);
         }
@@ -2443,11 +2442,11 @@ bool inTheSameChildBlock(scf::ParallelOp parOp, Block *block1, Block *block2) co
     }
 
     void bronKerbosch(
-        DenseSet<Operation *> &R, DenseSet<Operation *> &P,
-        DenseSet<Operation *> &X,
-        const DenseMap<Operation *, DenseSet<Operation *>>
+        DenseSet<Block *> &R, DenseSet<Block *> &P,
+        DenseSet<Block *> &X,
+        const DenseMap<Block *, DenseSet<Block *>>
             &complementAdjMap,
-        SmallVector<DenseSet<Operation *>> &maximalIndependentSets) const {
+        SmallVector<DenseSet<Block *>> &maximalIndependentSets) const {
       if (P.empty() && X.empty()) {
         // R is a maximal independent set
         maximalIndependentSets.push_back(R);
@@ -2455,7 +2454,7 @@ bool inTheSameChildBlock(scf::ParallelOp parOp, Block *block1, Block *block2) co
       }
 
       // Choose a pivot vertex u from P \union X
-      DenseSet<Operation *> unionPX = P;
+      DenseSet<Block *> unionPX = P;
       unionPX.insert(X.begin(), X.end());
 
       if (unionPX.empty()) {
@@ -2463,30 +2462,30 @@ bool inTheSameChildBlock(scf::ParallelOp parOp, Block *block1, Block *block2) co
       }
 
       // Simple pivot selection: choose an arbitrary vertex
-      Operation *u = *unionPX.begin();
+      Block *u = *unionPX.begin();
 
       // Neighbors of u in the complement graph
-      const DenseSet<Operation *> &neighborsU =
+      const DenseSet<Block *> &neighborsU =
           complementAdjMap.lookup(u);
 
       // p without neighbors = P \ N(u)
-      DenseSet<Operation *> pWithoutNeighbors;
+      DenseSet<Block *> pWithoutNeighbors;
       setDifference(P, neighborsU, pWithoutNeighbors);
 
-      for (Operation *v : pWithoutNeighbors) {
+      for (Block *v : pWithoutNeighbors) {
         // Create new sets for recursion
-        DenseSet<Operation *> rNew = R;
+        DenseSet<Block *> rNew = R;
         rNew.insert(v);
 
-        const DenseSet<Operation *> &neighborsV =
+        const DenseSet<Block *> &neighborsV =
             complementAdjMap.lookup(v);
 
         // new P = P \interset N(v)
-        DenseSet<Operation *> pNew;
+        DenseSet<Block *> pNew;
         setIntersection(P, neighborsV, pNew);
 
         // new X = X \interset N(v)
-        DenseSet<Operation *> xNew;
+        DenseSet<Block *> xNew;
         setIntersection(X, neighborsV, xNew);
 
         bronKerbosch(rNew, pNew, xNew, complementAdjMap,
@@ -2499,22 +2498,25 @@ bool inTheSameChildBlock(scf::ParallelOp parOp, Block *block1, Block *block2) co
     }
 
   private:
-    DenseSet<Operation *> vertices;
-    DenseMap<Operation *, DenseSet<Operation *>> adjacencyMap;
-    DenseMap<Operation *, DenseSet<Operation *>> complementAdjMap;
+    DenseSet<Block *> vertices;
+    DenseMap<Block *, DenseSet<Block *>> adjacencyMap;
+    DenseMap<Block *, DenseSet<Block *>> complementAdjMap;
   };
 
   // Computes the raw traces of a given memory use
   SmallVector<SmallVector<Value>> computeRawTrace(Operation *memUser) const {
     // blocks that can potentially be run in parallel
     DenseSet<Block *> parallelBlocks{memUser->getBlock()};
+    DenseSet<Operation *> potentialOps;
     Value memOperand;
     TypeSwitch<Operation *>(memUser)
         .Case<memref::LoadOp, memref::StoreOp>([&](auto memOp) {
           memOperand = memOp.getMemRef();
           for (auto *otherUser : memOperand.getUsers()) {
-            if (!nonParallel(memUser->getBlock(), otherUser->getBlock()))
+            if (!nonParallel(memUser->getBlock(), otherUser->getBlock())) {
               parallelBlocks.insert(otherUser->getBlock());
+            potentialOps.insert(otherUser);
+          }
             }
         })
         .Default([](Operation *) {
@@ -2524,14 +2526,14 @@ bool inTheSameChildBlock(scf::ParallelOp parOp, Block *block1, Block *block2) co
     DenseSet<Block *> iSetVertices(parallelBlocks.begin(),
                                     parallelBlocks.end());
 
-    DenseMap<Operation *, DenseSet<Block *>> adjacencyMap;
-    for (Operation *vertex : iSetVertices)
-      adjacencyMap[vertex] = DenseSet<Operation *>();
+    DenseMap<Block *, DenseSet<Block *>> adjacencyMap;
+    for (Block *vertex : iSetVertices)
+      adjacencyMap[vertex] = DenseSet<Block *>();
 
     for (auto it = iSetVertices.begin(); it != iSetVertices.end(); ++it) {
       auto it2 = std::next(it);
       for (; it2 != iSetVertices.end(); ++it2) {
-        if (hasConflict(*it, *it2)) {
+        if (nonParallel(*it, *it2)) {
           adjacencyMap[*it].insert(*it2);
           adjacencyMap[*it2].insert(*it);
         }
@@ -2541,10 +2543,13 @@ bool inTheSameChildBlock(scf::ParallelOp parOp, Block *block1, Block *block2) co
     IndependentGraph iSet(iSetVertices, adjacencyMap);
     auto maximalISets = iSet.findAllMaximalISets();
 
+    SmallVector<SmallVector<Operation *, 4>> allCombs;
+    generateOpCombinations(maximalISets, potentialOps, memUser, allCombs);
+
     // TODO: maybe add a boolean to raw traces to indicate if it will potentially
     // modify the memory
     auto rawTraces = llvm::to_vector(
-    llvm::map_range(maximalISets, [&](const auto &innerSet) {
+    llvm::map_range(allCombs, [&](const auto &innerSet) {
         return llvm::to_vector(
             llvm::map_range(innerSet, [&](Operation *op) {
                 return getMemAddr(op);
@@ -2553,6 +2558,86 @@ bool inTheSameChildBlock(scf::ParallelOp parOp, Block *block1, Block *block2) co
 
     return rawTraces;
   }
+
+void generateOpCombinations(
+    const SmallVector<DenseSet<Block*>>& maximalISets,
+    const DenseSet<Operation*>& potentialOps,
+    Operation* memUser,
+    SmallVector<SmallVector<Operation*, 4>>& allCombs) const 
+{
+    Block *memUserBlock = memUser->getBlock();
+    // Iterate over each maximal independent set
+    for (const DenseSet<Block*>& iset : maximalISets)
+    {
+        // Step 2: Initialize the current combination with memUser
+        SmallVector<Operation*, 4> currentComb;
+        currentComb.push_back(memUser);
+
+        // Step 3: Collect eligible operations from other blocks
+        SmallVector<SmallVector<Operation*, 4>, 4> eligibleOpsPerBlock;
+        bool skipSet = false; // Flag to determine if the current set should be skipped
+
+        for (Block* blk : iset)
+        {
+            if (blk == memUserBlock)
+                continue; // Skip the block containing memUser
+
+            // Collect operations from the current block that are in potentialOps
+            SmallVector<Operation*, 4> ops;
+            for (auto &op : blk->getOperations())
+            {
+                if (potentialOps.contains(&op))
+                {
+                    ops.push_back(&op);
+                }
+            }
+
+            // If no eligible operations are found in this block, skip the current set
+            if (ops.empty())
+            {
+                skipSet = true;
+                break;
+            }
+
+            // Add the eligible operations of the current block to the list
+            eligibleOpsPerBlock.push_back(ops);
+        }
+
+        // If any block lacked eligible operations, skip this set
+        if (skipSet)
+        {
+            continue;
+        }
+
+        // Step 4: Generate all combinations using recursive backtracking
+        // Define a lambda function for backtracking
+        std::function<void(unsigned, SmallVector<Operation*, 4>&)> backtrack =
+            [&](unsigned idx, SmallVector<Operation*, 4>& current) {
+                // If all blocks have been processed, add the current combination to allCombs
+                if (idx == eligibleOpsPerBlock.size())
+                {
+                    allCombs.emplace_back(current);
+                    return;
+                }
+
+                // Iterate through all eligible operations in the current block
+                for (Operation* op : eligibleOpsPerBlock[idx])
+                {
+                    // Add the operation to the current combination
+                    current.push_back(op);
+
+                    // Recurse to process the next block
+                    backtrack(idx + 1, current);
+
+                    // Remove the operation to backtrack
+                    current.pop_back();
+                }
+            };
+
+        // Start the backtracking process from the first eligible block
+        backtrack(0, currentComb);
+    }
+}
 
   // TODO: we can turn `Trace` into a class
   SmallVector<SmallVector<Value>>
