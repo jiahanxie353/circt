@@ -2169,46 +2169,6 @@ private:
   using LoopBounds = std::tuple<SmallVector<int64_t>, SmallVector<int64_t>,
                                 SmallVector<int64_t>>;
 
-  LoopBounds getLoopBounds(scf::ParallelOp scfParOp) const {
-    auto getConstantIntValue = [](Value val) -> int64_t {
-      return cast<IntegerAttr>(
-                 cast<arith::ConstantIndexOp>(val.getDefiningOp()).getValue())
-          .getInt();
-    };
-    SmallVector<int64_t> lowerBounds, upperBounds, steps;
-    for (size_t i = 0; i < scfParOp.getNumLoops(); i++) {
-      lowerBounds.push_back(getConstantIntValue(scfParOp.getLowerBound()[i]));
-      upperBounds.push_back(getConstantIntValue(scfParOp.getUpperBound()[i]));
-      steps.push_back(getConstantIntValue(scfParOp.getStep()[i]));
-    }
-    return {lowerBounds, upperBounds, steps};
-  }
-
-  SmallVector<SmallVector<int64_t>>
-  genInductVarCombinations(const SmallVector<int64_t> &lowerBounds,
-                           const SmallVector<int64_t> &upperBounds,
-                           const SmallVector<int64_t> &steps) const {
-    SmallVector<SmallVector<int64_t>> accessIndices;
-    auto numDims = lowerBounds.size();
-    SmallVector<int64_t> currIndices(numDims);
-
-    std::function<void(size_t)> generateCombinations = [&](size_t currDim) {
-      if (currDim == lowerBounds.size()) {
-        accessIndices.push_back(currIndices);
-        return;
-      }
-
-      for (auto s = lowerBounds[currDim]; s < upperBounds[currDim];
-           s += steps[currDim]) {
-        currIndices[currDim] = s;
-        generateCombinations(currDim + 1);
-      }
-    };
-
-    generateCombinations(0);
-    return accessIndices;
-  }
-
   bool isDefinedInsideRegion(Value value, Region *targetRegion) const {
     Operation *definingOp = value.getDefiningOp();
     if (!definingOp) {
@@ -2235,55 +2195,27 @@ private:
     return false;
   }
 
-  std::map<SmallVector<int64_t>, SmallVector<arith::ConstantIndexOp>>
-  createIVConsts(PatternRewriter &rewriter, scf::ParallelOp scfParOp) const {
-    std::map<SmallVector<int64_t>, SmallVector<arith::ConstantIndexOp>>
-        ivToArithConst;
-    SmallVector<int64_t> lowerBounds, upperBounds, steps;
-    std::tie(lowerBounds, upperBounds, steps) = getLoopBounds(scfParOp);
-    auto inductVarCombs =
-        genInductVarCombinations(lowerBounds, upperBounds, steps);
-    rewriter.setInsertionPointToStart(scfParOp.getBody());
-    for (const auto &ivComb : inductVarCombs) {
-      SmallVector<arith::ConstantIndexOp> consts;
-      for (int64_t val : ivComb) {
-        auto constOp =
-            rewriter.create<arith::ConstantIndexOp>(scfParOp.getLoc(), val);
-        consts.push_back(constOp);
-      }
-      ivToArithConst[ivComb] = consts;
-    }
-    llvm::errs() << "created iv consts:\n";
-    for (auto &[ints, indicies] : ivToArithConst) {
-      for (size_t i = 0; i < ints.size(); i++) {
-        llvm::errs() << ints[i] << "\n";
-        indicies[i].dump();
-      }
-    }
-    return ivToArithConst;
-  }
 
   scf::ParallelOp partialEval(PatternRewriter &rewriter,
                               scf::ParallelOp scfParOp) const {
-    DenseMap<Operation *, SmallVector<uint>> memOpAccessIndices;
+    assert(scfParOp.getLoopSteps() && "Parallel loop must have steps");
     auto *body = scfParOp.getBody();
     auto parOpIVs = scfParOp.getInductionVars();
-    assert(scfParOp.getLoopSteps() && "must have steps");
     auto steps = scfParOp.getStep();
     auto lowerBounds = scfParOp.getLowerBound();
     auto upperBounds = scfParOp.getUpperBound();
     rewriter.setInsertionPointAfter(scfParOp);
-    scf::ParallelOp newPloop = scfParOp.cloneWithoutRegions();
-    auto loc = newPloop.getLoc();
-    rewriter.insert(newPloop);
-    OpBuilder insideBuilder(newPloop);
+    scf::ParallelOp newParOp = scfParOp.cloneWithoutRegions();
+    auto loc = newParOp.getLoc();
+    rewriter.insert(newParOp);
+    OpBuilder insideBuilder(newParOp);
     Block *currBlock = nullptr;
-    auto &region = newPloop.getRegion();
+    auto &region = newParOp.getRegion();
     IRMapping operandMap;
 
     std::function<void(SmallVector<int64_t, 4> &, unsigned)>
-        generateCombinations;
-    generateCombinations = [&](SmallVector<int64_t, 4> &indices, unsigned dim) {
+        genIVCombinations;
+    genIVCombinations = [&](SmallVector<int64_t, 4> &indices, unsigned dim) {
       if (dim == lowerBounds.size()) {
         currBlock = &region.emplaceBlock();
         insideBuilder.setInsertionPointToEnd(currBlock);
@@ -2293,26 +2225,30 @@ private:
           operandMap.map(parOpIVs[i], ivConstant);
         }
 
-        for (auto it = body->begin(); it != std::prev(body->end()); ++it) {
+        for (auto it = body->begin(); it != std::prev(body->end()); ++it)
           insideBuilder.clone(*it, operandMap);
-        }
 
         return;
       }
+      auto lb = lowerBounds[dim].getDefiningOp<arith::ConstantIndexOp>();
+      auto ub = upperBounds[dim].getDefiningOp<arith::ConstantIndexOp>();
+      auto stepOp = steps[dim].getDefiningOp<arith::ConstantIndexOp>();
+      assert(lb && ub && stepOp && "Bounds and steps must be constants");
 
-      for (int64_t iv = *getConstantIntValue(lowerBounds[dim]);
-           iv < *getConstantIntValue(upperBounds[dim]);
-           iv += *getConstantIntValue(steps[dim])) {
+      int64_t lbVal = lb.value();
+      int64_t ubVal = ub.value();
+      int64_t stepVal = stepOp.value();
+      for (int64_t iv = lbVal; iv < ubVal; iv += stepVal) {
         indices[dim] = iv;
-        generateCombinations(indices, dim + 1);
+        genIVCombinations(indices, dim + 1);
       }
     };
 
     SmallVector<int64_t, 4> indices(lowerBounds.size());
-    generateCombinations(indices, 0);
+    genIVCombinations(indices, 0);
 
-    rewriter.replaceOp(scfParOp, newPloop);
-    return newPloop;
+    rewriter.replaceOp(scfParOp, newParOp);
+    return newParOp;
   }
 
   std::function<int(Value)> evaluateIndex = [&](Value val) -> int {
@@ -2344,24 +2280,25 @@ private:
     llvm_unreachable("unsupported operation for index evaluation");
   };
 
-  SmallVector<scf::ParallelOp, 4> getAncestorParOps(Operation *op) const {
+  SmallVector<scf::ParallelOp, 4> getAncestorParOps(Block *block) const {
     SmallVector<scf::ParallelOp, 4> ancestors;
-    while (op) {
-      if (auto parallelOp = dyn_cast<scf::ParallelOp>(op)) {
+    Operation *parentOp = block->getParentOp();
+    while (parentOp) {
+      if (auto parallelOp = dyn_cast<scf::ParallelOp>(parentOp)) {
         ancestors.push_back(parallelOp);
       }
-      op = op->getParentOp();
+      parentOp = parentOp->getParentOp();
     }
     return ancestors;
   }
 
   std::optional<scf::ParallelOp>
-  closestCommonAncestorParOp(Operation *op, Operation *anotherOp) const {
-    auto opAncestorPars = getAncestorParOps(op);
-    Operation *anotherParent = anotherOp->getParentOp();
+  closestCommonAncestorParOp(Block *block, Block *anotherBlock) const {
+    auto blockAncestorPars = getAncestorParOps(block);
+    Operation *anotherParent = anotherBlock->getParentOp();
     while (anotherParent) {
       if (auto anotherAncestorPar = dyn_cast<scf::ParallelOp>(anotherParent)) {
-        for (auto ancestorPar : opAncestorPars) {
+        for (auto ancestorPar : blockAncestorPars) {
           if (ancestorPar == anotherAncestorPar)
             return ancestorPar;
         }
@@ -2386,15 +2323,48 @@ private:
     return false;
   }
 
-  bool inTheSameChildBlock(scf::ParallelOp parOp, Operation *op,
-                           Operation *anotherOp) const {
-    bool res = false;
-    for (auto &childBlock : parOp.getRegion().getBlocks()) {
-      res |= (containsOperation(childBlock, op) &&
-              containsOperation(childBlock, anotherOp));
+bool containsBlock(Block &block, Block *nestedBlock) const {
+  for (Operation &nestedOp : block) {
+    for (Region &region : nestedOp.getRegions()) {
+      for (Block &blk : region) {
+        if (&blk == nestedBlock)
+          return true;
+        
+        // Recursively check nested blocks
+        if (containsBlock(blk, nestedBlock))
+          return true;
+      }
     }
-    return res;
   }
+  return false;
+}
+
+bool inTheSameChildBlock(scf::ParallelOp parOp, Block *block1, Block *block2) const {
+  // Check if both blocks are the same block
+  if (block1 == block2)
+    return true;
+
+  // Iterate through child blocks of parOp's region
+  for (auto &childBlock : parOp.getRegion().getBlocks()) {
+    bool inBlock1 = containsBlock(childBlock, block1);
+    bool inBlock2 = containsBlock(childBlock, block2);
+    
+    // If both blocks are in the same child block
+    if (inBlock1 && inBlock2)
+      return true;
+  }
+  return false;
+}
+
+//  bool inTheSameChildBlock(scf::ParallelOp parOp, Operation *op,
+//                           Operation *anotherOp) const {
+//    bool res = false;
+//    for (auto &childBlock : parOp.getRegion().getBlocks()) {
+//      res |= (containsOperation(childBlock, op) &&
+//              containsOperation(childBlock, anotherOp));
+//    }
+//    return res;
+//  }
 
   Value getMemAddr(Operation *memOp) const {
     Value memAddr;
@@ -2413,27 +2383,9 @@ private:
     return memAddr;
   }
 
-  DenseSet<Operation *>
-  getLargestNonConflictingSubset(Operation *newOp,
-                                 const DenseSet<Operation *> &innerSet) const {
-    DenseSet<Operation *> nonConflictingSet;
-    for (Operation *existingOp : innerSet) {
-      bool hasConflict = false;
-      if (auto parOp = closestCommonAncestorParOp(newOp, existingOp)) {
-        if (inTheSameChildBlock(*parOp, newOp, existingOp)) {
-          hasConflict = true;
-        }
-      }
-      if (!hasConflict) {
-        nonConflictingSet.insert(existingOp);
-      }
-    }
-    return nonConflictingSet;
-  }
-
-  bool hasConflict(Operation *newOp, Operation *existingOp) const {
-    if (auto parOp = closestCommonAncestorParOp(newOp, existingOp)) {
-      return inTheSameChildBlock(*parOp, newOp, existingOp);
+  bool nonParallel(Block *block1, Block *block2) const {
+    if (auto parOp = closestCommonAncestorParOp(block1, block2)) {
+      return inTheSameChildBlock(*parOp, block1, block2);
     }
     return true;
   }
@@ -2441,164 +2393,38 @@ private:
   class IndependentGraph {
   public:
     IndependentGraph(
-        SmallVector<Operation *> &inputVertices,
-        SmallVector<std::pair<Operation *, Operation *>> &inputEdges)
-        : vertices(inputVertices) {
-      for (auto edge : inputEdges) {
-        Operation *u = edge.first;
-        Operation *v = edge.second;
-
-        adjMap[u].push_back(v);
-        adjMap[v].push_back(u);
-      }
-    };
-
-    void buildAdjacencyMap(
-        const SmallVector<std::pair<Operation *, Operation *>> &edges,
-        const SmallVector<Operation *> &allVertices,
-        DenseMap<Operation *, SmallPtrSet<Operation *, 4>> &adjacencyMap,
-        DenseMap<Operation *, SmallPtrSet<Operation *, 32>>
-            &complementAdjacencyMap) {
-      // Initialize adjacency map
-      for (Operation *vertex : allVertices) {
-        adjacencyMap[vertex] = SmallPtrSet<Operation *, 4>();
-      }
-
-      // Build adjacency map
-      for (const auto &edge : edges) {
-        Operation *u = edge.first;
-        Operation *v = edge.second;
-
-        adjacencyMap[u].insert(v);
-        adjacencyMap[v].insert(u);
-      }
-
+        DenseSet<Operation *> &inputVertices,
+        DenseMap<Operation *, DenseSet<Operation *>> &inputAdjMap)
+        : vertices(inputVertices), adjacencyMap(inputAdjMap) {
       // Build complement adjacency map
-      SmallPtrSet<Operation *, 32> allVerticesSet(allVertices.begin(),
-                                                  allVertices.end());
-      for (Operation *vertex : allVertices) {
-        SmallPtrSet<Operation *, 32> complementNeighbors = allVerticesSet;
+      DenseSet<Operation *> allVerticesSet(inputVertices.begin(),
+                                                  inputVertices.end());
+      for (Operation *vertex : inputVertices) {
+        DenseSet<Operation *> complementNeighbors = allVerticesSet;
         complementNeighbors.erase(vertex); // Remove self
         // Remove neighbors
         for (Operation *neighbor : adjacencyMap[vertex]) {
           complementNeighbors.erase(neighbor);
         }
-        complementAdjacencyMap[vertex] = complementNeighbors;
+        complementAdjMap[vertex] = complementNeighbors;
       }
-    }
+    };
 
-    std::vector<SmallPtrSet<Operation *, 32>> findAllMaximalISets(
-        SmallVector<std::pair<Operation *, Operation *>> &iSetEdges,
-        SmallVector<Operation *> &potentialOps) {
-      DenseMap<Operation *, SmallPtrSet<Operation *, 4>> adjacencyMap;
-      DenseMap<Operation *, SmallPtrSet<Operation *, 32>>
-          complementAdjacencyMap;
-      buildAdjacencyMap(iSetEdges, potentialOps, adjacencyMap,
-                        complementAdjacencyMap);
+    SmallVector<DenseSet<Operation *>> findAllMaximalISets() const {
 
-      SmallPtrSet<Operation *, 32> R; // Empty set
-      SmallPtrSet<Operation *, 32> P(potentialOps.begin(), potentialOps.end());
-      SmallPtrSet<Operation *, 32> X; // Empty set
-      std::vector<SmallPtrSet<Operation *, 32>> maximalIndependentSets;
+      DenseSet<Operation *> R; // Empty set
+      DenseSet<Operation *> P(vertices.begin(), vertices.end());
+      DenseSet<Operation *> X; // Empty set
+      SmallVector<DenseSet<Operation *>> maximalIndependentSets;
 
-      // Run Bron-Kerbosch algorithm
-      bronKerbosch(R, P, X, complementAdjacencyMap, maximalIndependentSets);
+      bronKerbosch(R, P, X, complementAdjMap, maximalIndependentSets);
       return maximalIndependentSets;
-      //      llvm::errs() << "adj map: \n";
-      //      for (auto &entry : adjMap) {
-      //        Operation *op = entry.first;
-      //        llvm::errs() << op->getName().getStringRef() <<": " <<
-      //        evaluateIndex(getMemAddr(op)) << ": \n"; for (Operation *adjOp :
-      //        entry.second) {
-      //          llvm::errs() << adjOp->getName().getStringRef() << ": " <<
-      //          evaluateIndex(getMemAddr(adjOp)) << " ";
-      //        }
-      //        llvm::errs() << "\n";
-      //      }
-      //      std::set<std::set<Operation *>> maximalISets;
-      //      std::set<Operation *> tempSolnSet;
-      //      llvm::errs() << "vertices size: " << vertices.size() << "\n";
-      //      llvm::errs() << "edges size: " << adjMap.size() << "\n";
-      //      std::set<std::set<Operation *>> allIndependentSets;
-      //      findAllIndependentSets(tempSolnSet, 0, vertices, adjMap,
-      //      allIndependentSets); llvm::errs() << "found all isets\n"; for
-      //      (auto &iSet : allIndependentSets) {
-      //        for (auto elm : iSet) {
-      //          llvm::errs() << evaluateIndex(getMemAddr(elm)) << " ";
-      //        }
-      //        llvm::errs() << "\n";
-      //      }
-      //      for (auto &iSet : allIndependentSets) {
-      //        if (isMaximal(iSet))
-      //          maximalISets.insert(iSet);
-      //      }
-      //
-      //      return maximalISets;
     }
 
-    bool isMaximal(std::set<Operation *> potentialMaxISet) {
-      for (auto *vertex : vertices) {
-        if (potentialMaxISet.find(vertex) == potentialMaxISet.end() &&
-            isSafeForIndepSet(vertex, potentialMaxISet)) {
-          return false;
-        }
-      }
-      return true;
-    }
 
-    void findAllIndependentSets(
-        std::set<Operation *> &currentSet, size_t currentIndex,
-        SmallVector<Operation *> &vertices,
-        DenseMap<Operation *, SmallVector<Operation *>> &adjacencyMap,
-        std::set<std::set<Operation *>> &allIndependentSets) {
-      llvm::errs() << "currV:" << currentIndex << "\n";
-      llvm::errs() << "set Size: " << currentSet.size() << "\n";
-      if (currentIndex >= vertices.size()) {
-        allIndependentSets.insert(currentSet);
-        llvm::errs() << "return currentSet for vertices: \n";
-        for (auto vertex : vertices) {
-          llvm::errs() << vertex->getName().getStringRef() << ": "
-                       << evaluateIndex(getMemAddr(vertex)) << " ";
-        }
-        llvm::errs() << "\n";
-        for (auto elm : currentSet) {
-          llvm::errs() << elm->getName().getStringRef() << ": "
-                       << evaluateIndex(getMemAddr(elm)) << " ";
-        }
-        llvm::errs() << "\n";
-        return;
-      }
-
-      Operation *v = vertices[currentIndex];
-
-      findAllIndependentSets(currentSet, currentIndex + 1, vertices,
-                             adjacencyMap, allIndependentSets);
-
-      bool canInclude = true;
-      for (Operation *u : currentSet) {
-        auto adjIt = adjacencyMap.find(v);
-        if (adjIt != adjacencyMap.end()) {
-          SmallVector<Operation *> &adjacentVertices = adjIt->second;
-          if (std::find(adjacentVertices.begin(), adjacentVertices.end(), u) !=
-              adjacentVertices.end()) {
-            canInclude = false;
-            break;
-          }
-        }
-      }
-
-      if (canInclude) {
-        currentSet.insert(v);
-        llvm::errs() << "can include: " << evaluateIndex(getMemAddr(v)) << "\n";
-        findAllIndependentSets(currentSet, currentIndex + 1, vertices,
-                               adjacencyMap, allIndependentSets);
-        currentSet.erase(v);
-      }
-    }
-
-    void setDifference(const SmallPtrSet<Operation *, 32> &A,
-                       const SmallPtrSet<Operation *, 32> &B,
-                       SmallPtrSet<Operation *, 32> &Result) {
+    void setDifference(const DenseSet<Operation *> &A,
+                       const DenseSet<Operation *> &B,
+                       DenseSet<Operation *> &Result) const {
       for (Operation *op : A) {
         if (!B.contains(op)) {
           Result.insert(op);
@@ -2606,9 +2432,9 @@ private:
       }
     }
 
-    void setIntersection(const SmallPtrSet<Operation *, 32> &A,
-                         const SmallPtrSet<Operation *, 32> &B,
-                         SmallPtrSet<Operation *, 32> &Result) {
+    void setIntersection(const DenseSet<Operation *> &A,
+                         const DenseSet<Operation *> &B,
+                         DenseSet<Operation *> &Result) const {
       for (Operation *op : A) {
         if (B.contains(op)) {
           Result.insert(op);
@@ -2617,57 +2443,53 @@ private:
     }
 
     void bronKerbosch(
-        SmallPtrSet<Operation *, 32> &R, SmallPtrSet<Operation *, 32> &P,
-        SmallPtrSet<Operation *, 32> &X,
-        const DenseMap<Operation *, SmallPtrSet<Operation *, 32>>
-            &complementAdjacencyMap,
-        std::vector<SmallPtrSet<Operation *, 32>> &maximalIndependentSets) {
+        DenseSet<Operation *> &R, DenseSet<Operation *> &P,
+        DenseSet<Operation *> &X,
+        const DenseMap<Operation *, DenseSet<Operation *>>
+            &complementAdjMap,
+        SmallVector<DenseSet<Operation *>> &maximalIndependentSets) const {
       if (P.empty() && X.empty()) {
         // R is a maximal independent set
         maximalIndependentSets.push_back(R);
         return;
       }
 
-      // Choose a pivot vertex u from P ∪ X
-      SmallPtrSet<Operation *, 32> union_PX = P;
-      union_PX.insert(X.begin(), X.end());
+      // Choose a pivot vertex u from P \union X
+      DenseSet<Operation *> unionPX = P;
+      unionPX.insert(X.begin(), X.end());
 
-      if (union_PX.empty()) {
+      if (unionPX.empty()) {
         return;
       }
 
       // Simple pivot selection: choose an arbitrary vertex
-      Operation *u = *union_PX.begin();
+      Operation *u = *unionPX.begin();
 
       // Neighbors of u in the complement graph
-      const SmallPtrSet<Operation *, 32> &neighbors_u =
-          complementAdjacencyMap.lookup(u);
+      const DenseSet<Operation *> &neighborsU =
+          complementAdjMap.lookup(u);
 
-      // P_without_neighbors = P \ N(u)
-      SmallPtrSet<Operation *, 32> P_without_neighbors;
-      setDifference(P, neighbors_u, P_without_neighbors);
+      // p without neighbors = P \ N(u)
+      DenseSet<Operation *> pWithoutNeighbors;
+      setDifference(P, neighborsU, pWithoutNeighbors);
 
-      // Copy of P to avoid modifying it during iteration
-      SmallPtrSet<Operation *, 32> P_copy = P;
-
-      for (Operation *v : P_without_neighbors) {
+      for (Operation *v : pWithoutNeighbors) {
         // Create new sets for recursion
-        SmallPtrSet<Operation *, 32> R_new = R;
-        R_new.insert(v);
+        DenseSet<Operation *> rNew = R;
+        rNew.insert(v);
 
-        const SmallPtrSet<Operation *, 32> &neighbors_v =
-            complementAdjacencyMap.lookup(v);
+        const DenseSet<Operation *> &neighborsV =
+            complementAdjMap.lookup(v);
 
-        // P_new = P ∩ N(v)
-        SmallPtrSet<Operation *, 32> P_new;
-        setIntersection(P, neighbors_v, P_new);
+        // new P = P \interset N(v)
+        DenseSet<Operation *> pNew;
+        setIntersection(P, neighborsV, pNew);
 
-        // X_new = X ∩ N(v)
-        SmallPtrSet<Operation *, 32> X_new;
-        setIntersection(X, neighbors_v, X_new);
+        // new X = X \interset N(v)
+        DenseSet<Operation *> xNew;
+        setIntersection(X, neighborsV, xNew);
 
-        // Recursive call
-        bronKerbosch(R_new, P_new, X_new, complementAdjacencyMap,
+        bronKerbosch(rNew, pNew, xNew, complementAdjMap,
                      maximalIndependentSets);
 
         // Move v from P to X
@@ -2677,165 +2499,64 @@ private:
     }
 
   private:
-    DenseMap<Operation *, SmallVector<Operation *>> adjMap;
-    SmallVector<Operation *> vertices;
-    std::set<std::set<Operation *>> independentSets;
-    std::set<std::set<Operation *>> maximalIndependentSets;
-    bool isSafeForIndepSet(Operation *vertex,
-                           std::set<Operation *> &tempSolnSet) {
-      for (auto *iter : tempSolnSet) {
-        if (std::find(adjMap[vertex].begin(), adjMap[vertex].end(), iter) !=
-            adjMap[vertex].end())
-          return false;
-      }
-      return true;
-    }
-    std::function<int(Value)> evaluateIndex = [&](Value val) -> int {
-      if (auto constIndexOp =
-              dyn_cast<arith::ConstantIndexOp>(val.getDefiningOp()))
-        return constIndexOp.value();
-      if (auto addOp = dyn_cast<arith::AddIOp>(val.getDefiningOp())) {
-        int lhsValue = evaluateIndex(addOp.getLhs());
-        int rhsValue = evaluateIndex(addOp.getRhs());
-        return lhsValue + rhsValue;
-      }
-      if (auto mulOp = dyn_cast<arith::MulIOp>(val.getDefiningOp())) {
-        int lhsValue = evaluateIndex(mulOp.getLhs());
-        int rhsValue = evaluateIndex(mulOp.getRhs());
-        return lhsValue * rhsValue;
-      }
-      if (auto shlIOp = dyn_cast<arith::ShLIOp>(val.getDefiningOp())) {
-        int lhsValue = evaluateIndex(shlIOp.getLhs());
-        int rhsValue = evaluateIndex(shlIOp.getRhs());
-        return lhsValue << rhsValue;
-      }
-      if (auto subIOp = dyn_cast<arith::SubIOp>(val.getDefiningOp())) {
-        int lhsValue = evaluateIndex(subIOp.getLhs());
-        int rhsValue = evaluateIndex(subIOp.getRhs());
-        return lhsValue - rhsValue;
-      }
-      // Add more cases. We can do this only because we would have got error if
-      // we failed to get induction variables as constants.
-      llvm_unreachable("unsupported operation for index evaluation");
-    };
-    Value getMemAddr(Operation *memOp) const {
-      Value memAddr;
-      TypeSwitch<Operation *>(memOp)
-          .Case<memref::LoadOp>([&](memref::LoadOp loadOp) {
-            assert(loadOp.getIndices().size() == 1);
-            memAddr = loadOp.getIndices().front();
-          })
-          .Case<memref::StoreOp>([&](memref::StoreOp storeOp) {
-            assert(storeOp.getIndices().size() == 1);
-            memAddr = storeOp.getIndices().front();
-          })
-          .Default([](Operation *) {
-            llvm_unreachable("Unhandled memory operation type");
-          });
-      return memAddr;
-    }
+    DenseSet<Operation *> vertices;
+    DenseMap<Operation *, DenseSet<Operation *>> adjacencyMap;
+    DenseMap<Operation *, DenseSet<Operation *>> complementAdjMap;
   };
 
-  // Computes the raw traces of a given memory in a step
-  SmallVector<SmallVector<Value>> computeRawTrace(FuncOp funcOp,
-                                                  Operation *memUser) const {
-    // llvm::errs() << "compute raw trace\n";
-    // funcOp.dump();
-    DenseSet<Operation *> potentialOps{memUser};
-    // llvm::errs() << "memUser: " << memUser->getName().getStringRef() << ": "
-    // << evaluateIndex(getMemAddr(memUser)) << "\n";
-    SmallVector<Value> rawTrace;
+  // Computes the raw traces of a given memory use
+  SmallVector<SmallVector<Value>> computeRawTrace(Operation *memUser) const {
+    // blocks that can potentially be run in parallel
+    DenseSet<Block *> parallelBlocks{memUser->getBlock()};
     Value memOperand;
     TypeSwitch<Operation *>(memUser)
-        .Case<memref::LoadOp>([&](memref::LoadOp loadOp) {
-          memOperand = loadOp.getMemRef();
+        .Case<memref::LoadOp, memref::StoreOp>([&](auto memOp) {
+          memOperand = memOp.getMemRef();
           for (auto *otherUser : memOperand.getUsers()) {
-            if (!hasConflict(memUser, otherUser)) {
-              potentialOps.insert(otherUser);
+            if (!nonParallel(memUser->getBlock(), otherUser->getBlock()))
+              parallelBlocks.insert(otherUser->getBlock());
             }
-          }
-        })
-        .Case<memref::StoreOp>([&](memref::StoreOp storeOp) {
-          memOperand = storeOp.getMemRef();
-          for (auto *otherUser : memOperand.getUsers()) {
-            if (!hasConflict(memUser, otherUser)) {
-              potentialOps.insert(otherUser);
-            }
-          }
         })
         .Default([](Operation *) {
           llvm_unreachable("Unhandled memory operation type");
         });
 
-    SmallVector<Operation *> iSetVertices(potentialOps.begin(),
-                                          potentialOps.end());
+    DenseSet<Block *> iSetVertices(parallelBlocks.begin(),
+                                    parallelBlocks.end());
 
-    //    llvm::errs() << "potentialOps: " << iSetVertices.size() << "\n";
-    //    for (auto *potOp : iSetVertices) {
-    //      llvm::errs() << potOp->getName().getStringRef() << ": " <<
-    //      evaluateIndex(getMemAddr(potOp)) << " ";
-    //    }
-    //    llvm::errs() << "\n";
+    DenseMap<Operation *, DenseSet<Block *>> adjacencyMap;
+    for (Operation *vertex : iSetVertices)
+      adjacencyMap[vertex] = DenseSet<Operation *>();
 
-    SmallVector<std::pair<Operation *, Operation *>> iSetEdges;
-    for (auto *it = iSetVertices.begin(); it < iSetVertices.end(); it++) {
-      for (auto *it2 = it + 1; it2 < iSetVertices.end(); it2++) {
-        auto *pOp = *it;
-        auto *pOp2 = *it2;
-        if (hasConflict(pOp, pOp2)) {
-          iSetEdges.push_back(std::make_pair(pOp, pOp2));
-          // llvm::errs() << "adding edge: " << evaluateIndex(getMemAddr(pOp))
-          // << " and: " << evaluateIndex(getMemAddr(pOp2)) << "\n";
+    for (auto it = iSetVertices.begin(); it != iSetVertices.end(); ++it) {
+      auto it2 = std::next(it);
+      for (; it2 != iSetVertices.end(); ++it2) {
+        if (hasConflict(*it, *it2)) {
+          adjacencyMap[*it].insert(*it2);
+          adjacencyMap[*it2].insert(*it);
         }
       }
     }
-    // llvm::errs() << "iset edges size: " << iSetEdges.size() << "\n";
 
-    //    for (auto iSetEdge : iSetEdges) {
-    //      llvm::errs() << "first: " <<
-    //      iSetEdge.first->getName().getStringRef() << ": " <<
-    //      evaluateIndex(getMemAddr(iSetEdge.first)) << "\n"; llvm::errs() <<
-    //      "second: " << iSetEdge.second->getName().getStringRef() << ": " <<
-    //      evaluateIndex(getMemAddr(iSetEdge.second)) << "\n";
-    //    }
-    IndependentGraph iSet(iSetVertices, iSetEdges);
-    auto MIS = iSet.findAllMaximalISets(iSetEdges, iSetVertices);
-    ;
-    //    llvm::errs() << "MIS: \n";
-    //    for (auto &IS : MIS) {
-    //      for (auto *elm : IS) {
-    //        llvm::errs() << elm->getName().getStringRef() << ": " <<
-    //        evaluateIndex(getMemAddr(elm)) << " ";
-    //      }
-    //      llvm::errs() << "\n";
-    //    }
+    IndependentGraph iSet(iSetVertices, adjacencyMap);
+    auto maximalISets = iSet.findAllMaximalISets();
 
-    // TODO: add a boolean to raw traces to indicate if it will potentially
+    // TODO: maybe add a boolean to raw traces to indicate if it will potentially
     // modify the memory
-    SmallVector<SmallVector<Value>> rawTraces;
-    for (auto &innerSet : MIS) {
-      SmallVector<Value> valSet;
-      for (auto *elm : innerSet) {
-        valSet.push_back(getMemAddr(elm));
-      }
-      rawTraces.push_back(valSet);
-    }
-    //     llvm::errs() << "raw traces returning: \n";
-    //     for (auto &innerSet : rawTraces) {
-    //       for(auto elm : innerSet) {
-    //         llvm::errs() << evaluateIndex(elm) << " ";
-    //       }
-    //       llvm::errs() << "\n";
-    //     }
-    // llvm::errs() << "raw traces size after computing: " << rawTrace.size() <<
-    // "\n";
+    auto rawTraces = llvm::to_vector(
+    llvm::map_range(maximalISets, [&](const auto &innerSet) {
+        return llvm::to_vector(
+            llvm::map_range(innerSet, [&](Operation *op) {
+                return getMemAddr(op);
+            }));
+    }));
+
     return rawTraces;
   }
 
   // TODO: we can turn `Trace` into a class
   SmallVector<SmallVector<Value>>
   initCompress(SmallVector<SmallVector<Value>> &unCompressedTraces) const {
-    llvm::errs() << "init compress\n";
     // 1. Remove redundant info: memory access with the same address in the same
     // step
     SmallVector<SmallVector<Value>> redundantRemoved;
@@ -3048,8 +2769,7 @@ private:
                             Operation *memory) const {
     // `nA` is the maximum number of memory accesses in all steps in the
     // compressed memory trace
-    llvm::errs() << "compressedTraces size: " << compressedTraces.size()
-                 << "\n for: \n";
+    llvm::errs() << "compressedTraces in finding masks bits: \n";
     for (const auto &step : compressedTraces) {
       for (const auto trace : step) {
         auto traceInt = evaluateIndex(trace);
@@ -3311,8 +3031,7 @@ private:
     return foundBlockArg;
   }
 
-  // Given `scf.parallel`s (all `step`)s and a memory in the `scf.parallel`s,
-  // computes the addresses to banks mapping
+  // Given `funcOp`, get all `step`s that `memory` might access in parallel, then compute the addresses-to-banks mapping
   void traceBankAlgo(FuncOp funcOp, Operation *memory) const {
     // Raw trace of a given memory at all steps
     Value memRes;
@@ -3334,20 +3053,25 @@ private:
           llvm_unreachable("Unhandled memory operation type");
         });
 
-    // Store the raw trace for each "step" of the given `memory`.
-    // A "step" here is a set of blocks that are the descendant of
-    // the same scf::parallelOp
-    SmallVector<SmallVector<Value>> rawTraces;
     // For each memory use, get all access indices including this use
-    // and the access indices to this memory if current block and
-    // that block are both descendant of the same scfParOp
+    // and the access indices to `memory` if current block and
+    // that block are both descendant of the same scf::parallelOp
     if (!isDefinedInsideRegion(memRes, &funcOp.getRegion())) {
       auto callerFnOp = memRes.getDefiningOp()->getParentOfType<FuncOp>();
       memRes = getCalleeBlockArg(callerFnOp, funcOp, memRes);
     }
 
+    // `rawTraces` store the raw trace for each "step" of the given `memory`.
+    // A "step" here is a set of blocks that are the descendant of
+    // the same scf::parallelOp b/c the partial evaluation step
+    // separate parallel operations to multiple blocks based on
+    // the induction variables.
+    // A memory "trace" is a sequence of addresses that are grouped into steps.
+    SmallVector<SmallVector<Value>> rawTraces;
     for (auto *user : memRes.getUsers()) {
-      auto rawTrace = computeRawTrace(funcOp, user);
+      // For each `use` of the allocated `memory` result,
+      // compute its trace
+      auto rawTrace = computeRawTrace(user);
       rawTraces.append(rawTrace.begin(), rawTrace.end());
     }
 
