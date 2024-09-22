@@ -49,6 +49,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <bitset>
+#include <cstdint>
 #include <fstream>
 
 #include <limits>
@@ -1750,9 +1751,9 @@ public:
       auto *jsonObj = availBanksJsonValue.getAsObject();
       auto *banks = jsonObj->getArray("banks");
       uint availableBanks = 0;
-      if (auto bankOpt = (*banks)[memNum.at(origMemDef)].getAsInteger()) {
+      if (auto bankOpt = (*banks)[memNum.at(origMemDef)].getAsInteger())
         availableBanks = *bankOpt;
-      } else {
+      else {
         std::string dumpStr;
         llvm::raw_string_ostream dumpStream(dumpStr);
         origMemDef->print(dumpStream);
@@ -1852,21 +1853,6 @@ public:
         return banks;
       };
 
-      auto updateFnType = [&](FuncOp funcOp,
-                              SmallVector<Value> &banks) -> FunctionType {
-        SmallVector<Type, 4> updatedCurFnArgTys(funcOp.getArgumentTypes());
-        SmallVector<Type, 4> memBankArgTys;
-        for (auto bank : banks) {
-          funcOp.getBody().addArgument(bank.getType(), funcOp.getLoc());
-          memBankArgTys.push_back(bank.getType());
-        }
-
-        updatedCurFnArgTys.append(memBankArgTys.begin(), memBankArgTys.end());
-
-        return FunctionType::get(funcOp.getContext(), updatedCurFnArgTys,
-                                 funcOp.getResultTypes());
-      };
-
       auto eraseOperandInCallerCallees = [&](ModuleOp moduleOp, FuncOp callee,
                                              Value operand) {
         SmallVector<Type, 4> updatedCurFnArgTys(callee.getArgumentTypes());
@@ -1898,24 +1884,6 @@ public:
                                  callee.getFunctionType().getResults());
       };
 
-      auto updateCallSites = [&](ModuleOp moduleOp, FuncOp callee,
-                                 SmallVector<Value> &newOperands) {
-        moduleOp.walk([&](FuncOp otherFn) {
-          otherFn.walk([&](mlir::Operation *op) {
-            if (auto callOp = dyn_cast<CallOp>(op)) {
-              if (callOp.getCallee() == callee.getName()) {
-                SmallVector<Value> callerOperands(callOp.getOperands());
-                callerOperands.append(newOperands);
-                callOp->setOperands(callerOperands);
-                assert(callOp.getNumOperands() == callee.getNumArguments() &&
-                       "number of operands and block arguments should match "
-                       "after appending new memory banks");
-              }
-            }
-          });
-        });
-      };
-
       auto findNewMemRef = [&](FuncOp caller, FuncOp callee,
                                Value newMemRef) -> std::optional<Value> {
         std::optional<Value> foundValue;
@@ -1936,210 +1904,149 @@ public:
 
       auto replaceMemoryOp = [&](Operation *memOp, Value newMemRef,
                                  Value newAddr, IRMapping mapping) {
-        if (auto loadOp = dyn_cast<memref::LoadOp>(memOp)) {
-          Value newLoadResult = rewriter.replaceOpWithNewOp<memref::LoadOp>(
-              loadOp, newMemRef, SmallVector<Value>{newAddr});
-          mapping.map(loadOp.getResult(), newLoadResult);
-        } else if (auto storeOp = dyn_cast<memref::StoreOp>(memOp)) {
-          rewriter.replaceOpWithNewOp<memref::StoreOp>(
-              storeOp, storeOp.getValue(), newMemRef,
-              SmallVector<Value>{newAddr});
-        }
+        TypeSwitch<Operation *>(memOp)
+            .Case<memref::LoadOp>([&](memref::LoadOp loadOp) {
+              Value newLoadResult = rewriter.replaceOpWithNewOp<memref::LoadOp>(
+                  loadOp, newMemRef, SmallVector<Value>{newAddr});
+              mapping.map(loadOp.getResult(), newLoadResult);
+            })
+            .Case<memref::StoreOp>([&](memref::StoreOp storeOp) {
+              rewriter.replaceOpWithNewOp<memref::StoreOp>(
+                  storeOp, storeOp.getValue(), newMemRef,
+                  SmallVector<Value>{newAddr});
+            })
+            .Default([](Operation *) {
+              llvm_unreachable("Unhandled memory operation type");
+            });
       };
 
       auto topLevelFn = cast<FuncOp>(SymbolTable::lookupSymbolIn(
           moduleOp, loweringState().getTopLevelFunction()));
 
-      if (auto loadOp = dyn_cast<memref::LoadOp>(user)) {
-        assert(loadOp.getIndices().size() == 1);
-        accessIndex = loadOp.getIndices().front();
-        bankID = getBankOfMemAccess(origMemDef, accessIndex);
+      TypeSwitch<Operation *>(user)
+          .Case<memref::LoadOp, memref::StoreOp>([&](auto memUserOp) {
+            assert(memUserOp.getIndices().size() == 1);
+            accessIndex = memUserOp.getIndices().front();
+            bankID = getBankOfMemAccess(origMemDef, accessIndex);
 
-        if (getBanksForMem(origMemDef).empty()) {
-          auto allocatedBanks =
-              allocateBanks(loadOp, cast<MemRefType>(loadOp.getMemRefType()),
-                            &topLevelFn.getBlocks()
-                                 .front()); // we assume there is only one block
-                                            // in the top-level function
-          SmallVector<Value> allocatedResults;
-          for (auto *memOp : allocatedBanks) {
-            TypeSwitch<Operation *>(memOp)
-                .Case<memref::AllocOp>([&](memref::AllocOp allocOp) {
-                  allocatedResults.push_back(allocOp.getResult());
-                })
-                .Case<memref::GetGlobalOp>(
-                    [&](memref::GetGlobalOp getGlobalOp) {
-                      allocatedResults.push_back(getGlobalOp.getResult());
-                    });
-          }
-          setBanksForMem(origMemDef, allocatedBanks);
+            if (getBanksForMem(origMemDef).empty()) {
+              auto allocatedBanks = allocateBanks(
+                  memUserOp, cast<MemRefType>(memUserOp.getMemRefType()),
+                  &topLevelFn.getBlocks()
+                       .front()); // we assume there is only one block
+                                  // in the top-level function
+              SmallVector<Value> allocatedResults;
+              for (auto *memOp : allocatedBanks) {
+                TypeSwitch<Operation *>(memOp)
+                    .template Case<memref::AllocOp>(
+                        [&](memref::AllocOp allocOp) {
+                          allocatedResults.push_back(allocOp.getResult());
+                        })
+                    .template Case<memref::GetGlobalOp>(
+                        [&](memref::GetGlobalOp getGlobalOp) {
+                          allocatedResults.push_back(getGlobalOp.getResult());
+                        });
+              }
+              setBanksForMem(origMemDef, allocatedBanks);
 
-          rewriter.setInsertionPoint(loadOp);
-          Value constDivVal = rewriter
-                                  .create<arith::ConstantOp>(
-                                      rewriter.getUnknownLoc(),
-                                      rewriter.getIndexAttr(availableBanks))
-                                  .getResult();
-          Value newAddr = rewriter
-                              .create<arith::DivUIOp>(rewriter.getUnknownLoc(),
-                                                      accessIndex, constDivVal)
-                              .getResult();
-          Value newMemRef = getBankForMemAndID(origMemDef, bankID);
+              auto newAddr = insertNewAddress(rewriter, memUserOp, accessIndex,
+                                              availableBanks);
+              Value newMemRef = getBankForMemAndID(origMemDef, bankID);
 
-          if (topLevelFn.getName() != funcOp.getName()) {
-            auto newFnType = updateFnType(funcOp, allocatedResults);
-            funcOp.setType(newFnType);
+              if (topLevelFn.getName() != funcOp.getName()) {
+                auto newFnType = calyx::updateFnType(funcOp, allocatedResults);
+                funcOp.setType(newFnType);
 
-            updateCallSites(moduleOp, funcOp, allocatedResults);
-          }
+                calyx::updateCallSites(moduleOp, funcOp, allocatedResults);
+              }
 
-          if (isa<BlockArgument>(memOperand)) {
-            if (auto foundValue = findNewMemRef(topLevelFn, funcOp, newMemRef))
-              newMemRef = *foundValue;
-          }
+              if (isa<BlockArgument>(memOperand)) {
+                if (auto foundValue =
+                        findNewMemRef(topLevelFn, funcOp, newMemRef))
+                  newMemRef = *foundValue;
+              }
 
-          replaceMemoryOp(loadOp, newMemRef, newAddr, mapping);
-        } else {
-          rewriter.setInsertionPoint(loadOp);
-          Value constDivVal = rewriter
-                                  .create<arith::ConstantOp>(
-                                      rewriter.getUnknownLoc(),
-                                      rewriter.getIndexAttr(availableBanks))
-                                  .getResult();
-          Value newAddr = rewriter
-                              .create<arith::DivUIOp>(rewriter.getUnknownLoc(),
-                                                      accessIndex, constDivVal)
-                              .getResult();
-          Value newMemRef = getBankForMemAndID(origMemDef, bankID);
-          if (isa<BlockArgument>(memOperand)) {
-            if (auto foundValue = findNewMemRef(topLevelFn, funcOp, newMemRef))
-              newMemRef = *foundValue;
-          }
-
-          replaceMemoryOp(loadOp, newMemRef, newAddr, mapping);
-          if (memOperand.use_empty()) {
-            if (memOperand.getDefiningOp()) {
-              if (auto getGlobalOp = dyn_cast<memref::GetGlobalOp>(
-                      memOperand.getDefiningOp())) {
-                auto *symbolTableOp =
-                    getGlobalOp
-                        ->getParentWithTrait<mlir::OpTrait::SymbolTable>();
-                auto globalOp = dyn_cast_or_null<memref::GlobalOp>(
-                    SymbolTable::lookupSymbolIn(symbolTableOp,
-                                                getGlobalOp.getNameAttr()));
-                getGlobalOp->remove();
-                globalOp->remove();
-              } else
-                memOperand.getDefiningOp()->remove();
+              replaceMemoryOp(memUserOp, newMemRef, newAddr, mapping);
             } else {
-              auto newFnType = eraseOperandInCallerCallees(
-                  moduleOp, funcOp, origMemDef->getResult(0));
-              funcOp.setFunctionType(newFnType);
+              auto newAddr = insertNewAddress(rewriter, memUserOp, accessIndex,
+                                              availableBanks);
+              Value newMemRef = getBankForMemAndID(origMemDef, bankID);
+              if (isa<BlockArgument>(memOperand)) {
+                if (auto foundValue =
+                        findNewMemRef(topLevelFn, funcOp, newMemRef))
+                  newMemRef = *foundValue;
+              }
+
+              replaceMemoryOp(memUserOp, newMemRef, newAddr, mapping);
+              if (memOperand.use_empty()) {
+                if (memOperand.getDefiningOp()) {
+                  if (auto getGlobalOp = dyn_cast<memref::GetGlobalOp>(
+                          memOperand.getDefiningOp())) {
+                    auto *symbolTableOp =
+                        getGlobalOp
+                            ->getParentWithTrait<mlir::OpTrait::SymbolTable>();
+                    auto globalOp = dyn_cast_or_null<memref::GlobalOp>(
+                        SymbolTable::lookupSymbolIn(symbolTableOp,
+                                                    getGlobalOp.getNameAttr()));
+                    getGlobalOp->remove();
+                    globalOp->remove();
+                  } else
+                    memOperand.getDefiningOp()->remove();
+                } else {
+                  auto newFnType = eraseOperandInCallerCallees(
+                      moduleOp, funcOp, origMemDef->getResult(0));
+                  funcOp.setFunctionType(newFnType);
+                }
+              }
             }
-          }
-        }
-      } else if (auto storeOp = dyn_cast<memref::StoreOp>(user)) {
-        assert(storeOp.getIndices().size() == 1);
-        accessIndex = storeOp.getIndices().front();
-        bankID = getBankOfMemAccess(origMemDef, accessIndex);
-
-        if (getBanksForMem(origMemDef).empty()) {
-          auto allocatedBanks =
-              allocateBanks(storeOp, cast<MemRefType>(storeOp.getMemRefType()),
-                            &topLevelFn.getBlocks()
-                                 .front()); // we assume there is only one block
-                                            // in the top-level function
-          SmallVector<Value> allocatedResults;
-          for (auto *memOp : allocatedBanks) {
-            TypeSwitch<Operation *>(memOp)
-                .Case<memref::AllocOp>([&](memref::AllocOp allocOp) {
-                  allocatedResults.push_back(allocOp.getResult());
-                })
-                .Case<memref::GetGlobalOp>(
-                    [&](memref::GetGlobalOp getGlobalOp) {
-                      allocatedResults.push_back(getGlobalOp.getResult());
-                    });
-          }
-          setBanksForMem(origMemDef, allocatedBanks);
-
-          rewriter.setInsertionPoint(storeOp);
-          Value constDivVal = rewriter
-                                  .create<arith::ConstantOp>(
-                                      rewriter.getUnknownLoc(),
-                                      rewriter.getIndexAttr(availableBanks))
-                                  .getResult();
-          Value newAddr = rewriter
-                              .create<arith::DivUIOp>(rewriter.getUnknownLoc(),
-                                                      accessIndex, constDivVal)
-                              .getResult();
-          Value newMemRef = getBankForMemAndID(origMemDef, bankID);
-
-          if (topLevelFn.getName() != funcOp.getName()) {
-            auto newFnType = updateFnType(funcOp, allocatedResults);
-            funcOp.setType(newFnType);
-
-            updateCallSites(moduleOp, funcOp, allocatedResults);
-          }
-
-          if (isa<BlockArgument>(memOperand)) {
-            if (auto foundValue = findNewMemRef(topLevelFn, funcOp, newMemRef))
-              newMemRef = *foundValue;
-          }
-
-          replaceMemoryOp(storeOp, newMemRef, newAddr, mapping);
-        } else {
-          rewriter.setInsertionPoint(storeOp);
-          Value constDivVal = rewriter
-                                  .create<arith::ConstantOp>(
-                                      rewriter.getUnknownLoc(),
-                                      rewriter.getIndexAttr(availableBanks))
-                                  .getResult();
-          Value newAddr = rewriter
-                              .create<arith::DivUIOp>(rewriter.getUnknownLoc(),
-                                                      accessIndex, constDivVal)
-                              .getResult();
-          Value newMemRef = getBankForMemAndID(origMemDef, bankID);
-          if (isa<BlockArgument>(memOperand)) {
-            if (auto foundValue = findNewMemRef(topLevelFn, funcOp, newMemRef))
-              newMemRef = *foundValue;
-          }
-
-          replaceMemoryOp(storeOp, newMemRef, newAddr, mapping);
-
-          if (memOperand.use_empty()) {
-            if (memOperand.getDefiningOp()) {
-              if (auto getGlobalOp = dyn_cast<memref::GetGlobalOp>(
-                      memOperand.getDefiningOp())) {
-                auto *symbolTableOp =
-                    getGlobalOp
-                        ->getParentWithTrait<mlir::OpTrait::SymbolTable>();
-                auto globalOp = dyn_cast_or_null<memref::GlobalOp>(
-                    SymbolTable::lookupSymbolIn(symbolTableOp,
-                                                getGlobalOp.getNameAttr()));
-                getGlobalOp->remove();
-                globalOp->remove();
-              } else
-                memOperand.getDefiningOp()->remove();
-            } else {
-              auto newFnType = eraseOperandInCallerCallees(
-                  moduleOp, funcOp, origMemDef->getResult(0));
-              funcOp.setFunctionType(newFnType);
-            }
-          }
-        }
-      } else
-        llvm_unreachable("cannot reach this memref operation");
+          })
+          .Default([](Operation *) {
+            llvm_unreachable("Unhandled memory operation type");
+          });
     }
-    // llvm::errs() << "after replacing with new memory access indices\n";
-
-    llvm::errs() << "lowering result: \n";
-    moduleOp.dump();
 
     return res;
   };
 
 private:
+  class MaximalISetsCache {
+  public:
+    std::vector<std::set<Block *>>
+    getMaximalISets(const std::vector<Block *> &blocks,
+                    const std::unordered_map<Block *, std::set<Block *>>
+                        &complementAdjacencyMap) {
+      auto it = cache.find(blocks);
+      if (it != cache.end()) {
+        return it->second;
+      }
+
+      calyx::CliqueGraph<Block *> cliqueGraph(complementAdjacencyMap);
+
+      std::vector<std::set<Block *>> maximalIndependentSets =
+          cliqueGraph.findAllMaximalCliques();
+
+      cache[blocks] = maximalIndependentSets;
+      return maximalIndependentSets;
+    }
+
+  private:
+    struct BlocksVecHash {
+      std::size_t operator()(const std::vector<Block *> &blocks) const {
+        std::size_t seed = blocks.size();
+        for (Block *b : blocks) {
+          seed ^=
+              std::hash<Block *>()(b) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        }
+        return seed;
+      }
+    };
+    std::unordered_map<std::vector<Block *>, std::vector<std::set<Block *>>,
+                       BlocksVecHash>
+        cache;
+  };
+
   mutable DenseMap<Operation *, int> memNum;
+  mutable MaximalISetsCache maximalISetsCache;
   llvm::json::Value availBanksJsonValue;
   llvm::json::Value parseJsonFile(const std::string &fileName) const {
     std::string adjustedFileName = fileName;
@@ -2165,9 +2072,23 @@ private:
     return std::move(*jsonResult);
   }
 
-  mutable SmallVector<FuncOp> parFuncs;
-  using LoopBounds = std::tuple<SmallVector<int64_t>, SmallVector<int64_t>,
-                                SmallVector<int64_t>>;
+  Value insertNewAddress(PatternRewriter &rewriter, Operation *op,
+                         Value accessIndex, unsigned availableBanks) const {
+    rewriter.setInsertionPoint(op);
+
+    Value constDivVal =
+        rewriter
+            .create<arith::ConstantOp>(rewriter.getUnknownLoc(),
+                                       rewriter.getIndexAttr(availableBanks))
+            .getResult();
+
+    Value newAddr = rewriter
+                        .create<arith::DivUIOp>(rewriter.getUnknownLoc(),
+                                                accessIndex, constDivVal)
+                        .getResult();
+
+    return newAddr;
+  }
 
   bool isDefinedInsideRegion(Value value, Region *targetRegion) const {
     Operation *definingOp = value.getDefiningOp();
@@ -2195,7 +2116,6 @@ private:
     return false;
   }
 
-
   scf::ParallelOp partialEval(PatternRewriter &rewriter,
                               scf::ParallelOp scfParOp) const {
     assert(scfParOp.getLoopSteps() && "Parallel loop must have steps");
@@ -2213,8 +2133,7 @@ private:
     auto &region = newParOp.getRegion();
     IRMapping operandMap;
 
-    std::function<void(SmallVector<int64_t, 4> &, unsigned)>
-        genIVCombinations;
+    std::function<void(SmallVector<int64_t, 4> &, unsigned)> genIVCombinations;
     genIVCombinations = [&](SmallVector<int64_t, 4> &indices, unsigned dim) {
       if (dim == lowerBounds.size()) {
         currBlock = &region.emplaceBlock();
@@ -2252,32 +2171,40 @@ private:
   }
 
   std::function<int(Value)> evaluateIndex = [&](Value val) -> int {
-    if (auto constIndexOp =
-            dyn_cast<arith::ConstantIndexOp>(val.getDefiningOp()))
-      return constIndexOp.value();
-    if (auto addOp = dyn_cast<arith::AddIOp>(val.getDefiningOp())) {
-      int lhsValue = evaluateIndex(addOp.getLhs());
-      int rhsValue = evaluateIndex(addOp.getRhs());
-      return lhsValue + rhsValue;
-    }
-    if (auto mulOp = dyn_cast<arith::MulIOp>(val.getDefiningOp())) {
-      int lhsValue = evaluateIndex(mulOp.getLhs());
-      int rhsValue = evaluateIndex(mulOp.getRhs());
-      return lhsValue * rhsValue;
-    }
-    if (auto shlIOp = dyn_cast<arith::ShLIOp>(val.getDefiningOp())) {
-      int lhsValue = evaluateIndex(shlIOp.getLhs());
-      int rhsValue = evaluateIndex(shlIOp.getRhs());
-      return lhsValue << rhsValue;
-    }
-    if (auto subIOp = dyn_cast<arith::SubIOp>(val.getDefiningOp())) {
-      int lhsValue = evaluateIndex(subIOp.getLhs());
-      int rhsValue = evaluateIndex(subIOp.getRhs());
-      return lhsValue - rhsValue;
-    }
-    // Add more cases. We can do this only because we would have got error if we
-    // failed to get induction variables as constants.
-    llvm_unreachable("unsupported operation for index evaluation");
+    Operation *op = val.getDefiningOp();
+    if (!op)
+      llvm_unreachable("Value is not defined by any operation");
+
+    return TypeSwitch<Operation *, int>(op)
+        .Case<arith::ConstantIndexOp>(
+            [](arith::ConstantIndexOp constOp) -> int {
+              return constOp.value();
+            })
+        .Case<arith::AddIOp>([&](arith::AddIOp addOp) -> int {
+          int lhs = evaluateIndex(addOp.getLhs());
+          int rhs = evaluateIndex(addOp.getRhs());
+          return lhs + rhs;
+        })
+        .Case<arith::MulIOp>([&](arith::MulIOp mulOp) -> int {
+          int lhs = evaluateIndex(mulOp.getLhs());
+          int rhs = evaluateIndex(mulOp.getRhs());
+          return lhs * rhs;
+        })
+        .Case<arith::ShLIOp>([&](arith::ShLIOp shlOp) -> int {
+          int lhs = evaluateIndex(shlOp.getLhs());
+          int rhs = evaluateIndex(shlOp.getRhs());
+          return lhs << rhs;
+        })
+        .Case<arith::SubIOp>([&](arith::SubIOp subOp) -> int {
+          int lhs = evaluateIndex(subOp.getLhs());
+          int rhs = evaluateIndex(subOp.getRhs());
+          return lhs - rhs;
+        })
+        // Add more cases. We can do this only because we would have got error
+        // if we failed to get induction variables as constants.
+        .Default([&](Operation *) -> int {
+          llvm_unreachable("unsupported operation for index evaluation");
+        });
   };
 
   SmallVector<scf::ParallelOp, 4> getAncestorParOps(Block *block) const {
@@ -2308,14 +2235,15 @@ private:
     return std::nullopt;
   }
 
-  bool containsOperation(Block &block, Operation *op) const {
+  bool containsBlock(Block &block, Block *nestedBlock) const {
     for (Operation &nestedOp : block) {
-      if (&nestedOp == op)
-        return true;
-
       for (Region &region : nestedOp.getRegions()) {
-        for (Block &nestedBlock : region) {
-          if (containsOperation(nestedBlock, op))
+        for (Block &blk : region) {
+          if (&blk == nestedBlock)
+            return true;
+
+          // Recursively check nested blocks
+          if (containsBlock(blk, nestedBlock))
             return true;
         }
       }
@@ -2323,48 +2251,23 @@ private:
     return false;
   }
 
-bool containsBlock(Block &block, Block *nestedBlock) const {
-  for (Operation &nestedOp : block) {
-    for (Region &region : nestedOp.getRegions()) {
-      for (Block &blk : region) {
-        if (&blk == nestedBlock)
-          return true;
-        
-        // Recursively check nested blocks
-        if (containsBlock(blk, nestedBlock))
-          return true;
-      }
-    }
-  }
-  return false;
-}
-
-bool inTheSameChildBlock(scf::ParallelOp parOp, Block *block1, Block *block2) const {
-  // Check if both blocks are the same block
-  if (block1 == block2)
-    return true;
-
-  // Iterate through child blocks of parOp's region
-  for (auto &childBlock : parOp.getRegion().getBlocks()) {
-    bool inBlock1 = containsBlock(childBlock, block1);
-    bool inBlock2 = containsBlock(childBlock, block2);
-    
-    // If both blocks are in the same child block
-    if (inBlock1 && inBlock2)
+  bool inTheSameChildBlock(scf::ParallelOp parOp, Block *block1,
+                           Block *block2) const {
+    // Check if both blocks are the same block
+    if (block1 == block2)
       return true;
-  }
-  return false;
-}
 
-//  bool inTheSameChildBlock(scf::ParallelOp parOp, Operation *op,
-//                           Operation *anotherOp) const {
-//    bool res = false;
-//    for (auto &childBlock : parOp.getRegion().getBlocks()) {
-//      res |= (containsOperation(childBlock, op) &&
-//              containsOperation(childBlock, anotherOp));
-//    }
-//    return res;
-//  }
+    // Iterate through child blocks of parOp's region
+    for (auto &childBlock : parOp.getRegion().getBlocks()) {
+      bool inBlock1 = containsBlock(childBlock, block1);
+      bool inBlock2 = containsBlock(childBlock, block2);
+
+      // If both blocks are in the same child block
+      if (inBlock1 && inBlock2)
+        return true;
+    }
+    return false;
+  }
 
   Value getMemAddr(Operation *memOp) const {
     Value memAddr;
@@ -2390,124 +2293,11 @@ bool inTheSameChildBlock(scf::ParallelOp parOp, Block *block1, Block *block2) co
     return true;
   }
 
-  class IndependentGraph {
-  public:
-    IndependentGraph(
-        DenseSet<Block *> &inputVertices,
-        DenseMap<Block *, DenseSet<Block *>> &inputAdjMap)
-        : vertices(inputVertices), adjacencyMap(inputAdjMap) {
-      // Build complement adjacency map
-      DenseSet<Block *> allVerticesSet(inputVertices.begin(),
-                                                  inputVertices.end());
-      for (Block *vertex : inputVertices) {
-        DenseSet<Block *> complementNeighbors = allVerticesSet;
-        complementNeighbors.erase(vertex); // Remove self
-        // Remove neighbors
-        for (Block *neighbor : adjacencyMap[vertex]) {
-          complementNeighbors.erase(neighbor);
-        }
-        complementAdjMap[vertex] = complementNeighbors;
-      }
-    };
-
-    SmallVector<DenseSet<Block *>> findAllMaximalISets() const {
-
-      DenseSet<Block *> R; // Empty set
-      DenseSet<Block *> P(vertices.begin(), vertices.end());
-      DenseSet<Block *> X; // Empty set
-      SmallVector<DenseSet<Block *>> maximalIndependentSets;
-
-      bronKerbosch(R, P, X, complementAdjMap, maximalIndependentSets);
-      return maximalIndependentSets;
-    }
-
-    void setDifference(const DenseSet<Block *> &A,
-                       const DenseSet<Block *> &B,
-                       DenseSet<Block *> &Result) const {
-      for (Block *op : A) {
-        if (!B.contains(op)) {
-          Result.insert(op);
-        }
-      }
-    }
-
-    void setIntersection(const DenseSet<Block *> &A,
-                         const DenseSet<Block *> &B,
-                         DenseSet<Block *> &Result) const {
-      for (Block *op : A) {
-        if (B.contains(op)) {
-          Result.insert(op);
-        }
-      }
-    }
-
-    void bronKerbosch(
-        DenseSet<Block *> &R, DenseSet<Block *> &P,
-        DenseSet<Block *> &X,
-        const DenseMap<Block *, DenseSet<Block *>>
-            &complementAdjMap,
-        SmallVector<DenseSet<Block *>> &maximalIndependentSets) const {
-      if (P.empty() && X.empty()) {
-        // R is a maximal independent set
-        maximalIndependentSets.push_back(R);
-        return;
-      }
-
-      // Choose a pivot vertex u from P \union X
-      DenseSet<Block *> unionPX = P;
-      unionPX.insert(X.begin(), X.end());
-
-      if (unionPX.empty()) {
-        return;
-      }
-
-      // Simple pivot selection: choose an arbitrary vertex
-      Block *u = *unionPX.begin();
-
-      // Neighbors of u in the complement graph
-      const DenseSet<Block *> &neighborsU =
-          complementAdjMap.lookup(u);
-
-      // p without neighbors = P \ N(u)
-      DenseSet<Block *> pWithoutNeighbors;
-      setDifference(P, neighborsU, pWithoutNeighbors);
-
-      for (Block *v : pWithoutNeighbors) {
-        // Create new sets for recursion
-        DenseSet<Block *> rNew = R;
-        rNew.insert(v);
-
-        const DenseSet<Block *> &neighborsV =
-            complementAdjMap.lookup(v);
-
-        // new P = P \interset N(v)
-        DenseSet<Block *> pNew;
-        setIntersection(P, neighborsV, pNew);
-
-        // new X = X \interset N(v)
-        DenseSet<Block *> xNew;
-        setIntersection(X, neighborsV, xNew);
-
-        bronKerbosch(rNew, pNew, xNew, complementAdjMap,
-                     maximalIndependentSets);
-
-        // Move v from P to X
-        P.erase(v);
-        X.insert(v);
-      }
-    }
-
-  private:
-    DenseSet<Block *> vertices;
-    DenseMap<Block *, DenseSet<Block *>> adjacencyMap;
-    DenseMap<Block *, DenseSet<Block *>> complementAdjMap;
-  };
-
   // Computes the raw traces of a given memory use
   SmallVector<SmallVector<Value>> computeRawTrace(Operation *memUser) const {
     // blocks that can potentially be run in parallel
     DenseSet<Block *> parallelBlocks{memUser->getBlock()};
-    DenseSet<Operation *> potentialOps;
+    std::set<Operation *> potentialOps;
     Value memOperand;
     TypeSwitch<Operation *>(memUser)
         .Case<memref::LoadOp, memref::StoreOp>([&](auto memOp) {
@@ -2515,16 +2305,16 @@ bool inTheSameChildBlock(scf::ParallelOp parOp, Block *block1, Block *block2) co
           for (auto *otherUser : memOperand.getUsers()) {
             if (!nonParallel(memUser->getBlock(), otherUser->getBlock())) {
               parallelBlocks.insert(otherUser->getBlock());
-            potentialOps.insert(otherUser);
-          }
+              potentialOps.insert(otherUser);
             }
+          }
         })
         .Default([](Operation *) {
           llvm_unreachable("Unhandled memory operation type");
         });
 
     DenseSet<Block *> iSetVertices(parallelBlocks.begin(),
-                                    parallelBlocks.end());
+                                   parallelBlocks.end());
 
     DenseMap<Block *, DenseSet<Block *>> adjacencyMap;
     for (Block *vertex : iSetVertices)
@@ -2540,104 +2330,122 @@ bool inTheSameChildBlock(scf::ParallelOp parOp, Block *block1, Block *block2) co
       }
     }
 
-    IndependentGraph iSet(iSetVertices, adjacencyMap);
-    auto maximalISets = iSet.findAllMaximalISets();
+    std::unordered_map<Block *, std::set<Block *>> complementAdjacencyMap;
+    for (Block *vertex : iSetVertices) {
+      std::set<Block *> complementNeighbors(iSetVertices.begin(),
+                                            iSetVertices.end());
+      complementNeighbors.erase(vertex);
 
-    SmallVector<SmallVector<Operation *, 4>> allCombs;
+      for (Block *neighbor : adjacencyMap[vertex]) {
+        complementNeighbors.erase(neighbor);
+      }
+
+      complementAdjacencyMap[vertex] = complementNeighbors;
+    }
+    calyx::CliqueGraph<Block *> cliqueGraph(complementAdjacencyMap);
+
+    std::vector<Block *> blocksVec(parallelBlocks.begin(),
+                                   parallelBlocks.end());
+    std::sort(blocksVec.begin(), blocksVec.end());
+    auto maximalISets =
+        maximalISetsCache.getMaximalISets(blocksVec, complementAdjacencyMap);
+
+    std::vector<std::vector<Operation *>> allCombs;
     generateOpCombinations(maximalISets, potentialOps, memUser, allCombs);
 
-    // TODO: maybe add a boolean to raw traces to indicate if it will potentially
-    // modify the memory
-    auto rawTraces = llvm::to_vector(
-    llvm::map_range(allCombs, [&](const auto &innerSet) {
-        return llvm::to_vector(
-            llvm::map_range(innerSet, [&](Operation *op) {
-                return getMemAddr(op);
-            }));
-    }));
+    // TODO: maybe add a boolean to raw traces to indicate if it will
+    // potentially modify the memory
+    auto rawTraces =
+        llvm::to_vector(llvm::map_range(allCombs, [&](const auto &innerSet) {
+          return llvm::to_vector(llvm::map_range(
+              innerSet, [&](Operation *op) { return getMemAddr(op); }));
+        }));
 
     return rawTraces;
   }
 
-void generateOpCombinations(
-    const SmallVector<DenseSet<Block*>>& maximalISets,
-    const DenseSet<Operation*>& potentialOps,
-    Operation* memUser,
-    SmallVector<SmallVector<Operation*, 4>>& allCombs) const 
-{
+  void generateOpCombinations(
+      const std::vector<std::set<Block *>> &maximalISets,
+      const std::set<Operation *> &potentialOps, Operation *memUser,
+      std::vector<std::vector<Operation *>> &allCombs) const {
+
     Block *memUserBlock = memUser->getBlock();
-    // Iterate over each maximal independent set
-    for (const DenseSet<Block*>& iset : maximalISets)
-    {
-        // Step 2: Initialize the current combination with memUser
-        SmallVector<Operation*, 4> currentComb;
-        currentComb.push_back(memUser);
 
-        // Step 3: Collect eligible operations from other blocks
-        SmallVector<SmallVector<Operation*, 4>, 4> eligibleOpsPerBlock;
-        bool skipSet = false; // Flag to determine if the current set should be skipped
+    // Step 1: Cache eligible operations per block
+    std::unordered_map<Block *, std::vector<Operation *>> eligibleOpsCache;
 
-        for (Block* blk : iset)
-        {
-            if (blk == memUserBlock)
-                continue; // Skip the block containing memUser
-
-            // Collect operations from the current block that are in potentialOps
-            SmallVector<Operation*, 4> ops;
-            for (auto &op : blk->getOperations())
-            {
-                if (potentialOps.contains(&op))
-                {
-                    ops.push_back(&op);
-                }
+    for (const auto &iset : maximalISets) {
+      for (Block *blk : iset) {
+        if (blk == memUserBlock)
+          continue; // Skip the block containing memUser
+        if (eligibleOpsCache.find(blk) == eligibleOpsCache.end()) {
+          std::vector<Operation *> ops;
+          for (auto &op : blk->getOperations()) {
+            if (potentialOps.find(&op) != potentialOps.end()) {
+              ops.push_back(&op);
+              break;
             }
-
-            // If no eligible operations are found in this block, skip the current set
-            if (ops.empty())
-            {
-                skipSet = true;
-                break;
-            }
-
-            // Add the eligible operations of the current block to the list
-            eligibleOpsPerBlock.push_back(ops);
+          }
+          eligibleOpsCache[blk] = std::move(ops);
         }
-
-        // If any block lacked eligible operations, skip this set
-        if (skipSet)
-        {
-            continue;
-        }
-
-        // Step 4: Generate all combinations using recursive backtracking
-        // Define a lambda function for backtracking
-        std::function<void(unsigned, SmallVector<Operation*, 4>&)> backtrack =
-            [&](unsigned idx, SmallVector<Operation*, 4>& current) {
-                // If all blocks have been processed, add the current combination to allCombs
-                if (idx == eligibleOpsPerBlock.size())
-                {
-                    allCombs.emplace_back(current);
-                    return;
-                }
-
-                // Iterate through all eligible operations in the current block
-                for (Operation* op : eligibleOpsPerBlock[idx])
-                {
-                    // Add the operation to the current combination
-                    current.push_back(op);
-
-                    // Recurse to process the next block
-                    backtrack(idx + 1, current);
-
-                    // Remove the operation to backtrack
-                    current.pop_back();
-                }
-            };
-
-        // Start the backtracking process from the first eligible block
-        backtrack(0, currentComb);
+      }
     }
-}
+
+    // Step 2: Iterate over each maximal independent set
+    for (const auto &iset : maximalISets) {
+      SmallVector<Operation *, 4> currentComb;
+      currentComb.push_back(memUser);
+
+      std::vector<std::vector<Operation *>> eligibleOpsPerBlock;
+      eligibleOpsPerBlock.reserve(iset.size());
+
+      bool skipSet = false;
+
+      for (Block *blk : iset) {
+        if (blk == memUserBlock)
+          continue;
+        auto it = eligibleOpsCache.find(blk);
+        if (it == eligibleOpsCache.end() || it->second.empty()) {
+          skipSet = true;
+          break;
+        }
+        eligibleOpsPerBlock.push_back(it->second);
+      }
+
+      if (skipSet)
+        continue;
+
+      // Iterative backtracking
+      size_t numBlocks = eligibleOpsPerBlock.size();
+      SmallVector<size_t, 4> indices(numBlocks, 0);
+
+      while (true) {
+        // Build the current combination
+        std::vector<Operation *> comb;
+        comb.push_back(memUser);
+        for (size_t i = 0; i < numBlocks; ++i) {
+          comb.push_back(eligibleOpsPerBlock[i][indices[i]]);
+        }
+        allCombs.emplace_back(std::move(comb));
+
+        size_t block = numBlocks;
+        while (block > 0) {
+          block--;
+          if (indices[block] + 1 < eligibleOpsPerBlock[block].size()) {
+            indices[block]++;
+            // Reset all subsequent indices
+            for (size_t j = block + 1; j < numBlocks; ++j) {
+              indices[j] = 0;
+            }
+            break;
+          }
+        }
+
+        if (block == 0 && indices[0] + 1 >= eligibleOpsPerBlock[0].size())
+          break; // All combinations are generated
+      }
+    }
+  }
 
   // TODO: we can turn `Trace` into a class
   SmallVector<SmallVector<Value>>
@@ -2702,151 +2510,20 @@ void generateOpCombinations(
         numConflicts += seenMaskIDs.insert(bitWiseAnd).second ? 0 : 1;
       }
     }
-    // llvm::errs() << "number of conflicts when maskBits is: " << maskBits << "
-    // " << numConflicts << "\n";
     return numConflicts;
   }
 
   std::string extractMaskIDs(const std::string &sizedBinTrace,
                              const std::string &maskBits) const {
+    assert(sizedBinTrace.size() == maskBits.size() &&
+           "sizedBinTrace and maskBits must be of the same length");
+
     std::string maskedBits;
     for (size_t i = 0; i < maskBits.length(); ++i) {
-      if (maskBits[i] == '1') {
+      if (maskBits[i] == '1')
         maskedBits += sizedBinTrace[i];
-      }
     }
     return maskedBits;
-  }
-
-  struct ConflictGraph {
-    struct PairHash {
-      template <class T1, class T2>
-      std::size_t operator()(const std::pair<T1, T2> &pair) const {
-        return std::hash<T1>()(pair.first) ^ std::hash<T2>()(pair.second);
-      }
-    };
-    std::unordered_map<std::string, std::set<std::string>> adjList;
-    std::unordered_map<std::pair<std::string, std::string>, uint, PairHash>
-        edgeWeights;
-    void addEdge(const std::string &id1, const std::string &id2) {
-      if (id1 == id2)
-        return; // No self-loops
-
-      // Add edge to adjacency list
-      adjList[id1].insert(id2);
-      adjList[id2].insert(id1);
-
-      // Create a consistent ordering for the edge
-      auto edgeKey = std::make_pair(std::min(id1, id2), std::max(id1, id2));
-
-      // Increment edge weight or set it to 1 if it doesn't exist
-      edgeWeights[edgeKey]++;
-    }
-    void printGraph() const {
-      llvm::errs() << "Conflict Graph:\n";
-      for (const auto &node : adjList) {
-        llvm::errs() << "Mask ID: " << node.first << " -> [";
-        for (const auto &adjNode : node.second) {
-          llvm::errs() << adjNode << " ";
-        }
-        llvm::errs() << "]\n";
-      }
-
-      llvm::errs() << "Edge Weights:\n";
-      for (const auto &edge : edgeWeights) {
-        llvm::errs() << "Edge: (" << edge.first.first << ", "
-                     << edge.first.second << ") Weight: " << edge.second
-                     << "\n";
-      }
-    }
-
-    SmallVector<std::string> findMaxClique() const {
-      SmallVector<std::string> maxClique;
-      SmallVector<std::string> potentialClique;
-      SmallVector<std::string> candidates;
-      SmallVector<std::string> alreadyProcessed;
-
-      for (const auto &node : adjList) {
-        candidates.push_back(node.first);
-      }
-
-      findClique(potentialClique, candidates, alreadyProcessed, maxClique);
-      return maxClique;
-    }
-
-  private:
-    void findClique(SmallVector<std::string> &potentialClique,
-                    SmallVector<std::string> &candidates,
-                    SmallVector<std::string> &alreadyProcessed,
-                    SmallVector<std::string> &maxClique) const {
-      if (candidates.empty() && alreadyProcessed.empty()) {
-        if (potentialClique.size() > maxClique.size()) {
-          maxClique = potentialClique;
-        }
-        return;
-      }
-
-      auto candidatesCopy = candidates;
-      for (const auto &candidate : candidatesCopy) {
-        // Remove candidate from candidates and add to potentialClique
-        candidates.erase(
-            std::remove(candidates.begin(), candidates.end(), candidate),
-            candidates.end());
-        potentialClique.push_back(candidate);
-
-        // Build new candidates and alreadyProcessed lists
-        SmallVector<std::string> newCandidates;
-        SmallVector<std::string> newAlreadyProcessed;
-
-        for (const auto &adjNode : adjList.at(candidate)) {
-          if (std::find(candidates.begin(), candidates.end(), adjNode) !=
-              candidates.end()) {
-            newCandidates.push_back(adjNode);
-          }
-          if (std::find(alreadyProcessed.begin(), alreadyProcessed.end(),
-                        adjNode) != alreadyProcessed.end()) {
-            newAlreadyProcessed.push_back(adjNode);
-          }
-        }
-
-        // Recursive call
-        findClique(potentialClique, newCandidates, newAlreadyProcessed,
-                   maxClique);
-
-        // Backtrack: remove candidate from potentialClique and add to
-        // alreadyProcessed
-        potentialClique.pop_back();
-        alreadyProcessed.push_back(candidate);
-      }
-    }
-  };
-
-  ConflictGraph
-  constructGraph(SmallVector<SmallVector<Value>> &compressedTraces,
-                 const std::string &maskBits) const {
-    ConflictGraph graph;
-    for (const auto &traceInStep : compressedTraces) {
-      std::set<std::string> seenMaskIDs;
-      for (auto trace : traceInStep) {
-        auto sizedBinTrace = getSizedTrace(trace, maskBits.length());
-
-        std::string maskID = extractMaskIDs(sizedBinTrace, maskBits);
-
-        for (const auto &otherMaskID : seenMaskIDs) {
-          graph.adjList[maskID].insert(otherMaskID);
-          graph.adjList[otherMaskID].insert(maskID);
-          auto edgeKey = std::make_pair(maskID, otherMaskID);
-          if (maskID > otherMaskID)
-            edgeKey = std::make_pair(otherMaskID, maskID);
-          if (graph.edgeWeights.find(edgeKey) != graph.edgeWeights.end())
-            graph.edgeWeights[edgeKey]++;
-          else
-            graph.edgeWeights[edgeKey] = 1;
-        }
-        seenMaskIDs.insert(maskID);
-      }
-    }
-    return graph;
   }
 
   std::string findMasksBits(const uint availableBanks,
@@ -2854,60 +2531,55 @@ void generateOpCombinations(
                             Operation *memory) const {
     // `nA` is the maximum number of memory accesses in all steps in the
     // compressed memory trace
-    llvm::errs() << "compressedTraces in finding masks bits: \n";
-    for (const auto &step : compressedTraces) {
-      for (const auto trace : step) {
-        auto traceInt = evaluateIndex(trace);
-        llvm::errs() << traceInt << " ";
-      }
-      llvm::errs() << "\n";
-    }
-    uint nA = 0;
+    uint32_t nA = 0;
     for (const auto &traceInStep : compressedTraces) {
-      if (traceInStep.size() > nA)
-        nA = traceInStep.size();
+      nA = std::max(nA, static_cast<uint32_t>(traceInStep.size()));
     }
 
     ArrayRef<int64_t> memRefShape;
-    if (auto allocOp = dyn_cast<memref::AllocOp>(memory))
-      memRefShape = allocOp.getMemref().getType().getShape();
-    else if (auto allocaOp = dyn_cast<memref::AllocaOp>(memory))
-      memRefShape = allocaOp.getMemref().getType().getShape();
-    else {
-      auto getGlobalOp = dyn_cast<memref::GetGlobalOp>(memory);
-      memRefShape = getGlobalOp.getType().getShape();
-    }
+    TypeSwitch<Operation *>(memory)
+        .Case<memref::AllocOp, memref::AllocaOp>([&](auto allocOp) {
+          memRefShape = allocOp.getMemref().getType().getShape();
+        })
+        .Case<memref::GetGlobalOp>([&](memref::GetGlobalOp getGlobalOp) {
+          memRefShape = getGlobalOp.getType().getShape();
+        })
+        .Default([](Operation *) {
+          llvm_unreachable("Unhandled memory operation type");
+        });
     assert(memRefShape.size() == 1 &&
            "memref type must be flattened before this pass");
 
     auto addrSize = llvm::Log2_32_Ceil(memRefShape.front());
-    uint overallMinCliques = std::numeric_limits<uint>::max();
+    uint32_t minConflicts = std::numeric_limits<uint32_t>::max();
+    uint32_t minColors = std::numeric_limits<uint32_t>::max();
     std::string bestMaskBits;
     for (auto nBits = llvm::Log2_32_Ceil(nA); nBits <= addrSize; nBits++) {
       SmallVector<std::string> allMaskBits =
           generateAllMaskBits(nBits, addrSize);
-      uint minConflicts = std::numeric_limits<uint>::max();
-      for (auto &maskBits : allMaskBits) {
+      for (const auto &maskBits : allMaskBits) {
         auto numConflicts = calculateConflicts(compressedTraces, maskBits);
-        if (numConflicts <= minConflicts) {
+        if (numConflicts < minConflicts) {
           minConflicts = numConflicts;
-          auto graph = constructGraph(compressedTraces, maskBits);
-          auto numCliques = graph.findMaxClique().size();
-          if (minConflicts == 0 && numCliques <= availableBanks) {
-            if (numCliques < overallMinCliques) {
-              overallMinCliques = numCliques;
-              bestMaskBits = maskBits;
-              break;
-            }
+          minColors = std::numeric_limits<uint32_t>::max();
+        }
+
+        if (numConflicts == minConflicts) {
+          auto maskedCompressedTraces = applyMask(compressedTraces, maskBits);
+          calyx::ConflictGraph graph(maskedCompressedTraces);
+          auto numColors = graph.findMaxClique();
+          if (numColors < minColors) {
+            minColors = numColors;
+            bestMaskBits = maskBits;
           }
+
+          if (numConflicts == 0 && numColors == minColors &&
+              minColors <= availableBanks)
+            return bestMaskBits;
         }
       }
     }
-    if (bestMaskBits.length() == 0)
-      bestMaskBits.assign(addrSize, '1');
-    // llvm::errs() << "best: " << bestMaskBits << " with minCliques: " <<
-    // overallMinCliques << "\n";
-    return bestMaskBits;
+    report_fatal_error(llvm::Twine("Cannot find masks bits"));
   }
 
   SmallVector<SmallVector<std::string>> maskCompress(
@@ -2915,91 +2587,61 @@ void generateOpCombinations(
     std::set<SmallVector<std::string>> seenMaskIDs;
     SmallVector<SmallVector<std::string>> compressedMasks;
     for (const auto &step : unCompressedMasks) {
-      if (seenMaskIDs.insert(step).second) {
+      if (seenMaskIDs.insert(step).second)
         compressedMasks.push_back(step);
-      }
     }
     return compressedMasks;
   }
 
-  ConflictGraph constructConflictGraph(
-      const SmallVector<SmallVector<std::string>> &compressedTrace) const {
-    ConflictGraph graph;
+  std::string
+  bestFirstSearch(const SmallVector<SmallVector<Value>> &compressedTraces,
+                  const std::string &mask, uint32_t availableBanks) const {
+    size_t minColors = std::numeric_limits<size_t>::max();
+    int bestBitIndex = -1;
 
-    for (const auto &step : compressedTrace) {
-      std::unordered_set<std::string> seenMaskIDs;
-
-      for (const auto &maskID : step) {
-        for (const auto &otherID : seenMaskIDs) {
-          graph.addEdge(maskID, otherID);
-        }
-        seenMaskIDs.insert(maskID);
+    // Find indices where mask bits are '0'
+    std::vector<size_t> zeroBitsIndices;
+    for (size_t i = 0; i < mask.size(); ++i) {
+      if (mask[i] == '0') {
+        zeroBitsIndices.push_back(i);
       }
     }
 
-    return graph;
-  }
+    // Iterate over each bit that is not currently in the mask
+    for (size_t bitIndex : zeroBitsIndices) {
+      // Create a new mask by adding the current bit
+      std::string tempMask = mask;
+      tempMask[bitIndex] = '1';
 
-  bool isSafe(const std::string &node,
-              const std::unordered_map<std::string, int> &color,
-              const ConflictGraph &graph, int c) const {
-    for (const auto &adjNode : graph.adjList.at(node)) {
-      if (color.at(adjNode) == c) {
-        return false;
+      // Generate mask IDs for the new mask
+      auto rawMaskIDs = applyMask(compressedTraces, tempMask);
+      SmallVector<SmallVector<std::string>> compressedMasks =
+          maskCompress(rawMaskIDs);
+
+      calyx::ConflictGraph conflictGraph(compressedMasks);
+
+      size_t numColors = conflictGraph.findMaxClique();
+
+      // Check if the graph can be colored with available banks
+      if (numColors <= availableBanks) {
+        return tempMask;
       }
-    }
-    return true;
-  }
 
-  bool graphColoringUtil(const ConflictGraph &graph, const uint m,
-                         std::unordered_map<std::string, int> &color,
-                         std::vector<std::string> &nodes, uint pos) const {
-    if (pos == nodes.size()) {
-      return true; // All nodes are colored
-    }
-
-    const std::string &node = nodes[pos];
-
-    for (uint c = 1; c <= m; c++) {
-      if (isSafe(node, color, graph, c)) {
-        color[node] = c;
-
-        if (graphColoringUtil(graph, m, color, nodes, pos + 1)) {
-          return true;
-        }
-
-        // If assigning color c doesn't lead to a solution, backtrack
-        color[node] = 0;
+      if (numColors < minColors) {
+        minColors = numColors;
+        bestBitIndex = bitIndex;
       }
     }
 
-    return false; // If no color can be assigned
-  }
-
-  std::optional<std::unordered_map<std::string, int>>
-  graphColoring(const ConflictGraph &graph, const uint m) const {
-    std::unordered_map<std::string, int> color;
-    for (const auto &pair : graph.adjList) {
-      color[pair.first] = 0; // Initialize all colors to 0 (no color)
+    if (bestBitIndex != -1) {
+      // Modify the original mask by adding the best bit
+      std::string modifiedMask = mask;
+      modifiedMask[bestBitIndex] = '1';
+      return modifiedMask;
     }
-
-    std::vector<std::string> nodes;
-    for (const auto &pair : graph.adjList) {
-      nodes.push_back(pair.first);
-    }
-
-    if (graphColoringUtil(graph, m, color, nodes, 0)) {
-      return std::make_optional(color);
-    }
-    return std::nullopt;
-  }
-
-  std::string bestFirstSearch(SmallVector<SmallVector<Value>> &compressedTraces,
-                              std::string &mask) const {
-    // TODO
+    // No improvement found; return the original mask
     return mask;
   }
-
   std::string getSizedTrace(Value trace, uint len) const {
     auto traceInt = evaluateIndex(trace);
     std::bitset<32> bitsetTrace(traceInt);
@@ -3007,33 +2649,38 @@ void generateOpCombinations(
     return binTrace.substr(binTrace.size() - len);
   }
 
-  std::unordered_map<std::string, int>
-  mapMaskIDsToBanks(const uint availableBanks,
+  SmallVector<SmallVector<std::string>>
+  applyMask(const SmallVector<SmallVector<Value>> &traces,
+            const std::string &mask) const {
+    SmallVector<SmallVector<std::string>> maskIDs;
+    for (const auto &step : traces) {
+      SmallVector<std::string> maskIDInStep;
+      for (const auto &trace : step) {
+        auto sizedBinTrace = getSizedTrace(trace, mask.length());
+
+        auto maskID = extractMaskIDs(sizedBinTrace, mask);
+        maskIDInStep.push_back(maskID);
+      }
+      maskIDs.push_back(maskIDInStep);
+    }
+    return maskIDs;
+  }
+
+  std::unordered_map<std::string, uint32_t>
+  mapMaskIDsToBanks(const uint32_t availableBanks,
                     SmallVector<SmallVector<Value>> &compressedTraces,
                     std::string &mask) const {
     bool canBeColored = false;
-    std::unordered_map<std::string, int> maskToBanks;
+    std::unordered_map<std::string, uint32_t> maskToBanks;
     do {
-      SmallVector<SmallVector<std::string>> rawMaskIDs;
-      for (const auto &step : compressedTraces) {
-        SmallVector<std::string> maskIDInStep;
-        for (auto trace : step) {
-          auto sizedBinTrace = getSizedTrace(trace, mask.length());
-
-          auto maskID = extractMaskIDs(sizedBinTrace, mask);
-          maskIDInStep.push_back(maskID);
-        }
-        rawMaskIDs.push_back(maskIDInStep);
-      }
-      SmallVector<SmallVector<std::string>> compressedMasks =
+      auto rawMaskIDs = applyMask(compressedTraces, mask);
+      SmallVector<SmallVector<std::string>> compressedMaskIDs =
           maskCompress(rawMaskIDs);
-      auto conflictGraph = constructConflictGraph(compressedMasks);
+      calyx::ConflictGraph conflictGraph(compressedMaskIDs);
 
-      auto colorRes = graphColoring(conflictGraph, availableBanks);
+      auto colorRes = conflictGraph.graphColoring(availableBanks);
       canBeColored = colorRes.has_value();
       if (canBeColored) {
-        // llvm::errs() << "Graph can be colored with " << availableBanks << "
-        // colors." << "\n";
         maskToBanks = *colorRes;
       }
       auto isAllOnes = [](const std::string &binaryString) -> bool {
@@ -3043,17 +2690,13 @@ void generateOpCombinations(
 
       if (isAllOnes(mask))
         break;
-      if (!canBeColored) {
-        mask = bestFirstSearch(compressedTraces, mask);
-      }
+
+      if (!canBeColored)
+        mask = bestFirstSearch(compressedTraces, mask, availableBanks);
     } while (!canBeColored);
 
     assert(!maskToBanks.empty() &&
            "The number of vailable banks is not sufficient for banking");
-    // llvm::errs() << "can be colored; mask ID and color mapping is: \n";
-    //    for (const auto &[id, color] : maskToBanks) {
-    //      llvm::errs() << id << ": " << color << "\n";
-    //    }
     return maskToBanks;
   }
 
@@ -3070,13 +2713,8 @@ void generateOpCombinations(
   Value getBankForMemAndID(Operation *memory, uint bankID) const {
     auto *op = memoryToBanks[memory][bankID];
     return TypeSwitch<Operation *, Value>(op)
-        .Case<memref::AllocOp>(
-            [](memref::AllocOp allocOp) { return allocOp.getResult(); })
-        .Case<memref::AllocaOp>(
-            [](memref::AllocaOp allocaOp) { return allocaOp.getResult(); })
-        .Case<memref::GetGlobalOp>([](memref::GetGlobalOp getGlobalOp) {
-          return getGlobalOp.getResult();
-        })
+        .Case<memref::AllocOp, memref::AllocaOp, memref::GetGlobalOp>(
+            [](auto memRefOp) { return memRefOp.getResult(); })
         .Default([](Operation *op) -> Value {
           op->emitError("Unsupported memory operation type");
           return nullptr;
@@ -3116,24 +2754,18 @@ void generateOpCombinations(
     return foundBlockArg;
   }
 
-  // Given `funcOp`, get all `step`s that `memory` might access in parallel, then compute the addresses-to-banks mapping
+  // Given `funcOp`, get all `step`s that `memory` might access in parallel,
+  // then compute the addresses-to-banks mapping
   void traceBankAlgo(FuncOp funcOp, Operation *memory) const {
     // Raw trace of a given memory at all steps
     Value memRes;
     MemRefType memTy;
     TypeSwitch<Operation *>(memory)
-        .Case<memref::AllocOp>([&](memref::AllocOp allocOp) {
-          memRes = allocOp.getResult();
-          memTy = cast<MemRefType>(allocOp.getType());
-        })
-        .Case<memref::AllocaOp>([&](memref::AllocaOp allocaOp) {
-          memRes = allocaOp.getResult();
-          memTy = cast<MemRefType>(allocaOp.getType());
-        })
-        .Case<memref::GetGlobalOp>([&](memref::GetGlobalOp getGlobalOp) {
-          memRes = getGlobalOp.getResult();
-          memTy = cast<MemRefType>(getGlobalOp.getType());
-        })
+        .Case<memref::AllocOp, memref::AllocaOp, memref::GetGlobalOp>(
+            [&](auto memRefOp) {
+              memRes = memRefOp.getResult();
+              memTy = cast<MemRefType>(memRefOp.getType());
+            })
         .Default([](Operation *) {
           llvm_unreachable("Unhandled memory operation type");
         });
@@ -3161,20 +2793,13 @@ void generateOpCombinations(
     }
 
     auto compressedTraces = initCompress(rawTraces);
-    // llvm::errs() << "compressed traces: \n";
-    // for (const auto &step : rawTraces) {
-    //   for (auto traceInStep : step) {
-    //     llvm::errs() << evaluateIndex(traceInStep) << " ";
-    //   }
-    //   llvm::errs() << "\n";
-    // }
 
     auto *jsonObj = availBanksJsonValue.getAsObject();
     auto *banks = jsonObj->getArray("banks");
     uint availableBanks = 0;
-    if (auto bankOpt = (*banks)[memNum.at(memory)].getAsInteger()) {
+    if (auto bankOpt = (*banks)[memNum.at(memory)].getAsInteger())
       availableBanks = *bankOpt;
-    } else {
+    else {
       std::string dumpStr;
       llvm::raw_string_ostream dumpStream(dumpStr);
       memory->print(dumpStream);
@@ -3184,11 +2809,9 @@ void generateOpCombinations(
           dumpStream.str());
     }
 
-    std::string masksBits =
-        findMasksBits(availableBanks, compressedTraces, memory);
-    llvm::errs() << "masksBits: " << masksBits << "\n";
+    auto masksBits = findMasksBits(availableBanks, compressedTraces, memory);
 
-    std::unordered_map<std::string, int> maskIDsToBanks =
+    std::unordered_map<std::string, uint32_t> maskIDsToBanks =
         mapMaskIDsToBanks(availableBanks, compressedTraces, masksBits);
 
     SmallVector<SmallVector<uint>> accessIndicesToBanks;
@@ -3203,38 +2826,22 @@ void generateOpCombinations(
       accessIndicesToBanks.push_back(banksInStep);
     }
 
-    //    llvm::errs() << "accessIndicesToBanks: \n";
-    //    for (auto i : accessIndicesToBanks) {
-    //      for (auto j : i) {
-    //        llvm::errs() << j << " ";
-    //      }
-    //      llvm::errs() << "\n";
-    //    }
-    //    llvm::errs() << "rawTraces: \n";
-    //    for (auto i  : rawTraces) {
-    //      for (auto j : i) {
-    //        llvm::errs() << j << " ";
-    //      }
-    //      llvm::errs() << "\n";
-    //    }
+    for (uint bankCnt = 0; bankCnt < availableBanks; ++bankCnt) {
+      for (size_t i = 0; i < accessIndicesToBanks.size(); ++i) {
+        const auto &currentAccessIndices = accessIndicesToBanks[i];
+        const auto &currentRawTraces = rawTraces[i];
 
-    for (uint bankCnt = 0; bankCnt < availableBanks; bankCnt++) {
-      for (uint i = 0; i < accessIndicesToBanks.size(); i++) {
-        auto curStep = accessIndicesToBanks[i];
-        for (uint j = 0; j < curStep.size(); j++) {
-          if (accessIndicesToBanks[i][j] == bankCnt) {
-            if (memoryToBankIDs.find(memory) == memoryToBankIDs.end()) {
-              memoryToBankIDs[memory][rawTraces[i][j]] = bankCnt;
-            } else {
-              if (memoryToBankIDs[memory].find(rawTraces[i][j]) ==
-                  memoryToBankIDs[memory].end()) {
-                assert(memoryToBankIDs[memory][rawTraces[i][j]] == 0);
-                memoryToBankIDs[memory][rawTraces[i][j]] = bankCnt;
-              } else {
-                assert(memoryToBankIDs[memory][rawTraces[i][j]] == bankCnt);
-              }
-            }
-          }
+        for (size_t j = 0; j < currentAccessIndices.size(); ++j) {
+          if (currentAccessIndices[j] != bankCnt)
+            continue;
+
+          Value trace = currentRawTraces[j];
+          uint &assignedBank = memoryToBankIDs[memory][trace];
+
+          if (assignedBank == 0)
+            assignedBank = bankCnt;
+          else
+            assert(assignedBank == bankCnt && "Bank ID mismatch detected.");
         }
       }
     }
