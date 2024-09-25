@@ -40,14 +40,17 @@
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/ModRef.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
+#include <any>
 #include <bitset>
 #include <cstdint>
 #include <fstream>
@@ -1662,7 +1665,8 @@ public:
     });
 
     // TraceBanks algorithm
-    DenseSet<Operation *> memories;
+    SmallVector<Operation *> memories;
+    DenseSet<Operation *> seenMemories;
     funcOp.walk([&](Operation *op) {
       // Get all source definition of the memories that are used in the current
       // `funcOp` into `memories` to get prepared for running the TraceBank
@@ -1670,10 +1674,13 @@ public:
       for (auto operand : op->getOperands()) {
         if (op->getDialect()->getNamespace() ==
                 memref::MemRefDialect::getDialectNamespace() &&
-            isa<MemRefType>(operand.getType())) {
+            isa<MemRefType>(operand.getType()) && (hasUseInParOp(funcOp, operand))) {
           // Find the source definition
-          if (!isa<BlockArgument>(operand))
-            memories.insert(operand.getDefiningOp());
+          if (!isa<BlockArgument>(operand)) {
+            if (seenMemories.insert(operand.getDefiningOp()).second) {
+              memories.push_back(operand.getDefiningOp());
+            }
+          }
           else {
             auto blockArg = cast<BlockArgument>(operand);
             for (auto otherFn : moduleOp.getOps<FuncOp>()) {
@@ -1684,7 +1691,9 @@ public:
                          "callOp's operands size must match with the block "
                          "argument size of the callee function");
                   auto memRes = callOp.getOperand(blockArg.getArgNumber());
-                  memories.insert(memRes.getDefiningOp());
+                  if (seenMemories.insert(memRes.getDefiningOp()).second) {
+                    memories.push_back(memRes.getDefiningOp());
+                  }
                 }
               }
             }
@@ -1709,14 +1718,26 @@ public:
     // Create banks for each memory and replace the use of all old memories
     IRMapping mapping;
     // Get all the users, such as load/store/copy, of all memref results
-    DenseSet<Operation *> memRefUsers;
+    SmallVector<Operation *> memRefUsers;
+    DenseSet<Operation *> seenMemRefUsers;
     funcOp.walk([&](Operation *op) {
       if (op->getDialect()->getNamespace() ==
               memref::MemRefDialect::getDialectNamespace() &&
           std::any_of(
               op->getOperands().begin(), op->getOperands().end(),
-              [](Value operand) { return isa<MemRefType>(operand.getType()); }))
-        memRefUsers.insert(op);
+              [](Value operand) { return isa<MemRefType>(operand.getType()); }) &&
+      std::any_of(
+          op->getOperands().begin(), op->getOperands().end(),
+          [&](Value operand) {
+            if (isa<MemRefType>(operand.getType())) {
+              return hasUseInParOp(funcOp, operand);
+            }
+            return false;
+          })) {
+        if (seenMemRefUsers.insert(op).second) {
+          memRefUsers.push_back(op);
+        }
+      }
 
       return WalkResult::advance();
     });
@@ -1765,7 +1786,7 @@ public:
 
       // Allocate new banks for `memOp` into `block`
       auto allocateBanks = [&](Operation *memOp, MemRefType memTy,
-                               Block *insertBlock) -> SmallVector<Operation *> {
+                               Operation *insertOp) -> SmallVector<Operation *> {
         auto origShape = memTy.getShape();
         if (origShape.front() % availableBanks != 0)
           memOp->emitError()
@@ -1775,12 +1796,15 @@ public:
 
         uint bankSize = origShape.front() / availableBanks;
         SmallVector<Operation *> banks;
-        OpBuilder builder = OpBuilder::atBlockBegin(insertBlock);
+        OpBuilder builder(insertOp->getContext());
+        builder.setInsertionPointAfter(insertOp);
         TypeSwitch<Operation *>(origMemDef)
             .Case<memref::AllocOp>([&](memref::AllocOp allocOp) {
+              llvm::errs() << "creating for alloc: \n";
+              allocOp.dump();
               for (uint bankCnt = 0; bankCnt < availableBanks; bankCnt++) {
                 auto bankAllocOp = builder.create<memref::AllocOp>(
-                    insertBlock->getParentOp()->getLoc(),
+                    insertOp->getParentOp()->getLoc(),
                     MemRefType::get(bankSize, memTy.getElementType(),
                                     memTy.getLayout(), memTy.getMemorySpace()));
                 banks.push_back(bankAllocOp);
@@ -1788,6 +1812,8 @@ public:
             })
             .Case<memref::GetGlobalOp>([&](memref::GetGlobalOp getGlobalOp) {
               OpBuilder::InsertPoint globalOpsInsertPt, getGlobalOpsInsertPt;
+              llvm::errs() << "creating for global: \n";
+              getGlobalOp.dump();
               for (uint bankCnt = 0; bankCnt < availableBanks; bankCnt++) {
                 auto *symbolTableOp =
                     getGlobalOp->getParentWithTrait<OpTrait::SymbolTable>();
@@ -1805,8 +1831,10 @@ public:
                 uint endIdx = bankSize * (bankCnt + 1);
                 auto allAttrs = cstAttr.getValues<Attribute>();
                 SmallVector<Attribute, 8> extractedElements;
-                for (auto idx = beginIdx; idx < endIdx; idx++)
+                for (uint i = 0; i < bankSize; i++) {
+                  uint idx = bankCnt + availableBanks * i;
                   extractedElements.push_back(allAttrs[idx]);
+                }
 
                 auto newMemRefTy =
                     MemRefType::get(SmallVector<int64_t>{endIdx - beginIdx},
@@ -1932,9 +1960,9 @@ public:
             if (getBanksForMem(origMemDef).empty()) {
               auto allocatedBanks = allocateBanks(
                   memUserOp, cast<MemRefType>(memUserOp.getMemRefType()),
-                  &topLevelFn.getBlocks()
-                       .front()); // we assume there is only one block
-                                  // in the top-level function
+                  origMemDef);
+              memoryToBanks[origMemDef] = allocatedBanks;
+
               SmallVector<Value> allocatedResults;
               for (auto *memOp : allocatedBanks) {
                 TypeSwitch<Operation *>(memOp)
@@ -1947,17 +1975,25 @@ public:
                           allocatedResults.push_back(getGlobalOp.getResult());
                         });
               }
-              setBanksForMem(origMemDef, allocatedBanks);
 
               auto newAddr = insertNewAddress(rewriter, memUserOp, accessIndex,
                                               availableBanks);
               Value newMemRef = getBankForMemAndID(origMemDef, bankID);
 
               if (topLevelFn.getName() != funcOp.getName()) {
-                auto newFnType = calyx::updateFnType(funcOp, allocatedResults);
+                int argNumber = -1;
+                for (auto operand : user->getOperands()) {
+                  if (isa<MemRefType>(operand.getType())) {
+                    assert(isa<BlockArgument>(operand));
+                    auto blockArg = cast<BlockArgument>(operand);
+                    argNumber = blockArg.getArgNumber();
+                  }
+                }
+                assert (argNumber >= 0);
+                auto newFnType = calyx::updateFnType(funcOp, allocatedResults, argNumber);
                 funcOp.setType(newFnType);
 
-                calyx::updateCallSites(moduleOp, funcOp, allocatedResults);
+                calyx::updateCallSites(moduleOp, funcOp, allocatedResults, argNumber);
               }
 
               if (isa<BlockArgument>(memOperand)) {
@@ -2005,6 +2041,7 @@ public:
           });
     }
 
+    moduleOp.dump();
     return res;
   };
 
@@ -2045,6 +2082,21 @@ private:
         cache;
   };
 
+  bool hasUseInParOp(FuncOp parentFunc, Value operand) const {
+    for (Operation *userOp : operand.getUsers()) {
+        Operation *op = userOp;
+        // Traverse up the parent operations
+        while (op && op != parentFunc) {
+            // Check if the current parent is an scf::ParallelOp
+            if (isa<scf::ParallelOp>(op)) {
+                // The Value is used within an scf::ParallelOp
+                return true;
+            }
+            op = op->getParentOp();
+        }
+    }
+    return false;
+}
   mutable DenseMap<Operation *, int> memNum;
   mutable MaximalISetsCache maximalISetsCache;
   llvm::json::Value availBanksJsonValue;
@@ -2305,6 +2357,7 @@ private:
           for (auto *otherUser : memOperand.getUsers()) {
             if (!nonParallel(memUser->getBlock(), otherUser->getBlock())) {
               parallelBlocks.insert(otherUser->getBlock());
+            // TODO
               potentialOps.insert(otherUser);
             }
           }
@@ -2368,7 +2421,6 @@ private:
       const std::vector<std::set<Block *>> &maximalISets,
       const std::set<Operation *> &potentialOps, Operation *memUser,
       std::vector<std::vector<Operation *>> &allCombs) const {
-
     Block *memUserBlock = memUser->getBlock();
 
     // Step 1: Cache eligible operations per block
@@ -2568,6 +2620,10 @@ private:
           auto maskedCompressedTraces = applyMask(compressedTraces, maskBits);
           calyx::ConflictGraph graph(maskedCompressedTraces);
           auto numColors = graph.findMaxClique();
+//          llvm::errs() << "maskBits: " << maskBits << "\n";
+//          llvm::errs() << "num conflicts: " << numConflicts << "\n";
+//          llvm::errs() << "num colors: " << numColors << "\n";
+//          llvm::errs() << "num avail banks: " << availableBanks << "\n";
           if (numColors < minColors) {
             minColors = numColors;
             bestMaskBits = maskBits;
@@ -2721,11 +2777,6 @@ private:
         });
   }
 
-  void setBanksForMem(Operation *memory,
-                      SmallVector<Operation *> &allocatedBanks) const {
-    memoryToBanks[memory] = allocatedBanks;
-  }
-
   BlockArgument getCalleeBlockArg(FuncOp callerFnOp, FuncOp calleeFnOp,
                                   Value opRes) const {
     bool foundCalleeBlockArg = false;
@@ -2788,8 +2839,10 @@ private:
     for (auto *user : memRes.getUsers()) {
       // For each `use` of the allocated `memory` result,
       // compute its trace
-      auto rawTrace = computeRawTrace(user);
-      rawTraces.append(rawTrace.begin(), rawTrace.end());
+      if (isa<scf::ParallelOp>(user->getParentOp())) {
+        auto rawTrace = computeRawTrace(user);
+        rawTraces.append(rawTrace.begin(), rawTrace.end());
+      }
     }
 
     auto compressedTraces = initCompress(rawTraces);
@@ -2881,8 +2934,7 @@ class BuildIfGroups : public calyx::FuncOpPartialLoweringPattern {
       for (auto ifOpRes : scfIfOp.getResults()) {
         auto reg = createRegister(
             scfIfOp.getLoc(), rewriter, getComponent(),
-            ifOpRes.getType().getIntOrFloatBitWidth(),
-            getState<ComponentLoweringState>().getUniqueName("if_res"));
+            ifOpRes.getType(), getState<ComponentLoweringState>().getUniqueName("if_res"));
         getState<ComponentLoweringState>().setResultRegs(
             scfIfOp, reg, ifOpRes.getResultNumber());
       }

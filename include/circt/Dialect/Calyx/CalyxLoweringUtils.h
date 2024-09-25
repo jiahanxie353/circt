@@ -84,14 +84,14 @@ void buildAssignmentsForRegisterWrite(OpBuilder &builder,
                                       calyx::ComponentOp componentOp,
                                       calyx::RegisterOp &reg, Value inputValue);
 
-/// Update `funcOp`'s type by appending `newArgs` to the function
+/// Update `funcOp`'s type by insert `newArgs` to the function after `pos`
 FunctionType updateFnType(mlir::func::FuncOp funcOp,
-                          SmallVector<Value> &newArgs);
+                          SmallVector<Value> &newArgs, unsigned pos);
 
 /// Update each callOp in `moduleOp` that has `callee` as the callee by
-/// appending `newOperands`
+/// inserting `newOperands` after `pos`
 void updateCallSites(ModuleOp moduleOp, mlir::func::FuncOp callee,
-                     SmallVector<Value> &newOperands);
+                     SmallVector<Value> &newOperands, unsigned pos);
 
 // A structure representing a set of ports which act as a memory interface for
 // external memories.

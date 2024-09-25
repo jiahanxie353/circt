@@ -159,38 +159,75 @@ void buildAssignmentsForRegisterWrite(OpBuilder &builder,
   builder.create<calyx::GroupDoneOp>(loc, reg.getDone());
 }
 
-FunctionType updateFnType(mlir::func::FuncOp funcOp,
-                          SmallVector<Value> &newArgs) {
+FunctionType updateFnType(func::FuncOp funcOp,
+                          SmallVector<Value> &newArgs,
+                          unsigned pos) {
+  // Get the current argument types
   SmallVector<Type, 4> updatedCurFnArgTys(funcOp.getArgumentTypes());
+  
+  // Collect the types of the new arguments
   SmallVector<Type, 4> newArgTys;
   for (auto arg : newArgs) {
-    funcOp.getBody().addArgument(arg.getType(), funcOp.getLoc());
     newArgTys.push_back(arg.getType());
   }
 
-  updatedCurFnArgTys.append(newArgTys.begin(), newArgTys.end());
+  assert (pos <= updatedCurFnArgTys.size());
 
+  // Insert newArgTys after the specified position
+  updatedCurFnArgTys.insert(
+      updatedCurFnArgTys.begin() + pos + 1,
+      newArgTys.begin(),
+      newArgTys.end()
+  );
+
+  // Insert the new arguments into the function body at the specified position
+  Block &entryBlock = funcOp.getFunctionBody().front();
+  unsigned insertPos = pos + 1;
+  assert(insertPos <= entryBlock.getNumArguments());
+  for (size_t i = 0; i < newArgTys.size(); ++i) {
+    // The position increases by 1 for each inserted argument
+    entryBlock.insertArgument(insertPos + i, newArgTys[i], funcOp.getLoc());
+  }
+
+  // Create and return the new FunctionType with updated argument types
   return FunctionType::get(funcOp.getContext(), updatedCurFnArgTys,
                            funcOp.getResultTypes());
 }
 
 void updateCallSites(ModuleOp moduleOp, func::FuncOp callee,
-                     SmallVector<Value> &newOperands) {
+                    SmallVector<Value> &newOperands, unsigned pos) {
+  // Iterate over all functions in the module
   moduleOp.walk([&](func::FuncOp otherFn) {
-    otherFn.walk([&](mlir::Operation *op) {
+    // Iterate over all operations within each function
+    otherFn.walk([&](Operation *op) {
+      // Check if the operation is a CallOp
       if (auto callOp = dyn_cast<func::CallOp>(op)) {
+        // Check if the CallOp targets the specified callee
         if (callOp.getCallee() == callee.getName()) {
+          // Retrieve the current operands of the CallOp
           SmallVector<Value> callerOperands(callOp.getOperands());
-          callerOperands.append(newOperands);
+
+          // Validate the insertion position
+          assert (pos <= callerOperands.size());
+
+          // Determine the insertion index (after pos)
+          unsigned insertIndex = pos + 1;
+
+          // Insert the new operands after the specified position
+          callerOperands.insert(callerOperands.begin() + insertIndex,
+                                newOperands.begin(), newOperands.end());
+
+          // Update the operands of the CallOp
           callOp->setOperands(callerOperands);
+
+          // Optional: Verify that the number of operands matches the callee's arguments
           assert(callOp.getNumOperands() == callee.getNumArguments() &&
-                 "number of operands and block arguments should match "
-                 "after appending new memory banks");
+                 "Number of operands and block arguments should match after insertion");
         }
       }
     });
   });
-};
+}
 
 //===----------------------------------------------------------------------===//
 // MemoryInterface
@@ -934,23 +971,6 @@ void ConflictGraph::addEdge(const std::string &id1, const std::string &id2) {
     edgeWeights[edgeKey]++;
   else
     edgeWeights[edgeKey] = 1;
-}
-
-void ConflictGraph::printGraph() const {
-  llvm::errs() << "Conflict Graph:\n";
-  for (const auto &node : adjList) {
-    llvm::errs() << "Mask ID: " << node.first << " -> [";
-    for (const auto &adjNode : node.second) {
-      llvm::errs() << adjNode << " ";
-    }
-    llvm::errs() << "]\n";
-  }
-
-  llvm::errs() << "Edge Weights:\n";
-  for (const auto &edge : edgeWeights) {
-    llvm::errs() << "Edge: (" << edge.first.first << ", " << edge.first.second
-                 << ") Weight: " << edge.second << "\n";
-  }
 }
 
 size_t ConflictGraph::findMaxClique() const {
