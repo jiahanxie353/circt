@@ -1800,8 +1800,8 @@ public:
         builder.setInsertionPointAfter(insertOp);
         TypeSwitch<Operation *>(origMemDef)
             .Case<memref::AllocOp>([&](memref::AllocOp allocOp) {
-              llvm::errs() << "creating for alloc: \n";
-              allocOp.dump();
+              // llvm::errs() << "creating for alloc: \n";
+              // allocOp.dump();
               for (uint bankCnt = 0; bankCnt < availableBanks; bankCnt++) {
                 auto bankAllocOp = builder.create<memref::AllocOp>(
                     insertOp->getParentOp()->getLoc(),
@@ -1812,8 +1812,8 @@ public:
             })
             .Case<memref::GetGlobalOp>([&](memref::GetGlobalOp getGlobalOp) {
               OpBuilder::InsertPoint globalOpsInsertPt, getGlobalOpsInsertPt;
-              llvm::errs() << "creating for global: \n";
-              getGlobalOp.dump();
+              // llvm::errs() << "creating for global: \n";
+              // getGlobalOp.dump();
               for (uint bankCnt = 0; bankCnt < availableBanks; bankCnt++) {
                 auto *symbolTableOp =
                     getGlobalOp->getParentWithTrait<OpTrait::SymbolTable>();
@@ -2040,6 +2040,43 @@ public:
             llvm_unreachable("Unhandled memory operation type");
           });
     }
+
+    funcOp.walk([&](Operation *op) {
+      if (!isa<scf::ParallelOp>(op))
+        return WalkResult::advance();
+
+      auto parOp = cast<scf::ParallelOp>(op);
+
+      for (auto &blk : parOp.getBodyRegion().getBlocks()) {
+        for (auto storeOp : blk.getOps<memref::StoreOp>()) {
+          auto storeMemRef = storeOp.getMemRef();
+          Operation *storeMem;
+          if (storeMemRef.getDefiningOp())
+            storeMem = storeMemRef.getDefiningOp();
+          else {
+            auto blockArg = cast<BlockArgument>(storeMemRef);
+            for (auto otherFn : moduleOp.getOps<FuncOp>()) {
+              for (auto callOp : otherFn.getOps<CallOp>()) {
+                if (callOp.getCallee() == funcOp.getName()) {
+                  assert(callOp.getOperands().size() ==
+                             funcOp.getArguments().size() &&
+                         "callOp's operands size must match with the block "
+                         "argument size of the callee function");
+                  auto memRes = callOp.getOperand(blockArg.getArgNumber());
+                  storeMem = memRes.getDefiningOp();
+                }
+              }
+            }
+          }
+          llvm::errs() << "storeMem: \n";
+          storeMem->dump();
+          auto bankID = getIDForBank(storeMem);
+          llvm::errs() << "bankID: " << bankID << "\n";
+        }
+      }
+
+      return WalkResult::advance();
+    });
 
     moduleOp.dump();
     return res;
@@ -2757,13 +2794,34 @@ private:
   }
 
   mutable DenseMap<Operation *, DenseMap<Value, uint>> memoryToBankIDs;
+  // Given the original `memory` and an address that access this memory,
+  // returns the corresponding bank of this `memory`
   uint getBankOfMemAccess(Operation *memory, Value accessIndex) const {
     return memoryToBankIDs[memory][accessIndex];
   }
 
+  mutable DenseMap<Operation *, DenseMap<uint, Operation *>> memoryAndIDToBank;
+  Operation *getBankFromID(Operation *memory, uint id) const {
+    if (memoryAndIDToBank.find(memory) == memoryAndIDToBank.end())
+      report_fatal_error("memory not found");
+    auto idToBank = memoryAndIDToBank.at(memory);
+    if (idToBank.find(id) == idToBank.end())
+      report_fatal_error("bank not found for id");
+    return idToBank.at(id);
+  }
+  // Map from original memory to its banks
   mutable DenseMap<Operation *, SmallVector<Operation *>> memoryToBanks;
   SmallVector<Operation *> getBanksForMem(Operation *memory) const {
     return memoryToBanks[memory];
+  }
+
+  // Get the bankID of a allocated bank
+  uint getIDForBank(Operation *memBank) const {
+    for (const auto &[mem, banks] : memoryToBanks) {
+      if (std::find(banks.begin(), banks.end(), memBank) != banks.end())
+        return std::find(banks.begin(), banks.end(), memBank) - banks.begin();
+    }
+    report_fatal_error("bank id not found");
   }
 
   Value getBankForMemAndID(Operation *memory, uint bankID) const {
@@ -2879,25 +2937,46 @@ private:
       accessIndicesToBanks.push_back(banksInStep);
     }
 
-    for (uint bankCnt = 0; bankCnt < availableBanks; ++bankCnt) {
-      for (size_t i = 0; i < accessIndicesToBanks.size(); ++i) {
-        const auto &currentAccessIndices = accessIndicesToBanks[i];
-        const auto &currentRawTraces = rawTraces[i];
-
-        for (size_t j = 0; j < currentAccessIndices.size(); ++j) {
-          if (currentAccessIndices[j] != bankCnt)
-            continue;
-
-          Value trace = currentRawTraces[j];
-          uint &assignedBank = memoryToBankIDs[memory][trace];
-
-          if (assignedBank == 0)
-            assignedBank = bankCnt;
-          else
-            assert(assignedBank == bankCnt && "Bank ID mismatch detected.");
+    for (uint bankCnt = 0; bankCnt < availableBanks; bankCnt++) {
+      for (uint i = 0; i < accessIndicesToBanks.size(); i++) {
+        auto curStep = accessIndicesToBanks[i];
+        for (uint j = 0; j < curStep.size(); j++) {
+          if (accessIndicesToBanks[i][j] == bankCnt) {
+            if (memoryToBankIDs.find(memory) == memoryToBankIDs.end()) {
+              memoryToBankIDs[memory][rawTraces[i][j]] = bankCnt;
+            }
+            else {
+              if (memoryToBankIDs[memory].find(rawTraces[i][j]) == memoryToBankIDs[memory].end()) {
+                assert(memoryToBankIDs[memory][rawTraces[i][j]] == 0);
+                memoryToBankIDs[memory][rawTraces[i][j]] = bankCnt;
+              }
+              else {
+                assert(memoryToBankIDs[memory][rawTraces[i][j]] == bankCnt);
+              }
+            }
+          }
         }
       }
     }
+//    for (uint bankCnt = 0; bankCnt < availableBanks; ++bankCnt) {
+//      for (size_t i = 0; i < accessIndicesToBanks.size(); ++i) {
+//        const auto &currentAccessIndices = accessIndicesToBanks[i];
+//        const auto &currentRawTraces = rawTraces[i];
+//
+//        for (size_t j = 0; j < currentAccessIndices.size(); ++j) {
+//          if (currentAccessIndices[j] != bankCnt)
+//            continue;
+//
+//          Value trace = currentRawTraces[j];
+//          uint &assignedBank = memoryToBankIDs[memory][trace];
+//
+//          if (assignedBank == 0)
+//            assignedBank = bankCnt;
+//          else
+//            assert(assignedBank == bankCnt && "Bank ID mismatch detected.");
+//        }
+//      }
+//    }
   }
 };
 
