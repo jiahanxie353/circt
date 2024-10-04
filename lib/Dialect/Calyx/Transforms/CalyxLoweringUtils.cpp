@@ -156,6 +156,65 @@ void buildAssignmentsForRegisterWrite(OpBuilder &builder,
   builder.create<calyx::GroupDoneOp>(loc, reg.getDone());
 }
 
+FunctionType updateFnType(mlir::func::FuncOp funcOp,
+                          SmallVector<Value> &newArgs, uint pos) {
+  // Get the current argument types
+  SmallVector<Type, 4> updatedCurFnArgTys(funcOp.getArgumentTypes());
+
+  // Collect the types of the new arguments
+  SmallVector<Type, 4> newArgTys;
+  for (auto arg : newArgs) {
+    newArgTys.push_back(arg.getType());
+  }
+
+  assert(pos <= updatedCurFnArgTys.size());
+
+  // Insert newArgTys after the specified position
+  updatedCurFnArgTys.insert(updatedCurFnArgTys.begin() + pos + 1,
+                            newArgTys.begin(), newArgTys.end());
+
+  // Insert the new arguments into the function body at the specified position
+  Block &entryBlock = funcOp.getFunctionBody().front();
+  unsigned insertPos = pos + 1;
+  assert(insertPos <= entryBlock.getNumArguments());
+  for (size_t i = 0; i < newArgTys.size(); ++i) {
+    // The position increases by 1 for each inserted argument
+    entryBlock.insertArgument(insertPos + i, newArgTys[i], funcOp.getLoc());
+  }
+
+  // Create and return the new FunctionType with updated argument types
+  return FunctionType::get(funcOp.getContext(), updatedCurFnArgTys,
+                           funcOp.getResultTypes());
+}
+
+void updateCallSites(ModuleOp moduleOp, func::FuncOp callee,
+                     SmallVector<Value> &newOperands, uint pos) {
+  // Iterate over all functions in the module
+  moduleOp.walk([&](func::FuncOp otherFn) {
+    // Iterate over all operations within each function
+    otherFn.walk([&](Operation *op) {
+      // Check if the operation is a CallOp
+      if (auto callOp = dyn_cast<func::CallOp>(op)) {
+        // Check if the CallOp targets the specified callee
+        if (callOp.getCallee() == callee.getName()) {
+          // Retrieve the current operands of the CallOp
+          SmallVector<Value> callerOperands(callOp.getOperands());
+
+          assert(pos <= callerOperands.size());
+          // Insert the new operands after the specified position
+          callerOperands.insert(callerOperands.begin() + pos + 1,
+                                newOperands.begin(), newOperands.end());
+          callOp->setOperands(callerOperands);
+
+          assert(callOp.getNumOperands() == callee.getNumArguments() &&
+                 "Number of operands and block arguments should match after "
+                 "insertion");
+        }
+      }
+    });
+  });
+};
+
 //===----------------------------------------------------------------------===//
 // MemoryInterface
 //===----------------------------------------------------------------------===//

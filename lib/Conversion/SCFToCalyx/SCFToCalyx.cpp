@@ -16,6 +16,7 @@
 #include "circt/Dialect/Calyx/CalyxOps.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
+#include "circt/Transforms/Passes.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -30,6 +31,12 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/Error.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/LogicalResult.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/raw_ostream.h"
 #include <fstream>
 
 #include <variant>
@@ -122,10 +129,15 @@ struct CallScheduleable {
   func::CallOp callOp;
 };
 
+struct ParScheduleable {
+  /// Parallel operation to schedule.
+  scf::ParallelOp parOp;
+};
+
 /// A variant of types representing scheduleable operations.
 using Scheduleable =
     std::variant<calyx::GroupOp, WhileScheduleable, ForScheduleable,
-                 IfScheduleable, CallScheduleable>;
+                 IfScheduleable, CallScheduleable, ParScheduleable>;
 
 class IfLoweringStateInterface {
 public:
@@ -278,6 +290,7 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
               .template Case<arith::ConstantOp, ReturnOp, BranchOpInterface,
                              /// SCF
                              scf::YieldOp, scf::WhileOp, scf::ForOp, scf::IfOp,
+                             scf::ParallelOp, scf::ReduceOp,
                              /// memref
                              memref::AllocOp, memref::AllocaOp, memref::LoadOp,
                              memref::StoreOp, memref::GetGlobalOp,
@@ -353,6 +366,10 @@ private:
   LogicalResult buildOp(PatternRewriter &rewriter, scf::WhileOp whileOp) const;
   LogicalResult buildOp(PatternRewriter &rewriter, scf::ForOp forOp) const;
   LogicalResult buildOp(PatternRewriter &rewriter, scf::IfOp ifOp) const;
+  LogicalResult buildOp(PatternRewriter &rewriter,
+                        scf::ParallelOp parallelOp) const;
+  LogicalResult buildOp(PatternRewriter &rewriter,
+                        scf::ReduceOp reduceOp) const;
   LogicalResult buildOp(PatternRewriter &rewriter, CallOp callOp) const;
 
   /// buildLibraryOp will build a TCalyxLibOp inside a TGroupOp based on the
@@ -1269,6 +1286,17 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   return success();
 }
 
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     scf::ReduceOp reduceOp) const {
+  return success();
+}
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     scf::ParallelOp parOp) const {
+  getState<ComponentLoweringState>().addBlockScheduleable(
+      parOp.getOperation()->getBlock(), ParScheduleable{parOp});
+  return success();
+}
+
 /// Inlines Calyx ExecuteRegionOp operations within their parent blocks.
 /// An execution region op (ERO) is inlined by:
 ///  i  : add a sink basic block for all yield operations inside the
@@ -1435,6 +1463,560 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
           compOp.getArgument(mapping.getSecond()));
 
     return success();
+  }
+};
+
+class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
+public:
+  BuildParGroups(MLIRContext *context, LogicalResult &resRef,
+                 calyx::PatternApplicationState &patternState,
+                 DenseMap<FuncOp, calyx::ComponentOp> &funcMap,
+                 calyx::CalyxLoweringState &pls, std::string &availBanksJson)
+      : calyx::FuncOpPartialLoweringPattern(context, resRef, patternState,
+                                            funcMap, pls),
+        availBanksJsonValue(parseJsonFile(availBanksJson)){};
+  using FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern;
+  LogicalResult
+  partiallyLowerFuncToComp(FuncOp funcOp,
+                           PatternRewriter &rewriter) const override {
+    LogicalResult res = success();
+
+    auto moduleOp = funcOp->getParentOfType<ModuleOp>();
+    auto topLevelFn = cast<FuncOp>(SymbolTable::lookupSymbolIn(
+        moduleOp, loweringState().getTopLevelFunction()));
+
+    moduleOp.walk([&](Operation *op) {
+      if (isa<memref::AllocOp, memref::AllocaOp, memref::GetGlobalOp>(op) &&
+          seenOrigMemDefns.insert(op).second) {
+        auto memRefResult = op->getResult(0);
+        if (funcOp == topLevelFn) {
+          if (hasUseInParOp(funcOp, memRefResult))
+            originalMemDefns.push_back(op);
+        } else {
+          auto newMemRef = getNewMemRef(memRefResult, topLevelFn, funcOp);
+          if (hasUseInParOp(funcOp, newMemRef))
+            originalMemDefns.push_back(op);
+        }
+      }
+    });
+
+    funcOp.walk([&](Operation *op) {
+      if (!isa<scf::ParallelOp>(op))
+        return WalkResult::advance();
+
+      auto scfParOp = cast<scf::ParallelOp>(op);
+
+      IRMapping cloningMap;
+      if (failed(processParLoop(scfParOp, cloningMap, rewriter))) {
+        res = failure();
+        return WalkResult::interrupt();
+      }
+
+      return WalkResult::advance();
+    });
+
+    return res;
+  }
+
+private:
+  mutable SmallVector<Operation *> originalMemDefns;
+  mutable DenseSet<Operation *> seenOrigMemDefns;
+  mutable DenseMap<Operation *, SmallVector<Operation *>> memoryToBanks;
+  mutable std::atomic<unsigned> globalCounter;
+  llvm::json::Value availBanksJsonValue;
+  llvm::json::Value parseJsonFile(const std::string &fileName) const {
+    std::string adjustedFileName = fileName;
+    if (adjustedFileName.find(".json") == std::string::npos)
+      adjustedFileName += ".json";
+
+    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> fileOrErr =
+        llvm::MemoryBuffer::getFile(adjustedFileName);
+    if (std::error_code ec = fileOrErr.getError())
+      llvm::report_fatal_error(
+          llvm::Twine("User forgets to input a JSON file for memory banking or "
+                      "error reading the file: ") +
+          adjustedFileName + " - " + ec.message());
+
+    auto jsonResult = llvm::json::parse(fileOrErr.get()->getBuffer());
+    if (!jsonResult) {
+      llvm::errs() << "Error parsing JSON: "
+                   << llvm::toString(jsonResult.takeError()) << "\n";
+      llvm::report_fatal_error(llvm::Twine("Failed to parse JSON file: ") +
+                               adjustedFileName);
+    }
+    return std::move(*jsonResult);
+  }
+
+  uint getNumAvailableBanks(Operation *definingMemOp,
+                            SmallVector<Operation *> &originalMemDefns) const {
+    auto pos = std::find(originalMemDefns.begin(), originalMemDefns.end(),
+                         definingMemOp) -
+               originalMemDefns.begin();
+    auto *jsonObj = availBanksJsonValue.getAsObject();
+    auto *bankNums = jsonObj->getArray("banks");
+    if (auto bankOpt = (*bankNums)[pos].getAsInteger()) {
+      assert(*bankOpt > 0 &&
+             "number of available banks must be greater than zero");
+      return *bankOpt;
+    }
+
+    std::string dumpStr;
+    llvm::raw_string_ostream dumpStream(dumpStr);
+    definingMemOp->print(dumpStream);
+    report_fatal_error(
+        llvm::Twine("Cannot find the number of banks associated with memory") +
+        dumpStream.str());
+  }
+
+  // TODO: handle nested parallel op
+  LogicalResult processParLoop(scf::ParallelOp parallelOp, IRMapping &mapping,
+                               PatternRewriter &rewriter) const {
+    LogicalResult result = success();
+    // TODO: support `scf::ReduceOp`
+    if (parallelOp.getNumResults() > 0)
+      return failure();
+
+    if (failed(unrollPLoop(rewriter, parallelOp)))
+      return rewriter.notifyMatchFailure(parallelOp,
+                                         "Cannot unroll parallelOp's induction "
+                                         "variable combinations statically");
+
+    parallelOp.walk([&](Operation *op) {
+      if (op->getDialect()->getNamespace() ==
+              memref::MemRefDialect::getDialectNamespace() &&
+          std::any_of(op->getOperands().begin(), op->getOperands().end(),
+                      [](Value operand) {
+                        return isa<MemRefType>(operand.getType());
+                      })) {
+        // Replace the use of all memories in the `parallelOp` with their bank
+        // and corresponding offset in the bank
+        if (failed(replaceMemUseWithBank(rewriter, op, mapping))) {
+          result = failure();
+          return WalkResult::interrupt();
+        }
+      }
+      return WalkResult::advance();
+    });
+
+    return result;
+  }
+
+  bool hasUseInParOp(FuncOp parentFunc, Value value) const {
+    for (Operation *userOp : value.getUsers()) {
+      Operation *op = userOp;
+      // Traverse up the parent operations
+      while (op && op != parentFunc) {
+        // Check if the current parent is an scf::ParallelOp
+        if (isa<scf::ParallelOp>(op)) {
+          // The Value is used within an scf::ParallelOp
+          return true;
+        }
+        op = op->getParentOp();
+      }
+    }
+    return false;
+  }
+
+  void removeMemDefiningOp(Operation *memDefnOp) const {
+    if (auto getGlobalOp = dyn_cast<memref::GetGlobalOp>(memDefnOp)) {
+      auto *symbolTableOp =
+          getGlobalOp->getParentWithTrait<mlir::OpTrait::SymbolTable>();
+      auto globalOp =
+          dyn_cast_or_null<memref::GlobalOp>(SymbolTable::lookupSymbolIn(
+              symbolTableOp, getGlobalOp.getNameAttr()));
+      getGlobalOp->remove();
+      globalOp->remove();
+    } else
+      memDefnOp->remove();
+  }
+
+  FunctionType eraseMemRefInCallerCallees(ModuleOp moduleOp,
+                                          mlir::func::FuncOp callee,
+                                          Value memrefVal) const {
+    SmallVector<Type, 4> updatedCurFnArgTys(callee.getArgumentTypes());
+    for (auto otherFn : moduleOp.getOps<mlir::func::FuncOp>()) {
+      for (auto callOp : otherFn.getOps<mlir::func::CallOp>()) {
+        if (callOp.getCallee() == callee.getName()) {
+          auto pos = llvm::find(callOp.getOperands(), memrefVal) -
+                     callOp.getOperands().begin();
+          updatedCurFnArgTys.erase(updatedCurFnArgTys.begin() + pos);
+          callee.getBlocks().front().eraseArgument(pos);
+          callOp->eraseOperand(pos);
+          removeMemDefiningOp(memrefVal.getDefiningOp());
+        }
+      }
+    }
+
+    return FunctionType::get(callee.getContext(), updatedCurFnArgTys,
+                             callee.getFunctionType().getResults());
+  };
+
+  LogicalResult unrollPLoop(PatternRewriter &rewriter,
+                            scf::ParallelOp parallelOp) const {
+    auto inductionVars = parallelOp.getInductionVars();
+    auto steps = parallelOp.getStep();
+    auto lowerBounds = parallelOp.getLowerBound();
+    auto upperBounds = parallelOp.getUpperBound();
+
+    auto &region = parallelOp.getRegion();
+    auto loc = parallelOp.getLoc();
+    auto *body = parallelOp.getBody();
+
+    OpBuilder blockBuilder(parallelOp);
+    Block *currBlock = nullptr;
+    IRMapping cloningMap;
+
+    std::function<void(SmallVector<int64_t, 4> &, unsigned)> genIVCombinations;
+    genIVCombinations = [&](SmallVector<int64_t, 4> &indices, unsigned dim) {
+      if (dim == lowerBounds.size()) {
+        currBlock = &region.emplaceBlock();
+        blockBuilder.setInsertionPointToEnd(currBlock);
+        for (unsigned i = 0; i < indices.size(); ++i) {
+          Value ivConstant =
+              blockBuilder.create<arith::ConstantIndexOp>(loc, indices[i]);
+          cloningMap.map(inductionVars[i], ivConstant);
+        }
+
+        for (auto it = body->begin(); it != std::prev(body->end()); ++it)
+          blockBuilder.clone(*it, cloningMap);
+
+        return;
+      }
+
+      auto lb = lowerBounds[dim].getDefiningOp<arith::ConstantIndexOp>();
+      assert(lb && "Parallel loop lower bounds must be constants");
+      auto ub = upperBounds[dim].getDefiningOp<arith::ConstantIndexOp>();
+      assert(ub && "Parallel loop upper bounds must be constants");
+      auto step = steps[dim].getDefiningOp<arith::ConstantIndexOp>();
+      assert(step && "Parallel loop steps must be constants");
+
+      int64_t lbVal = lb.value();
+      int64_t ubVal = ub.value();
+      int64_t stepVal = step.value();
+
+      for (int64_t iv = lbVal; iv < ubVal; iv += stepVal) {
+        indices[dim] = iv;
+        genIVCombinations(indices, dim + 1);
+      }
+    };
+
+    SmallVector<int64_t, 4> indices(lowerBounds.size());
+    genIVCombinations(indices, 0);
+
+    // Because of the assumption that `scf::ParallelOp` has only one region
+    // capturing the loop body
+    body->erase();
+
+    return success();
+  }
+
+  Value getNewMemRef(Value memRef, FuncOp caller, FuncOp callee) const {
+    for (auto callOp : caller.getOps<CallOp>()) {
+      if (callOp.getCallee() == callee.getName()) {
+        auto pos = llvm::find(callOp.getOperands(), memRef) -
+                   callOp.getOperands().begin();
+        return callee.getArgument(pos);
+      }
+    }
+    return nullptr;
+  };
+
+  LogicalResult replaceMemUseWithBank(PatternRewriter &rewriter,
+                                      Operation *memUse,
+                                      IRMapping &mapping) const {
+    LogicalResult result = success();
+
+    auto funcOp = memUse->getParentOfType<FuncOp>();
+    auto moduleOp = memUse->getParentOfType<ModuleOp>();
+    auto topLevelFn = cast<FuncOp>(SymbolTable::lookupSymbolIn(
+        moduleOp, loweringState().getTopLevelFunction()));
+
+    auto updateFnTyAndCallSites =
+        [&moduleOp, &funcOp](SmallVector<Operation *> &banks, uint argNumber) {
+          SmallVector<Value> bankResults;
+          for (auto *bank : banks)
+            bankResults.push_back(bank->getResult(0));
+          auto newFnType = calyx::updateFnType(funcOp, bankResults, argNumber);
+          funcOp.setType(newFnType);
+          calyx::updateCallSites(moduleOp, funcOp, bankResults, argNumber);
+        };
+
+    TypeSwitch<Operation *>(memUse)
+        .Case<memref::LoadOp, memref::StoreOp>([&](auto memUserOp) {
+          // Get the corresponding bank and intra-bank offset
+          // of this memory use based on the access address
+          assert(memUserOp.getIndices().size() == 1);
+          auto accessAddr = memUserOp.getIndices().front();
+          Value memRef = memUserOp.getMemRef();
+
+          // Find the source defining memory allocation op
+          bool isTopLevelFn = funcOp == topLevelFn;
+          Operation *definingMemOp;
+          if (isTopLevelFn)
+            definingMemOp = memRef.getDefiningOp();
+          else
+            definingMemOp = findDefiningOpInCaller(memRef, funcOp, topLevelFn);
+
+          // We skip if this is a newly created bank
+          if (std::find(originalMemDefns.begin(), originalMemDefns.end(),
+                        definingMemOp) == originalMemDefns.end())
+            return;
+
+          uint availableBanks =
+              getNumAvailableBanks(definingMemOp, originalMemDefns);
+          uint bankId;
+          Value offset;
+          std::tie(bankId, offset) =
+              memoryBankingMap(rewriter, memUserOp, accessAddr, availableBanks);
+          SmallVector<Operation *> banks;
+          auto blockArg = cast<BlockArgument>(memRef);
+          if (memoryToBanks.find(definingMemOp) == memoryToBanks.end()) {
+            banks = allocateBanks(rewriter, definingMemOp, availableBanks);
+            memoryToBanks[definingMemOp] = banks;
+            // If current function is not the top-level function, we update
+            // current function's argument types and the callOp in the top-level
+            // function to pass those new memref banks as reference
+            if (!isTopLevelFn) {
+              auto argNumber = blockArg.getArgNumber();
+              updateFnTyAndCallSites(banks, argNumber);
+            }
+          } else
+            banks = memoryToBanks[definingMemOp];
+          assert(bankId < banks.size() &&
+                 "bank ID cannot exceed total number of banks");
+
+          auto *bank = banks[bankId];
+          Value newMemRef =
+              TypeSwitch<Operation *, Value>(bank)
+                  .Case<memref::AllocOp, memref::AllocaOp, memref::GetGlobalOp>(
+                      [](auto memRefOp) { return memRefOp.getResult(); })
+                  .Default([&](Operation *op) -> Value {
+                    op->emitError("Unsupported memory operation type");
+                    return nullptr;
+                  });
+
+          if (!isTopLevelFn) {
+            // Get the new memref as a block argument since they should always
+            // be passed as a reference
+            newMemRef = getNewMemRef(newMemRef, topLevelFn, funcOp);
+            if (!newMemRef)
+              result = failure();
+          }
+
+          if (failed(replaceMemoryOp(rewriter, memUserOp, newMemRef, offset,
+                                     mapping)))
+            result = failure();
+
+          // Clean up the old memories when all replacements are done
+          if (isTopLevelFn) {
+            if (definingMemOp->use_empty())
+              removeMemDefiningOp(definingMemOp);
+          } else {
+            if (blockArg.use_empty()) {
+              auto newFnType = eraseMemRefInCallerCallees(
+                  moduleOp, funcOp, definingMemOp->getResult(0));
+              funcOp.setFunctionType(newFnType);
+            }
+          }
+        })
+        .Default([](Operation *) {
+          llvm_unreachable("Unhandled memory operation type");
+        });
+
+    return result;
+  }
+
+  LogicalResult replaceMemoryOp(PatternRewriter &rewriter, Operation *memOp,
+                                Value newMemRef, Value newAddr,
+                                IRMapping mapping) const {
+    rewriter.setInsertionPoint(memOp);
+    return TypeSwitch<Operation *, LogicalResult>(memOp)
+        .Case<memref::LoadOp>([&](memref::LoadOp loadOp) {
+          Value newLoadResult = rewriter.replaceOpWithNewOp<memref::LoadOp>(
+              loadOp, newMemRef, SmallVector<Value>{newAddr});
+          mapping.map(loadOp.getResult(), newLoadResult);
+          return success();
+        })
+        .Case<memref::StoreOp>([&](memref::StoreOp storeOp) {
+          rewriter.replaceOpWithNewOp<memref::StoreOp>(
+              storeOp, storeOp.getValue(), newMemRef,
+              SmallVector<Value>{newAddr});
+          return success();
+        })
+        .Default([](Operation *) -> LogicalResult {
+          llvm_unreachable("Unhandled memory operation type");
+          return failure();
+        });
+  }
+
+  Operation *findDefiningOpInCaller(Value value, FuncOp calleeOp,
+                                    FuncOp callerOp) const {
+    Operation *definingOp;
+    assert(isa<BlockArgument>(value));
+    auto blockArg = cast<BlockArgument>(value);
+    for (auto callOp : callerOp.getOps<CallOp>()) {
+      if (callOp.getCallee() == calleeOp.getName()) {
+        assert(callOp.getOperands().size() == calleeOp.getArguments().size() &&
+               "callOp's operands size must match with the block "
+               "argument size of the callee function");
+        definingOp = callOp.getOperand(blockArg.getArgNumber()).getDefiningOp();
+      }
+    }
+    assert(definingOp &&
+           "must have found a defining operation in caller function");
+    return definingOp;
+  }
+
+  SmallVector<Operation *> allocateBanks(PatternRewriter &rewriter,
+                                         Operation *definingMemOp,
+                                         uint availableBanks) const {
+    auto ensureTypeValidForBanking = [&availableBanks](MemRefType memTy) {
+      auto memShape = memTy.getShape();
+      assert(circt::isUniDimensional(memTy) &&
+             "all memories must be flattened before the scf-to-calyx pass");
+      assert(memShape.front() % availableBanks == 0 &&
+             "memory size must be divisible by the banking factor");
+    };
+
+    SmallVector<Operation *> banks;
+    Location loc = definingMemOp->getParentOp()->getLoc();
+    rewriter.setInsertionPointAfter(definingMemOp);
+
+    TypeSwitch<Operation *>(definingMemOp)
+        .Case<memref::AllocOp>([&](memref::AllocOp allocOp) {
+          auto memTy = cast<MemRefType>(allocOp.getMemref().getType());
+          ensureTypeValidForBanking(memTy);
+
+          uint bankSize = memTy.getShape().front() / availableBanks;
+          for (uint bankCnt = 0; bankCnt < availableBanks; bankCnt++) {
+            auto bankAllocOp = rewriter.create<memref::AllocOp>(
+                loc,
+                MemRefType::get(bankSize, memTy.getElementType(),
+                                memTy.getLayout(), memTy.getMemorySpace()));
+            banks.push_back(bankAllocOp);
+          }
+        })
+        .Case<memref::GetGlobalOp>([&](memref::GetGlobalOp getGlobalOp) {
+          auto memTy = cast<MemRefType>(getGlobalOp.getType());
+          ensureTypeValidForBanking(memTy);
+
+          OpBuilder::InsertPoint globalOpsInsertPt, getGlobalOpsInsertPt;
+          uint bankSize = memTy.getShape().front() / availableBanks;
+          for (uint bankCnt = 0; bankCnt < availableBanks; bankCnt++) {
+            auto *symbolTableOp =
+                getGlobalOp->getParentWithTrait<OpTrait::SymbolTable>();
+            auto globalOp =
+                dyn_cast_or_null<memref::GlobalOp>(SymbolTable::lookupSymbolIn(
+                    symbolTableOp, getGlobalOp.getNameAttr()));
+            MemRefType globalOpTy = globalOp.getType();
+            auto cstAttr = llvm::dyn_cast_or_null<DenseElementsAttr>(
+                globalOp.getConstantInitValue());
+            auto allAttrs = cstAttr.getValues<Attribute>();
+            uint beginIdx = bankSize * bankCnt;
+            uint endIdx = bankSize * (bankCnt + 1);
+            SmallVector<Attribute, 8> extractedElements;
+            for (uint i = 0; i < bankSize; i++) {
+              uint idx = bankCnt + availableBanks * i;
+              extractedElements.push_back(allAttrs[idx]);
+            }
+
+            if (bankCnt == 0) {
+              rewriter.setInsertionPointAfter(globalOp);
+              globalOpsInsertPt = rewriter.saveInsertionPoint();
+              rewriter.setInsertionPointAfter(getGlobalOp);
+              getGlobalOpsInsertPt = rewriter.saveInsertionPoint();
+            }
+
+            // Prepare relevant information to create a new `GlobalOp`
+            auto newMemRefTy =
+                MemRefType::get(SmallVector<int64_t>{endIdx - beginIdx},
+                                globalOpTy.getElementType());
+            auto newTypeAttr = TypeAttr::get(newMemRefTy);
+            std::string newNameStr = llvm::formatv(
+                "{0}_{1}x{2}_{3}_{4}", globalOp.getConstantAttrName(),
+                endIdx - beginIdx, globalOpTy.getElementType(), bankCnt,
+                globalCounter);
+            globalCounter++;
+            RankedTensorType tensorType = RankedTensorType::get(
+                {static_cast<int64_t>(extractedElements.size())},
+                globalOpTy.getElementType());
+            auto newInitValue =
+                DenseElementsAttr::get(tensorType, extractedElements);
+
+            // Create a new `GlobalOp`
+            rewriter.restoreInsertionPoint(globalOpsInsertPt);
+            auto newGlobalOp = rewriter.create<memref::GlobalOp>(
+                loc, rewriter.getStringAttr(newNameStr),
+                globalOp.getSymVisibilityAttr(), newTypeAttr, newInitValue,
+                globalOp.getConstantAttr(), globalOp.getAlignmentAttr());
+            rewriter.setInsertionPointAfter(newGlobalOp);
+            globalOpsInsertPt = rewriter.saveInsertionPoint();
+
+            // Create a new `GetGlobalOp` using the above created new `GlobalOp`
+            rewriter.restoreInsertionPoint(getGlobalOpsInsertPt);
+            auto newGetGlobalOp = rewriter.create<memref::GetGlobalOp>(
+                loc, newMemRefTy, newGlobalOp.getName());
+            rewriter.setInsertionPointAfter(newGetGlobalOp);
+            getGlobalOpsInsertPt = rewriter.saveInsertionPoint();
+
+            banks.push_back(newGetGlobalOp);
+          }
+        })
+        .Default([](Operation *) {
+          llvm_unreachable("Unhandled memory operation type");
+        });
+    return banks;
+  }
+
+  int deriveStaticIntVal(Value value) const {
+    Operation *op = value.getDefiningOp();
+    assert(op && "value has to have a defining operation");
+    return TypeSwitch<Operation *, int>(op)
+        .Case<arith::ConstantIndexOp>(
+            [](arith::ConstantIndexOp constOp) -> int {
+              return constOp.value();
+            })
+        .Case<arith::AddIOp>([&](arith::AddIOp addOp) -> int {
+          int lhs = deriveStaticIntVal(addOp.getLhs());
+          int rhs = deriveStaticIntVal(addOp.getRhs());
+          return lhs + rhs;
+        })
+        .Case<arith::MulIOp>([&](arith::MulIOp mulOp) -> int {
+          int lhs = deriveStaticIntVal(mulOp.getLhs());
+          int rhs = deriveStaticIntVal(mulOp.getRhs());
+          return lhs * rhs;
+        })
+        .Case<arith::ShLIOp>([&](arith::ShLIOp shlOp) -> int {
+          int lhs = deriveStaticIntVal(shlOp.getLhs());
+          int rhs = deriveStaticIntVal(shlOp.getRhs());
+          return lhs << rhs;
+        })
+        .Case<arith::SubIOp>([&](arith::SubIOp subOp) -> int {
+          int lhs = deriveStaticIntVal(subOp.getLhs());
+          int rhs = deriveStaticIntVal(subOp.getRhs());
+          return lhs - rhs;
+        })
+        // Add more cases. We can do this only because we would have got error
+        // if we failed to get induction variables as constants.
+        .Default([&](Operation *) -> int {
+          llvm_unreachable("unsupported operation for index evaluation");
+        });
+  }
+
+  std::pair<uint, Value> memoryBankingMap(PatternRewriter &rewriter,
+                                          Operation *insertOp, Value address,
+                                          uint availableBanks) const {
+    rewriter.setInsertionPoint(insertOp);
+    Value availBanksVal =
+        rewriter
+            .create<arith::ConstantOp>(rewriter.getUnknownLoc(),
+                                       rewriter.getIndexAttr(availableBanks))
+            .getResult();
+    Value offset = rewriter
+                       .create<arith::DivUIOp>(rewriter.getUnknownLoc(),
+                                               address, availBanksVal)
+                       .getResult();
+    return std::make_pair(deriveStaticIntVal(address) % availableBanks, offset);
   }
 };
 
@@ -1620,8 +2202,7 @@ class BuildIfGroups : public calyx::FuncOpPartialLoweringPattern {
 
       for (auto ifOpRes : scfIfOp.getResults()) {
         auto reg = createRegister(
-            scfIfOp.getLoc(), rewriter, getComponent(),
-            ifOpRes.getType().getIntOrFloatBitWidth(),
+            scfIfOp.getLoc(), rewriter, getComponent(), ifOpRes.getType(),
             getState<ComponentLoweringState>().getUniqueName("if_res"));
         getState<ComponentLoweringState>().setResultRegs(
             scfIfOp, reg, ifOpRes.getResultNumber());
@@ -1664,7 +2245,8 @@ private:
         getState<ComponentLoweringState>().getBlockScheduleables(block);
     auto loc = block->front().getLoc();
 
-    if (compBlockScheduleables.size() > 1) {
+    if (compBlockScheduleables.size() > 1 &&
+        !isa<scf::ParallelOp>(block->getParentOp())) {
       auto seqOp = rewriter.create<calyx::SeqOp>(loc);
       parentCtrlBlock = seqOp.getBodyBlock();
     }
@@ -1817,6 +2399,17 @@ private:
             instanceOp.getLoc(), instanceOp.getSymName(), instancePorts,
             inputPorts, refCellsAttr, ArrayAttr::get(rewriter.getContext(), {}),
             ArrayAttr::get(rewriter.getContext(), {}));
+      } else if (auto *parSchedPtr = std::get_if<ParScheduleable>(&group)) {
+        auto parOp = parSchedPtr->parOp;
+        auto calyxParOp = rewriter.create<calyx::ParOp>(parOp.getLoc());
+        LogicalResult res = LogicalResult::success();
+        for (auto &innerBlock : parOp.getRegion().getBlocks()) {
+          rewriter.setInsertionPointToEnd(calyxParOp.getBodyBlock());
+          auto seqOp = rewriter.create<calyx::SeqOp>(parOp.getLoc());
+          rewriter.setInsertionPointToEnd(seqOp.getBodyBlock());
+          res = scheduleBasicBlock(rewriter, path, seqOp.getBodyBlock(),
+                                   &innerBlock);
+        }
       } else
         llvm_unreachable("Unknown scheduleable");
     }
@@ -2347,6 +2940,9 @@ void SCFToCalyxPass::runOnOperation() {
   DenseMap<FuncOp, calyx::ComponentOp> funcMap;
   SmallVector<LoweringPattern, 8> loweringPatterns;
   calyx::PatternApplicationState patternState;
+
+  addOncePattern<BuildParGroups>(loweringPatterns, patternState, funcMap,
+                                 *loweringState, numAvailBanksOpt);
 
   /// Creates a new Calyx component for each FuncOp in the inpurt module.
   addOncePattern<FuncOpConversion>(loweringPatterns, patternState, funcMap,
