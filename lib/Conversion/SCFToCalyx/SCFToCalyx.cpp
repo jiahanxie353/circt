@@ -16,22 +16,35 @@
 #include "circt/Dialect/Calyx/CalyxOps.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
+#include "circt/Support/LLVM.h"
+#include "circt/Transforms/Passes.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
+#include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AsmState.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/Visitors.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
-#include <fstream>
+#include "llvm/Support/Error.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/LogicalResult.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/raw_ostream.h"
 
+#include <fstream>
+#include <optional>
 #include <variant>
 
 namespace circt {
@@ -129,6 +142,20 @@ using Scheduleable =
 
 class IfLoweringStateInterface {
 public:
+  void setCondReg(scf::IfOp op, calyx::RegisterOp regOp) {
+    Operation *operation = op.getOperation();
+    assert(condReg.count(operation) == 0 &&
+           "A condition register was already set for this scf::IfOp!\n");
+    condReg[operation] = regOp;
+  }
+
+  calyx::RegisterOp getCondReg(scf::IfOp op) {
+    auto it = condReg.find(op.getOperation());
+    if (it != condReg.end())
+      return it->second;
+    return nullptr;
+  }
+
   void setThenGroup(scf::IfOp op, calyx::GroupOp group) {
     Operation *operation = op.getOperation();
     assert(thenGroup.count(operation) == 0 &&
@@ -176,6 +203,7 @@ public:
   }
 
 private:
+  DenseMap<Operation *, calyx::RegisterOp> condReg;
   DenseMap<Operation *, calyx::GroupOp> thenGroup;
   DenseMap<Operation *, calyx::GroupOp> elseGroup;
   DenseMap<Operation *, DenseMap<unsigned, calyx::RegisterOp>> resultRegs;
@@ -244,6 +272,28 @@ public:
   }
 };
 
+class PipeOpLoweringStateInterface {
+public:
+  void setPipeResReg(Operation *op, calyx::RegisterOp reg) {
+    assert(isa<calyx::MultPipeLibOp>(op) || isa<calyx::DivUPipeLibOp>(op) ||
+           isa<calyx::DivSPipeLibOp>(op) || isa<calyx::RemUPipeLibOp>(op) ||
+           isa<calyx::RemSPipeLibOp>(op));
+    assert(resultRegs.count(op) == 0 &&
+           "A register was already set for this pipe operation!\n");
+    resultRegs[op] = reg;
+  }
+  // Get the register for a specific pipe operation
+  calyx::RegisterOp getPipeResReg(Operation *op) {
+    auto it = resultRegs.find(op);
+    assert(it != resultRegs.end() &&
+           "No register was set for this pipe operation!\n");
+    return it->second;
+  }
+
+private:
+  DenseMap<Operation *, calyx::RegisterOp> resultRegs;
+};
+
 /// Handles the current state of lowering of a Calyx component. It is mainly
 /// used as a key/value store for recording information during partial lowering,
 /// which is required at later lowering passes.
@@ -251,6 +301,7 @@ class ComponentLoweringState : public calyx::ComponentLoweringStateInterface,
                                public WhileLoopLoweringStateInterface,
                                public ForLoopLoweringStateInterface,
                                public IfLoweringStateInterface,
+                               public PipeOpLoweringStateInterface,
                                public calyx::SchedulerInterface<Scheduleable> {
 public:
   ComponentLoweringState(calyx::ComponentOp component)
@@ -359,7 +410,21 @@ private:
   /// source operation TSrcOp.
   template <typename TGroupOp, typename TCalyxLibOp, typename TSrcOp>
   LogicalResult buildLibraryOp(PatternRewriter &rewriter, TSrcOp op,
-                               TypeRange srcTypes, TypeRange dstTypes) const {
+                               TypeRange srcTypes, TypeRange dstTypes,
+                               calyx::RegisterOp srcReg = nullptr,
+                               calyx::RegisterOp dstReg = nullptr) const {
+    auto isPipeLibOp = [](Value val) -> bool {
+      if (Operation *defOp = val.getDefiningOp()) {
+        return isa<calyx::MultPipeLibOp, calyx::DivUPipeLibOp,
+                   calyx::DivSPipeLibOp, calyx::RemUPipeLibOp,
+                   calyx::RemSPipeLibOp>(defOp);
+      }
+      return false;
+    };
+
+    assert((srcReg && dstReg) || (!srcReg && !dstReg));
+    bool isSequential = srcReg && dstReg;
+
     SmallVector<Type> types;
     llvm::append_range(types, srcTypes);
     llvm::append_range(types, dstTypes);
@@ -385,26 +450,54 @@ private:
 
     /// Create assignments to the inputs of the library op.
     auto group = createGroupForOp<TGroupOp>(rewriter, op);
+
+    if (isSequential) {
+      auto groupOp = cast<calyx::GroupOp>(group);
+      getState<ComponentLoweringState>().addBlockScheduleable(op->getBlock(),
+                                                              groupOp);
+    }
+
     rewriter.setInsertionPointToEnd(group.getBodyBlock());
-    for (auto dstOp : enumerate(opInputPorts))
-      rewriter.create<calyx::AssignOp>(op.getLoc(), dstOp.value(),
-                                       op->getOperand(dstOp.index()));
+
+    for (auto dstOp : enumerate(opInputPorts)) {
+      if (isPipeLibOp(dstOp.value()))
+        rewriter.create<calyx::AssignOp>(op.getLoc(), dstOp.value(),
+                                         srcReg.getOut());
+      else
+        rewriter.create<calyx::AssignOp>(op.getLoc(), dstOp.value(),
+                                         op->getOperand(dstOp.index()));
+    }
 
     /// Replace the result values of the source operator with the new operator.
     for (auto res : enumerate(opOutputPorts)) {
       getState<ComponentLoweringState>().registerEvaluatingGroup(res.value(),
                                                                  group);
-      op->getResult(res.index()).replaceAllUsesWith(res.value());
+      if (isSequential)
+        op->getResult(res.index()).replaceAllUsesWith(dstReg.getOut());
+      else
+        op->getResult(res.index()).replaceAllUsesWith(res.value());
     }
+
+    if (isSequential) {
+      auto groupOp = cast<calyx::GroupOp>(group);
+      buildAssignmentsForRegisterWrite(
+          rewriter, groupOp,
+          getState<ComponentLoweringState>().getComponentOp(), dstReg,
+          calyxOp.getOut());
+    }
+
     return success();
   }
 
   /// buildLibraryOp which provides in- and output types based on the operands
   /// and results of the op argument.
   template <typename TGroupOp, typename TCalyxLibOp, typename TSrcOp>
-  LogicalResult buildLibraryOp(PatternRewriter &rewriter, TSrcOp op) const {
+  LogicalResult buildLibraryOp(PatternRewriter &rewriter, TSrcOp op,
+                               calyx::RegisterOp srcReg = nullptr,
+                               calyx::RegisterOp dstReg = nullptr) const {
     return buildLibraryOp<TGroupOp, TCalyxLibOp, TSrcOp>(
-        rewriter, op, op.getOperandTypes(), op->getResultTypes());
+        rewriter, op, op.getOperandTypes(), op->getResultTypes(), srcReg,
+        dstReg);
   }
 
   /// Creates a group named by the basic block which the input op resides in.
@@ -431,6 +524,7 @@ private:
     auto reg = createRegister(
         op.getLoc(), rewriter, getComponent(), width,
         getState<ComponentLoweringState>().getUniqueName(opName));
+
     // Operation pipelines are not combinational, so a GroupOp is required.
     auto group = createGroupForOp<calyx::GroupOp>(rewriter, op);
     OpBuilder builder(group->getRegion(0));
@@ -471,6 +565,8 @@ private:
                                                                group);
     getState<ComponentLoweringState>().registerEvaluatingGroup(
         opPipe.getRight(), group);
+
+    getState<ComponentLoweringState>().setPipeResReg(out.getDefiningOp(), reg);
 
     return success();
   }
@@ -901,7 +997,8 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      scf::YieldOp yieldOp) const {
-  if (yieldOp.getOperands().empty()) {
+  if (yieldOp.getOperands().empty() &&
+      isa<scf::ForOp>(yieldOp->getParentOp())) {
     // If yield operands are empty, we assume we have a for loop.
     auto forOp = dyn_cast<scf::ForOp>(yieldOp->getParentOp());
     assert(forOp && "Empty yieldOps should only be located within ForOps");
@@ -990,6 +1087,8 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   }
 
   if (auto ifOp = dyn_cast<scf::IfOp>(yieldOp->getParentOp())) {
+    if (ifOp.getResults().empty())
+      return success();
     auto resultRegs = getState<ComponentLoweringState>().getResultRegs(ifOp);
 
     if (yieldOp->getParentRegion() == &ifOp.getThenRegion()) {
@@ -1141,9 +1240,43 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      CmpIOp op) const {
+  auto isPipeLibOp = [](Value val) -> bool {
+    if (Operation *defOp = val.getDefiningOp()) {
+      return isa<calyx::MultPipeLibOp, calyx::DivUPipeLibOp,
+                 calyx::DivSPipeLibOp, calyx::RemUPipeLibOp,
+                 calyx::RemSPipeLibOp>(defOp);
+    }
+    return false;
+  };
+
   switch (op.getPredicate()) {
-  case CmpIPredicate::eq:
+  case CmpIPredicate::eq: {
+    StringRef opName = op.getOperationName().split(".").second;
+    Type width = op.getResult().getType();
+    bool isSequential = isPipeLibOp(op.getLhs()) || isPipeLibOp(op.getRhs());
+    if (isSequential) {
+      auto condReg = createRegister(
+          op.getLoc(), rewriter, getComponent(), width.getIntOrFloatBitWidth(),
+          getState<ComponentLoweringState>().getUniqueName(opName));
+
+      for (auto *user : op->getUsers()) {
+        if (auto ifOp = dyn_cast<scf::IfOp>(user))
+          getState<ComponentLoweringState>().setCondReg(ifOp, condReg);
+      }
+
+      calyx::RegisterOp pipeResReg;
+      if (isPipeLibOp(op.getLhs()))
+        pipeResReg = getState<ComponentLoweringState>().getPipeResReg(
+            op.getLhs().getDefiningOp());
+      else
+        pipeResReg = getState<ComponentLoweringState>().getPipeResReg(
+            op.getRhs().getDefiningOp());
+
+      return buildLibraryOp<calyx::GroupOp, calyx::EqLibOp>(
+          rewriter, op, pipeResReg, condReg);
+    }
     return buildLibraryOp<calyx::CombGroupOp, calyx::EqLibOp>(rewriter, op);
+  }
   case CmpIPredicate::ne:
     return buildLibraryOp<calyx::CombGroupOp, calyx::NeqLibOp>(rewriter, op);
   case CmpIPredicate::uge:
@@ -1317,6 +1450,443 @@ class InlineExecuteRegionOpPattern
     rewriter.mergeBlocks(execOpEntryBlock, preBlock);
 
     return success();
+  }
+};
+
+class MemoryBanking : public calyx::FuncOpPartialLoweringPattern {
+  using FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern;
+
+  LogicalResult
+  partiallyLowerFuncToComp(FuncOp funcOp,
+                           PatternRewriter &rewriter) const override {
+    LogicalResult res = success();
+
+    auto moduleOp = funcOp->getParentOfType<ModuleOp>();
+    auto topLevelFn = cast<FuncOp>(SymbolTable::lookupSymbolIn(
+        moduleOp, loweringState().getTopLevelFunction()));
+
+    // Calyx puts the constraint that all memories should be defined in the
+    // top-level function
+    if (funcOp != topLevelFn)
+      return res;
+
+    auto allMemRefDefinitions = collectAllMemRefDefns(funcOp);
+
+    for (auto *defn : allMemRefDefinitions) {
+      if (auto bankAttr =
+              defn->template getAttrOfType<IntegerAttr>("calyx.num_banks")) {
+        uint availableBanks = bankAttr.getInt();
+        if (availableBanks == 1)
+          continue;
+        auto banks = allocateBanks(rewriter, defn, availableBanks);
+
+        if (failed(replaceMemUseWithBanks(rewriter, defn, banks)))
+          return failure();
+      }
+    }
+
+    return res;
+  }
+
+private:
+  LogicalResult insertNewOperandsToCallSites(PatternRewriter &rewriter,
+                                             CallOp callOp,
+                                             SmallVector<Value> &newOperands,
+                                             uint pos) const {
+    auto callee = SymbolTable::lookupNearestSymbolFrom<FuncOp>(
+        callOp, callOp.getCalleeAttr());
+
+    SmallVector<Value> callerOperands(callOp.getOperands());
+    if (pos > callerOperands.size())
+      return rewriter.notifyMatchFailure(
+          callOp, "position cannot be greater than caller operands size");
+    // Insert the new operands after the specified position
+    callerOperands.insert(callerOperands.begin() + pos + 1, newOperands.begin(),
+                          newOperands.end());
+    callOp->setOperands(callerOperands);
+    if (callOp.getNumOperands() != callee.getNumArguments())
+      return rewriter.notifyMatchFailure(
+          callOp, "Number of operands and block arguments should match after "
+                  "insertion");
+
+    return success();
+  }
+
+  // Insert `newArgs` to `pos` argument in `funcOp`
+  LogicalResult insertNewArgsToFunc(PatternRewriter &rewriter, FuncOp funcOp,
+                                    SmallVector<Value> &newArgs,
+                                    uint pos) const {
+    // Get the current argument types
+    SmallVector<Type, 4> updatedCurFnArgTys(funcOp.getArgumentTypes());
+    // Collect the types of the new arguments
+    SmallVector<Type, 4> newArgTys;
+    for (auto arg : newArgs)
+      newArgTys.push_back(arg.getType());
+
+    if (pos > updatedCurFnArgTys.size())
+      return rewriter.notifyMatchFailure(
+          funcOp,
+          "insert position cannot be larger than funcOp's argument numbers");
+
+    // Insert newArgTys after the specified position
+    updatedCurFnArgTys.insert(updatedCurFnArgTys.begin() + pos + 1,
+                              newArgTys.begin(), newArgTys.end());
+    // Insert the new arguments into the function body at the specified position
+    Block &entryBlock = funcOp.getFunctionBody().front();
+    unsigned insertPos = pos + 1;
+    if (pos > entryBlock.getNumArguments())
+      return rewriter.notifyMatchFailure(
+          funcOp, "insert position cannot be larger than function body block's "
+                  "argument numbers");
+
+    for (size_t i = 0; i < newArgTys.size(); ++i) {
+      // The position increases by 1 for each inserted argument
+      entryBlock.insertArgument(insertPos + i, newArgTys[i], funcOp.getLoc());
+    }
+
+    // Create and set the new FunctionType with updated argument types
+    auto newFnTy = FunctionType::get(funcOp.getContext(), updatedCurFnArgTys,
+                                     funcOp.getResultTypes());
+    funcOp.setType(newFnTy);
+
+    return success();
+  }
+
+  Value computeIntraBankingOffset(PatternRewriter &rewriter, Value address,
+                                  uint availableBanks) const {
+    Value availBanksVal =
+        rewriter
+            .create<arith::ConstantOp>(rewriter.getUnknownLoc(),
+                                       rewriter.getIndexAttr(availableBanks))
+            .getResult();
+    Value offset = rewriter
+                       .create<arith::DivUIOp>(rewriter.getUnknownLoc(),
+                                               address, availBanksVal)
+                       .getResult();
+    return offset;
+  }
+
+  void removeMemDefiningOp(Operation *memDefnOp) const {
+    if (auto getGlobalOp = dyn_cast<memref::GetGlobalOp>(memDefnOp)) {
+      auto *symbolTableOp =
+          getGlobalOp->getParentWithTrait<mlir::OpTrait::SymbolTable>();
+      auto globalOp =
+          dyn_cast_or_null<memref::GlobalOp>(SymbolTable::lookupSymbolIn(
+              symbolTableOp, getGlobalOp.getNameAttr()));
+      getGlobalOp->remove();
+      globalOp->remove();
+    } else
+      memDefnOp->remove();
+  }
+
+  // Replace the use of the BlockArgument at `argPos` with new BlockArguments
+  LogicalResult replaceBlockArgWithNewArgs(PatternRewriter &rewriter,
+                                           FuncOp funcOp, uint argPos,
+                                           uint beginIdx, uint endIdx) const {
+    IRMapping replaceMapping;
+
+    auto oldArg = funcOp.getArgument(argPos);
+    SmallVector<Value> replaceArgs(funcOp.getArguments().begin() + beginIdx,
+                                   funcOp.getArguments().begin() + endIdx + 1);
+
+    for (auto &use : llvm::make_early_inc_range(oldArg.getUses())) {
+      Operation *op = use.getOwner();
+
+      LogicalResult result =
+          TypeSwitch<Operation *, LogicalResult>(op)
+              .Case<memref::LoadOp, memref::StoreOp>([&](auto memUseOp) {
+                if (!isUniDimensional(memUseOp.getMemRefType()))
+                  return rewriter.notifyMatchFailure(
+                      memUseOp, "all memories must be flattened before the "
+                                "scf-to-calyx pass");
+
+                // Replace the memory operation with banked mem ops that uses
+                // memory references
+                return replaceMemOpWithBankedMemOps(rewriter, memUseOp,
+                                                    replaceArgs);
+              })
+              .Default([](Operation *) {
+                llvm_unreachable("Unhandled memory operation type");
+                return failure();
+              });
+
+      if (failed(result))
+        return result;
+    }
+
+    return success();
+  }
+
+  LogicalResult eraseOperandFromCallSite(CallOp callOp, Value memrefVal) const {
+    auto argPos = llvm::find(callOp.getOperands(), memrefVal) -
+                  callOp.getOperands().begin();
+    auto *definingMemOp = callOp.getOperand(argPos).getDefiningOp();
+    callOp->eraseOperand(argPos);
+    removeMemDefiningOp(definingMemOp);
+
+    return success();
+  }
+
+  LogicalResult eraseArgInFunc(FuncOp funcOp, uint argPos) const {
+    SmallVector<Type, 4> updatedCurFnArgTys(funcOp.getArgumentTypes());
+    updatedCurFnArgTys.erase(updatedCurFnArgTys.begin() + argPos);
+    funcOp.getBlocks().front().eraseArgument(argPos);
+    auto newFnType = FunctionType::get(funcOp.getContext(), updatedCurFnArgTys,
+                                       funcOp.getFunctionType().getResults());
+    funcOp.setFunctionType(newFnType);
+
+    return success();
+  }
+
+  // Replace `memOp`'s uses with `banks`
+  LogicalResult replaceMemUseWithBanks(PatternRewriter &rewriter,
+                                       Operation *memOp,
+                                       SmallVector<Operation *> &banks) const {
+    SmallVector<Value> bankResults;
+    for (auto *bank : banks)
+      bankResults.push_back(bank->getResult(0));
+
+    for (auto &use : memOp->getResult(0).getUses()) {
+      Operation *userOp = use.getOwner();
+      if (auto callOp = dyn_cast<CallOp>(userOp)) {
+        FuncOp calleeFunc = SymbolTable::lookupNearestSymbolFrom<FuncOp>(
+            callOp, callOp.getCalleeAttr());
+        auto pos = llvm::find(callOp.getOperands(), memOp->getResult(0)) -
+                   callOp.getOperands().begin();
+        if (failed(insertNewArgsToFunc(rewriter, calleeFunc, bankResults, pos)))
+          return failure();
+
+        if (failed(insertNewOperandsToCallSites(rewriter, callOp, bankResults,
+                                                pos)))
+          return failure();
+
+        if (failed(replaceBlockArgWithNewArgs(rewriter, calleeFunc, pos,
+                                              pos + 1, pos + banks.size() + 1)))
+          return failure();
+
+        if (calleeFunc.getArgument(pos).use_empty()) {
+          if (failed(eraseOperandFromCallSite(callOp, memOp->getResult(0))))
+            return failure();
+
+          if (failed(eraseArgInFunc(calleeFunc, pos)))
+            return failure();
+        }
+      } else {
+        LogicalResult result =
+            TypeSwitch<Operation *, LogicalResult>(userOp)
+                .Case<memref::LoadOp, memref::StoreOp>([&](auto memUseOp) {
+                  if (!isUniDimensional(memUseOp.getMemRefType()))
+                    return rewriter.notifyMatchFailure(
+                        memUseOp, "all memories must be flattened before the "
+                                  "scf-to-calyx pass");
+
+                  // Replace the memory operation with banked mems
+                  return replaceMemOpWithBankedMemOps(rewriter, memUseOp,
+                                                      bankResults);
+                })
+                .Default([](Operation *) {
+                  llvm_unreachable("Unhandled memory operation type");
+                  return failure();
+                });
+
+        if (failed(result))
+          return result;
+      }
+    }
+
+    return success();
+  }
+
+  LogicalResult
+  replaceMemOpWithBankedMemOps(PatternRewriter &rewriter, Operation *memOp,
+                               SmallVector<Value> &bankResults) const {
+    Location loc = memOp->getLoc();
+    rewriter.setInsertionPoint(memOp);
+    TypeSwitch<Operation *>(memOp)
+        .Case<memref::LoadOp, memref::StoreOp>([&](auto memUseOp) {
+          // All memory has to be uni-dimensiona
+          Value index = memUseOp.getIndices().front();
+          unsigned numBanks = bankResults.size();
+          Value numBanksValue =
+              rewriter.create<arith::ConstantIndexOp>(loc, numBanks);
+
+          // Compute bank index and local index within the bank
+          Value bankIndex =
+              rewriter.create<arith::RemUIOp>(loc, index, numBanksValue);
+          Value bankAddress =
+              computeIntraBankingOffset(rewriter, index, numBanks);
+
+          // Create switchOp to select the bank
+          SmallVector<Type> resultTypes = {};
+          if (isa<memref::LoadOp>(memUseOp)) {
+            auto loadOp = cast<memref::LoadOp>(memUseOp);
+            resultTypes = {loadOp.getType()};
+          }
+
+          SmallVector<int64_t> caseValues;
+          for (unsigned i = 0; i < numBanks; ++i)
+            caseValues.push_back(i);
+
+          scf::IndexSwitchOp switchOp = rewriter.create<scf::IndexSwitchOp>(
+              loc, resultTypes, bankIndex, caseValues, /*numRegions=*/numBanks);
+
+          // Populate the case regions
+          for (unsigned i = 0; i < numBanks; ++i) {
+            Region &caseRegion = switchOp.getCaseRegions()[i];
+            rewriter.setInsertionPointToStart(&caseRegion.emplaceBlock());
+
+            Value bankMemRef = bankResults[i];
+            if (isa<memref::LoadOp>(memUseOp)) {
+              auto newLoadOp =
+                  rewriter.create<memref::LoadOp>(loc, bankMemRef, bankAddress);
+              // Yield the result of the new load operation
+              rewriter.create<scf::YieldOp>(loc, newLoadOp.getResult());
+            } else {
+              auto storeOp = cast<memref::StoreOp>(memUseOp);
+              rewriter.create<memref::StoreOp>(loc, storeOp.getValueToStore(),
+                                               bankMemRef, bankAddress);
+              rewriter.create<scf::YieldOp>(loc);
+            }
+          }
+
+          Region &defaultRegion = switchOp.getDefaultRegion();
+          assert(defaultRegion.empty() && "Default region should be empty");
+          rewriter.setInsertionPointToStart(&defaultRegion.emplaceBlock());
+
+          if (isa<memref::LoadOp>(memUseOp)) {
+            auto loadOp = cast<memref::LoadOp>(memUseOp);
+            Type loadType = loadOp.getType();
+            TypedAttr zeroAttr =
+                cast<TypedAttr>(rewriter.getZeroAttr(loadType));
+            auto defaultValue =
+                rewriter.create<arith::ConstantOp>(loc, zeroAttr);
+            // Yield the default value zero
+            rewriter.create<scf::YieldOp>(loc, defaultValue.getResult());
+
+            // Replace the original loadOp's result with the switchOp's result
+            loadOp.getResult().replaceAllUsesWith(switchOp.getResult(0));
+          } else
+            rewriter.create<scf::YieldOp>(loc);
+
+          rewriter.eraseOp(memUseOp);
+        })
+        .Default([](Operation *) {
+          llvm_unreachable("Unhandled memory operation type");
+        });
+
+    return success();
+  }
+
+  SmallVector<Operation *> collectAllMemRefDefns(FuncOp funcOp) const {
+    SmallVector<Operation *> allMemRefDefinitions;
+    funcOp.walk([&](Operation *op) {
+      if (isa<memref::AllocOp, memref::AllocaOp, memref::GetGlobalOp>(op)) {
+        allMemRefDefinitions.push_back(op);
+      }
+    });
+
+    return allMemRefDefinitions;
+  }
+
+  mutable std::atomic<unsigned> globalCounter;
+  SmallVector<Operation *> allocateBanks(PatternRewriter &rewriter,
+                                         Operation *definingMemOp,
+                                         uint availableBanks) const {
+    auto ensureTypeValidForBanking = [&availableBanks](MemRefType memTy) {
+      auto memShape = memTy.getShape();
+      assert(circt::isUniDimensional(memTy) &&
+             "all memories must be flattened before the scf-to-calyx pass");
+      assert(memShape.front() % availableBanks == 0 &&
+             "memory size must be divisible by the banking factor");
+    };
+
+    SmallVector<Operation *> banks;
+    Location loc = definingMemOp->getParentOp()->getLoc();
+    rewriter.setInsertionPointAfter(definingMemOp);
+
+    TypeSwitch<Operation *>(definingMemOp)
+        .Case<memref::AllocOp>([&](memref::AllocOp allocOp) {
+          auto memTy = cast<MemRefType>(allocOp.getMemref().getType());
+          ensureTypeValidForBanking(memTy);
+
+          uint bankSize = memTy.getShape().front() / availableBanks;
+          for (uint bankCnt = 0; bankCnt < availableBanks; bankCnt++) {
+            auto bankAllocOp = rewriter.create<memref::AllocOp>(
+                loc,
+                MemRefType::get(bankSize, memTy.getElementType(),
+                                memTy.getLayout(), memTy.getMemorySpace()));
+            banks.push_back(bankAllocOp);
+          }
+        })
+        .Case<memref::GetGlobalOp>([&](memref::GetGlobalOp getGlobalOp) {
+          auto memTy = cast<MemRefType>(getGlobalOp.getType());
+          ensureTypeValidForBanking(memTy);
+
+          OpBuilder::InsertPoint globalOpsInsertPt, getGlobalOpsInsertPt;
+          uint bankSize = memTy.getShape().front() / availableBanks;
+          for (uint bankCnt = 0; bankCnt < availableBanks; bankCnt++) {
+            auto *symbolTableOp =
+                getGlobalOp->getParentWithTrait<OpTrait::SymbolTable>();
+            auto globalOp =
+                dyn_cast_or_null<memref::GlobalOp>(SymbolTable::lookupSymbolIn(
+                    symbolTableOp, getGlobalOp.getNameAttr()));
+            MemRefType globalOpTy = globalOp.getType();
+            auto cstAttr = llvm::dyn_cast_or_null<DenseElementsAttr>(
+                globalOp.getConstantInitValue());
+            auto allAttrs = cstAttr.getValues<Attribute>();
+            uint beginIdx = bankSize * bankCnt;
+            uint endIdx = bankSize * (bankCnt + 1);
+            SmallVector<Attribute, 8> extractedElements;
+            for (uint i = 0; i < bankSize; i++) {
+              uint idx = bankCnt + availableBanks * i;
+              extractedElements.push_back(allAttrs[idx]);
+            }
+
+            if (bankCnt == 0) {
+              rewriter.setInsertionPointAfter(globalOp);
+              globalOpsInsertPt = rewriter.saveInsertionPoint();
+              rewriter.setInsertionPointAfter(getGlobalOp);
+              getGlobalOpsInsertPt = rewriter.saveInsertionPoint();
+            }
+
+            // Prepare relevant information to create a new `GlobalOp`
+            auto newMemRefTy =
+                MemRefType::get(SmallVector<int64_t>{endIdx - beginIdx},
+                                globalOpTy.getElementType());
+            auto newTypeAttr = TypeAttr::get(newMemRefTy);
+            std::string newNameStr = llvm::formatv(
+                "{0}_{1}x{2}_{3}_{4}", globalOp.getConstantAttrName(),
+                endIdx - beginIdx, globalOpTy.getElementType(), bankCnt,
+                globalCounter++);
+            RankedTensorType tensorType = RankedTensorType::get(
+                {static_cast<int64_t>(extractedElements.size())},
+                globalOpTy.getElementType());
+            auto newInitValue =
+                DenseElementsAttr::get(tensorType, extractedElements);
+
+            // Create a new `GlobalOp`
+            rewriter.restoreInsertionPoint(globalOpsInsertPt);
+            auto newGlobalOp = rewriter.create<memref::GlobalOp>(
+                loc, rewriter.getStringAttr(newNameStr),
+                globalOp.getSymVisibilityAttr(), newTypeAttr, newInitValue,
+                globalOp.getConstantAttr(), globalOp.getAlignmentAttr());
+            rewriter.setInsertionPointAfter(newGlobalOp);
+            globalOpsInsertPt = rewriter.saveInsertionPoint();
+
+            // Create a new `GetGlobalOp` using the above created new `GlobalOp`
+            rewriter.restoreInsertionPoint(getGlobalOpsInsertPt);
+            auto newGetGlobalOp = rewriter.create<memref::GetGlobalOp>(
+                loc, newMemRefTy, newGlobalOp.getName());
+            rewriter.setInsertionPointAfter(newGetGlobalOp);
+            getGlobalOpsInsertPt = rewriter.saveInsertionPoint();
+
+            banks.push_back(newGetGlobalOp);
+          }
+        })
+        .Default([](Operation *) {
+          llvm_unreachable("Unhandled memory operation type");
+        });
+    return banks;
   }
 };
 
@@ -1604,13 +2174,15 @@ class BuildIfGroups : public calyx::FuncOpPartialLoweringPattern {
       calyx::ComponentOp componentOp =
           getState<ComponentLoweringState>().getComponentOp();
 
-      std::string thenGroupName =
-          getState<ComponentLoweringState>().getUniqueName("then_br");
-      auto thenGroupOp = calyx::createGroup<calyx::GroupOp>(
-          rewriter, componentOp, scfIfOp.getLoc(), thenGroupName);
-      getState<ComponentLoweringState>().setThenGroup(scfIfOp, thenGroupOp);
+      if (!scfIfOp.getResults().empty()) {
+        std::string thenGroupName =
+            getState<ComponentLoweringState>().getUniqueName("then_br");
+        auto thenGroupOp = calyx::createGroup<calyx::GroupOp>(
+            rewriter, componentOp, scfIfOp.getLoc(), thenGroupName);
+        getState<ComponentLoweringState>().setThenGroup(scfIfOp, thenGroupOp);
+      }
 
-      if (!scfIfOp.getElseRegion().empty()) {
+      if (!scfIfOp.getElseRegion().empty() && !scfIfOp.getResults().empty()) {
         std::string elseGroupName =
             getState<ComponentLoweringState>().getUniqueName("else_br");
         auto elseGroupOp = calyx::createGroup<calyx::GroupOp>(
@@ -1626,6 +2198,79 @@ class BuildIfGroups : public calyx::FuncOpPartialLoweringPattern {
         getState<ComponentLoweringState>().setResultRegs(
             scfIfOp, reg, ifOpRes.getResultNumber());
       }
+
+      return WalkResult::advance();
+    });
+    return res;
+  }
+};
+
+class BuildSwitchGroups : public calyx::FuncOpPartialLoweringPattern {
+  using FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern;
+
+  LogicalResult
+  partiallyLowerFuncToComp(FuncOp funcOp,
+                           PatternRewriter &rewriter) const override {
+    LogicalResult res = success();
+    funcOp.walk([&](Operation *op) {
+      if (!isa<scf::IndexSwitchOp>(op))
+        return WalkResult::advance();
+
+      auto switchOp = cast<scf::IndexSwitchOp>(op);
+      auto loc = switchOp.getLoc();
+
+      Region &defaultRegion = switchOp.getDefaultRegion();
+      Operation *yieldOp = defaultRegion.front().getTerminator();
+      Value defaultResult = {};
+      if (!yieldOp->getOperands().empty())
+        defaultResult = yieldOp->getOperand(0);
+
+      Value finalResult = defaultResult;
+      scf::IfOp prevIfOp = nullptr;
+
+      rewriter.setInsertionPointAfter(switchOp);
+      for (size_t i = 0; i < switchOp.getCases().size(); i++) {
+        auto caseValueInt = switchOp.getCases()[i];
+        if (prevIfOp && !prevIfOp.getElseRegion().empty())
+          rewriter.setInsertionPointToStart(&prevIfOp.getElseRegion().front());
+
+        Value caseValue = rewriter.create<ConstantIndexOp>(loc, caseValueInt);
+        Value cond = rewriter.create<CmpIOp>(
+            loc, CmpIPredicate::eq, *switchOp.getODSOperands(0).begin(),
+            caseValue);
+
+        bool hasElseRegion =
+            (i < switchOp.getCases().size() - 1 || defaultResult);
+        auto ifOp = rewriter.create<scf::IfOp>(loc, switchOp.getResultTypes(),
+                                               cond, hasElseRegion);
+
+        Region &caseRegion = switchOp.getCaseRegions()[i];
+        IRMapping mapping;
+        Block &emptyThenBlock = ifOp.getThenRegion().front();
+        emptyThenBlock.erase();
+        caseRegion.cloneInto(&ifOp.getThenRegion(), mapping);
+
+        if (i == switchOp.getCases().size() - 1 && defaultResult) {
+          rewriter.setInsertionPointToEnd(&ifOp.getElseRegion().front());
+          rewriter.create<scf::YieldOp>(loc, defaultResult);
+        }
+
+        if (prevIfOp && !prevIfOp.getElseRegion().empty()) {
+          rewriter.setInsertionPointToEnd(&prevIfOp.getElseRegion().front());
+          if (!ifOp.getResults().empty())
+            rewriter.create<scf::YieldOp>(loc, ifOp.getResult(0));
+        }
+
+        if (i == 0 && !ifOp.getResults().empty())
+          finalResult = ifOp.getResult(0);
+
+        prevIfOp = ifOp;
+      }
+
+      if (switchOp.getNumResults() == 0)
+        rewriter.eraseOp(switchOp);
+      else
+        rewriter.replaceOp(switchOp, finalResult);
 
       return WalkResult::advance();
     });
@@ -1733,11 +2378,17 @@ private:
         Location loc = ifOp->getLoc();
 
         auto cond = ifOp.getCondition();
-        auto condGroup = getState<ComponentLoweringState>()
-                             .getEvaluatingGroup<calyx::CombGroupOp>(cond);
 
-        auto symbolAttr = FlatSymbolRefAttr::get(
-            StringAttr::get(getContext(), condGroup.getSymName()));
+        FlatSymbolRefAttr symbolAttr = nullptr;
+        auto condReg = getState<ComponentLoweringState>().getCondReg(ifOp);
+        if (!condReg) {
+
+          auto condGroup = getState<ComponentLoweringState>()
+                               .getEvaluatingGroup<calyx::CombGroupOp>(cond);
+
+          symbolAttr = FlatSymbolRefAttr::get(
+              StringAttr::get(getContext(), condGroup.getSymName()));
+        }
 
         bool initElse = !ifOp.getElseRegion().empty();
         auto ifCtrlOp = rewriter.create<calyx::IfOp>(
@@ -1749,12 +2400,19 @@ private:
             rewriter.create<calyx::SeqOp>(ifOp.getThenRegion().getLoc());
         auto *thenSeqOpBlock = thenSeqOp.getBodyBlock();
 
-        rewriter.setInsertionPointToEnd(thenSeqOpBlock);
+        auto *thenBlock = &ifOp.getThenRegion().front();
+        LogicalResult res = buildCFGControl(path, rewriter, thenSeqOpBlock,
+                                            /*preBlock=*/block, thenBlock);
+        if (res.failed())
+          return res;
 
-        calyx::GroupOp thenGroup =
-            getState<ComponentLoweringState>().getThenGroup(ifOp);
-        rewriter.create<calyx::EnableOp>(thenGroup.getLoc(),
-                                         thenGroup.getName());
+        if (!ifOp.getResults().empty()) {
+          rewriter.setInsertionPointToEnd(thenSeqOpBlock);
+          calyx::GroupOp thenGroup =
+              getState<ComponentLoweringState>().getThenGroup(ifOp);
+          rewriter.create<calyx::EnableOp>(thenGroup.getLoc(),
+                                           thenGroup.getName());
+        }
 
         if (!ifOp.getElseRegion().empty()) {
           rewriter.setInsertionPointToEnd(ifCtrlOp.getElseBody());
@@ -1763,12 +2421,19 @@ private:
               rewriter.create<calyx::SeqOp>(ifOp.getElseRegion().getLoc());
           auto *elseSeqOpBlock = elseSeqOp.getBodyBlock();
 
-          rewriter.setInsertionPointToEnd(elseSeqOpBlock);
+          auto *elseBlock = &ifOp.getElseRegion().front();
+          res = buildCFGControl(path, rewriter, elseSeqOpBlock,
+                                /*preBlock=*/block, elseBlock);
+          if (res.failed())
+            return res;
 
-          calyx::GroupOp elseGroup =
-              getState<ComponentLoweringState>().getElseGroup(ifOp);
-          rewriter.create<calyx::EnableOp>(elseGroup.getLoc(),
-                                           elseGroup.getName());
+          if (!ifOp.getResults().empty()) {
+            rewriter.setInsertionPointToEnd(elseSeqOpBlock);
+            calyx::GroupOp elseGroup =
+                getState<ComponentLoweringState>().getElseGroup(ifOp);
+            rewriter.create<calyx::EnableOp>(elseGroup.getLoc(),
+                                             elseGroup.getName());
+          }
         }
       } else if (auto *callSchedPtr = std::get_if<CallScheduleable>(&group)) {
         auto instanceOp = callSchedPtr->instanceOp;
@@ -2348,12 +3013,20 @@ void SCFToCalyxPass::runOnOperation() {
   SmallVector<LoweringPattern, 8> loweringPatterns;
   calyx::PatternApplicationState patternState;
 
+  /// Replace memory accesses with their corresponding banks if the user has
+  /// specified the number of available banks.
+  addOncePattern<MemoryBanking>(loweringPatterns, patternState, funcMap,
+                                *loweringState);
+
   /// Creates a new Calyx component for each FuncOp in the inpurt module.
   addOncePattern<FuncOpConversion>(loweringPatterns, patternState, funcMap,
                                    *loweringState);
 
   /// This pass inlines scf.ExecuteRegionOp's by adding control-flow.
   addGreedyPattern<InlineExecuteRegionOpPattern>(loweringPatterns);
+
+  addOncePattern<BuildSwitchGroups>(loweringPatterns, patternState, funcMap,
+                                    *loweringState);
 
   /// This pattern converts all index typed values to an i32 integer.
   addOncePattern<calyx::ConvertIndexTypes>(loweringPatterns, patternState,
