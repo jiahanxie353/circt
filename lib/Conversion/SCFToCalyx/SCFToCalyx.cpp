@@ -323,8 +323,6 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
       llvm::errs() << "Unable to open file for writing\n";
     }
 
-    llvm::errs() << "after building OpGroups\n";
-    getState<ComponentLoweringState>().getComponentOp().dump();
     return success(opBuiltSuccessfully);
   }
 
@@ -2084,15 +2082,16 @@ class BuildSwitchGroups : public calyx::FuncOpPartialLoweringPattern {
       rewriter.setInsertionPointAfter(switchOp);
       for (size_t i = 0; i < switchOp.getCases().size(); i++) {
         auto caseValueInt = switchOp.getCases()[i];
+        if (prevIfOp)
+          rewriter.setInsertionPointToStart(&prevIfOp.getElseRegion().front());
+
         Value caseValue = rewriter.create<ConstantIndexOp>(loc, caseValueInt);
         Value cond = rewriter.create<CmpIOp>(
             loc, CmpIPredicate::eq, *switchOp.getODSOperands(0).begin(),
             caseValue);
-        if (prevIfOp) {
-          rewriter.setInsertionPointToEnd(&prevIfOp.getElseRegion().front());
-        }
-        scf::IfOp ifOp = rewriter.create<scf::IfOp>(
-            loc, switchOp.getResultTypes(), cond, /*hasElseRegion=*/true);
+
+        auto ifOp = rewriter.create<scf::IfOp>(loc, switchOp.getResultTypes(),
+                                               cond, /*hasElseRegion=*/true);
 
         Region &caseRegion = switchOp.getCaseRegions()[i];
         IRMapping mapping;
@@ -2100,9 +2099,14 @@ class BuildSwitchGroups : public calyx::FuncOpPartialLoweringPattern {
         emptyThenBlock.erase();
         caseRegion.cloneInto(&ifOp.getThenRegion(), mapping);
 
-        rewriter.setInsertionPointToStart(&ifOp.getElseRegion().front());
         if (i == switchOp.getCases().size() - 1) {
+          rewriter.setInsertionPointToEnd(&ifOp.getElseRegion().front());
           rewriter.create<scf::YieldOp>(loc, defaultResult);
+        }
+
+        if (prevIfOp) {
+          rewriter.setInsertionPointToEnd(&prevIfOp.getElseRegion().front());
+          rewriter.create<scf::YieldOp>(loc, ifOp.getResult(0));
         }
 
         if (i == 0)
@@ -2110,10 +2114,7 @@ class BuildSwitchGroups : public calyx::FuncOpPartialLoweringPattern {
         prevIfOp = ifOp;
       }
 
-      llvm::errs() << "replacing final result:\n";
-      finalResult.dump();
       rewriter.replaceOp(switchOp, finalResult);
-      funcOp.dump();
 
       return WalkResult::advance();
     });
