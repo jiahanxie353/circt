@@ -27,6 +27,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AsmState.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/Visitors.h"
 #include "mlir/Pass/Pass.h"
@@ -322,6 +323,8 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
       llvm::errs() << "Unable to open file for writing\n";
     }
 
+    llvm::errs() << "after building OpGroups\n";
+    getState<ComponentLoweringState>().getComponentOp().dump();
     return success(opBuiltSuccessfully);
   }
 
@@ -1524,23 +1527,21 @@ private:
               "all memories must be flattened before the scf-to-calyx pass");
 
         Value index = loadOp.getIndices().front();
-        Value modValue =
+        auto modValue =
             rewriter.create<RemUIOp>(loc, index, numReplacementsValue);
-        Type int64Type = rewriter.getIntegerType(64);
-        Value modIndex = rewriter.create<IndexCastOp>(loc, int64Type, modValue);
 
-        SmallVector<int64_t, 8> caseValues;
         SmallVector<Type, 1> resultTypes;
         if (op->getNumResults() > 0)
           resultTypes.append(op->result_type_begin(), op->result_type_end());
 
+        SmallVector<int64_t, 8> caseValues;
         // Prepare case values
         for (unsigned i = 0; i < numReplacements; i++)
           caseValues.push_back(i);
 
         // Create the IndexSwitchOp
         scf::IndexSwitchOp switchOp = rewriter.create<scf::IndexSwitchOp>(
-            loc, resultTypes, modIndex, caseValues,
+            loc, resultTypes, modValue, caseValues,
             /*numRegions=*/numReplacements);
 
         // Populate the case regions
@@ -2052,6 +2053,67 @@ class BuildIfGroups : public calyx::FuncOpPartialLoweringPattern {
         getState<ComponentLoweringState>().setResultRegs(
             scfIfOp, reg, ifOpRes.getResultNumber());
       }
+
+      return WalkResult::advance();
+    });
+    return res;
+  }
+};
+
+class BuildSwitchGroups : public calyx::FuncOpPartialLoweringPattern {
+  using FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern;
+
+  LogicalResult
+  partiallyLowerFuncToComp(FuncOp funcOp,
+                           PatternRewriter &rewriter) const override {
+    LogicalResult res = success();
+    funcOp.walk([&](Operation *op) {
+      if (!isa<scf::IndexSwitchOp>(op))
+        return WalkResult::advance();
+
+      auto switchOp = cast<scf::IndexSwitchOp>(op);
+      auto loc = switchOp.getLoc();
+
+      Region &defaultRegion = switchOp.getDefaultRegion();
+      Operation *yieldOp = defaultRegion.front().getTerminator();
+      Value defaultResult = yieldOp->getOperand(0);
+
+      Value finalResult = defaultResult;
+      scf::IfOp prevIfOp = nullptr;
+
+      rewriter.setInsertionPointAfter(switchOp);
+      for (size_t i = 0; i < switchOp.getCases().size(); i++) {
+        auto caseValueInt = switchOp.getCases()[i];
+        Value caseValue = rewriter.create<ConstantIndexOp>(loc, caseValueInt);
+        Value cond = rewriter.create<CmpIOp>(
+            loc, CmpIPredicate::eq, *switchOp.getODSOperands(0).begin(),
+            caseValue);
+        if (prevIfOp) {
+          rewriter.setInsertionPointToEnd(&prevIfOp.getElseRegion().front());
+        }
+        scf::IfOp ifOp = rewriter.create<scf::IfOp>(
+            loc, switchOp.getResultTypes(), cond, /*hasElseRegion=*/true);
+
+        Region &caseRegion = switchOp.getCaseRegions()[i];
+        IRMapping mapping;
+        Block &emptyThenBlock = ifOp.getThenRegion().front();
+        emptyThenBlock.erase();
+        caseRegion.cloneInto(&ifOp.getThenRegion(), mapping);
+
+        rewriter.setInsertionPointToStart(&ifOp.getElseRegion().front());
+        if (i == switchOp.getCases().size() - 1) {
+          rewriter.create<scf::YieldOp>(loc, defaultResult);
+        }
+
+        if (i == 0)
+          finalResult = ifOp.getResult(0);
+        prevIfOp = ifOp;
+      }
+
+      llvm::errs() << "replacing final result:\n";
+      finalResult.dump();
+      rewriter.replaceOp(switchOp, finalResult);
+      funcOp.dump();
 
       return WalkResult::advance();
     });
@@ -2787,6 +2849,9 @@ void SCFToCalyxPass::runOnOperation() {
 
   /// This pass inlines scf.ExecuteRegionOp's by adding control-flow.
   addGreedyPattern<InlineExecuteRegionOpPattern>(loweringPatterns);
+
+  addOncePattern<BuildSwitchGroups>(loweringPatterns, patternState, funcMap,
+                                    *loweringState);
 
   /// This pattern converts all index typed values to an i32 integer.
   addOncePattern<calyx::ConvertIndexTypes>(loweringPatterns, patternState,
