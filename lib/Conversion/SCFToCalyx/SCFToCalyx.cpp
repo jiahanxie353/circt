@@ -324,6 +324,7 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
       llvm::errs() << "Unable to open file for writing\n";
     }
 
+    getState<ComponentLoweringState>().getComponentOp().dump();
     return success(opBuiltSuccessfully);
   }
 
@@ -436,6 +437,8 @@ private:
   template <typename TOpType, typename TSrcOp>
   LogicalResult buildLibraryBinaryPipeOp(PatternRewriter &rewriter, TSrcOp op,
                                          TOpType opPipe, Value out) const {
+    llvm::errs() << "before building:\n";
+    getState<ComponentLoweringState>().getComponentOp().dump();
     StringRef opName = TSrcOp::getOperationName().split(".").second;
     Location loc = op.getLoc();
     Type width = op.getResult().getType();
@@ -485,6 +488,8 @@ private:
     getState<ComponentLoweringState>().registerEvaluatingGroup(
         opPipe.getRight(), group);
 
+    llvm::errs() << "after building:\n";
+    getState<ComponentLoweringState>().getComponentOp().dump();
     return success();
   }
 
@@ -914,7 +919,8 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      scf::YieldOp yieldOp) const {
-  if (yieldOp.getOperands().empty()) {
+  if (yieldOp.getOperands().empty() &&
+      isa<scf::ForOp>(yieldOp->getParentOp())) {
     // If yield operands are empty, we assume we have a for loop.
     auto forOp = dyn_cast<scf::ForOp>(yieldOp->getParentOp());
     assert(forOp && "Empty yieldOps should only be located within ForOps");
@@ -1003,6 +1009,8 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   }
 
   if (auto ifOp = dyn_cast<scf::IfOp>(yieldOp->getParentOp())) {
+    if (ifOp.getResults().empty())
+      return success();
     auto resultRegs = getState<ComponentLoweringState>().getResultRegs(ifOp);
 
     if (yieldOp->getParentRegion() == &ifOp.getThenRegion()) {
@@ -1356,6 +1364,8 @@ class MemoryBanking : public calyx::FuncOpPartialLoweringPattern {
       if (auto bankAttr =
               defn->template getAttrOfType<IntegerAttr>("calyx.num_banks")) {
         uint availableBanks = bankAttr.getInt();
+        if (availableBanks == 1)
+          continue;
         auto banks = allocateBanks(rewriter, defn, availableBanks);
 
         if (failed(replaceMemUseWithBanks(rewriter, defn, banks)))
@@ -2052,13 +2062,15 @@ class BuildIfGroups : public calyx::FuncOpPartialLoweringPattern {
       calyx::ComponentOp componentOp =
           getState<ComponentLoweringState>().getComponentOp();
 
-      std::string thenGroupName =
-          getState<ComponentLoweringState>().getUniqueName("then_br");
-      auto thenGroupOp = calyx::createGroup<calyx::GroupOp>(
-          rewriter, componentOp, scfIfOp.getLoc(), thenGroupName);
-      getState<ComponentLoweringState>().setThenGroup(scfIfOp, thenGroupOp);
+      if (!scfIfOp.getResults().empty()) {
+        std::string thenGroupName =
+            getState<ComponentLoweringState>().getUniqueName("then_br");
+        auto thenGroupOp = calyx::createGroup<calyx::GroupOp>(
+            rewriter, componentOp, scfIfOp.getLoc(), thenGroupName);
+        getState<ComponentLoweringState>().setThenGroup(scfIfOp, thenGroupOp);
+      }
 
-      if (!scfIfOp.getElseRegion().empty()) {
+      if (!scfIfOp.getElseRegion().empty() && !scfIfOp.getResults().empty()) {
         std::string elseGroupName =
             getState<ComponentLoweringState>().getUniqueName("else_br");
         auto elseGroupOp = calyx::createGroup<calyx::GroupOp>(
@@ -2097,7 +2109,9 @@ class BuildSwitchGroups : public calyx::FuncOpPartialLoweringPattern {
 
       Region &defaultRegion = switchOp.getDefaultRegion();
       Operation *yieldOp = defaultRegion.front().getTerminator();
-      Value defaultResult = yieldOp->getOperand(0);
+      Value defaultResult = {};
+      if (!yieldOp->getOperands().empty())
+        defaultResult = yieldOp->getOperand(0);
 
       Value finalResult = defaultResult;
       scf::IfOp prevIfOp = nullptr;
@@ -2105,7 +2119,7 @@ class BuildSwitchGroups : public calyx::FuncOpPartialLoweringPattern {
       rewriter.setInsertionPointAfter(switchOp);
       for (size_t i = 0; i < switchOp.getCases().size(); i++) {
         auto caseValueInt = switchOp.getCases()[i];
-        if (prevIfOp)
+        if (prevIfOp && !prevIfOp.getElseRegion().empty())
           rewriter.setInsertionPointToStart(&prevIfOp.getElseRegion().front());
 
         Value caseValue = rewriter.create<ConstantIndexOp>(loc, caseValueInt);
@@ -2113,8 +2127,10 @@ class BuildSwitchGroups : public calyx::FuncOpPartialLoweringPattern {
             loc, CmpIPredicate::eq, *switchOp.getODSOperands(0).begin(),
             caseValue);
 
+        bool hasElseRegion =
+            (i < switchOp.getCases().size() - 1 || defaultResult);
         auto ifOp = rewriter.create<scf::IfOp>(loc, switchOp.getResultTypes(),
-                                               cond, /*hasElseRegion=*/true);
+                                               cond, hasElseRegion);
 
         Region &caseRegion = switchOp.getCaseRegions()[i];
         IRMapping mapping;
@@ -2122,25 +2138,31 @@ class BuildSwitchGroups : public calyx::FuncOpPartialLoweringPattern {
         emptyThenBlock.erase();
         caseRegion.cloneInto(&ifOp.getThenRegion(), mapping);
 
-        if (i == switchOp.getCases().size() - 1) {
+        if (i == switchOp.getCases().size() - 1 && defaultResult) {
           rewriter.setInsertionPointToEnd(&ifOp.getElseRegion().front());
           rewriter.create<scf::YieldOp>(loc, defaultResult);
         }
 
-        if (prevIfOp) {
+        if (prevIfOp && !prevIfOp.getElseRegion().empty()) {
           rewriter.setInsertionPointToEnd(&prevIfOp.getElseRegion().front());
-          rewriter.create<scf::YieldOp>(loc, ifOp.getResult(0));
+          if (!ifOp.getResults().empty())
+            rewriter.create<scf::YieldOp>(loc, ifOp.getResult(0));
         }
 
-        if (i == 0)
+        if (i == 0 && !ifOp.getResults().empty())
           finalResult = ifOp.getResult(0);
+
         prevIfOp = ifOp;
       }
 
-      rewriter.replaceOp(switchOp, finalResult);
+      if (switchOp.getNumResults() == 0)
+        rewriter.eraseOp(switchOp);
+      else
+        rewriter.replaceOp(switchOp, finalResult);
 
       return WalkResult::advance();
     });
+    funcOp.dump();
     return res;
   }
 };
@@ -2267,11 +2289,13 @@ private:
         if (res.failed())
           return res;
 
-        rewriter.setInsertionPointToEnd(thenSeqOpBlock);
-        calyx::GroupOp thenGroup =
-            getState<ComponentLoweringState>().getThenGroup(ifOp);
-        rewriter.create<calyx::EnableOp>(thenGroup.getLoc(),
-                                         thenGroup.getName());
+        if (!ifOp.getResults().empty()) {
+          rewriter.setInsertionPointToEnd(thenSeqOpBlock);
+          calyx::GroupOp thenGroup =
+              getState<ComponentLoweringState>().getThenGroup(ifOp);
+          rewriter.create<calyx::EnableOp>(thenGroup.getLoc(),
+                                           thenGroup.getName());
+        }
 
         if (!ifOp.getElseRegion().empty()) {
           rewriter.setInsertionPointToEnd(ifCtrlOp.getElseBody());
@@ -2286,12 +2310,16 @@ private:
           if (res.failed())
             return res;
 
-          rewriter.setInsertionPointToEnd(elseSeqOpBlock);
-          calyx::GroupOp elseGroup =
-              getState<ComponentLoweringState>().getElseGroup(ifOp);
-          rewriter.create<calyx::EnableOp>(elseGroup.getLoc(),
-                                           elseGroup.getName());
+          if (!ifOp.getResults().empty()) {
+            rewriter.setInsertionPointToEnd(elseSeqOpBlock);
+            calyx::GroupOp elseGroup =
+                getState<ComponentLoweringState>().getElseGroup(ifOp);
+            rewriter.create<calyx::EnableOp>(elseGroup.getLoc(),
+                                             elseGroup.getName());
+          }
         }
+
+        getState<ComponentLoweringState>().getComponentOp().dump();
       } else if (auto *callSchedPtr = std::get_if<CallScheduleable>(&group)) {
         auto instanceOp = callSchedPtr->instanceOp;
         auto callBody = rewriter.create<calyx::SeqOp>(instanceOp.getLoc());
