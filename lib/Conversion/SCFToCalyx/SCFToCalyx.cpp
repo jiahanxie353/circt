@@ -1587,7 +1587,7 @@ private:
 
     auto oldArg = funcOp.getArgument(argPos);
     SmallVector<Value> replaceArgs(funcOp.getArguments().begin() + beginIdx,
-                                   funcOp.getArguments().begin() + endIdx + 1);
+                                   funcOp.getArguments().begin() + endIdx);
 
     for (auto &use : llvm::make_early_inc_range(oldArg.getUses())) {
       Operation *op = use.getOwner();
@@ -2192,8 +2192,7 @@ class BuildIfGroups : public calyx::FuncOpPartialLoweringPattern {
 
       for (auto ifOpRes : scfIfOp.getResults()) {
         auto reg = createRegister(
-            scfIfOp.getLoc(), rewriter, getComponent(),
-            ifOpRes.getType().getIntOrFloatBitWidth(),
+            scfIfOp.getLoc(), rewriter, getComponent(), ifOpRes.getType(),
             getState<ComponentLoweringState>().getUniqueName("if_res"));
         getState<ComponentLoweringState>().setResultRegs(
             scfIfOp, reg, ifOpRes.getResultNumber());
@@ -2890,18 +2889,35 @@ private:
 
     builder.setInsertionPointToEnd(callerEntryBlock);
     for (auto *op : opsToModify) {
-        Value newOpRes;
-        if (auto allocaOp = dyn_cast<memref::AllocaOp>(op)) {
-          newOpRes = builder.create<memref::AllocaOp>(callee.getLoc(), allocaOp.getType());
+      Operation *newOp;
+      if (auto allocaOp = dyn_cast<memref::AllocaOp>(op)) {
+        newOp = builder.create<memref::AllocaOp>(callee.getLoc(),
+                                                 allocaOp.getType());
+        for (auto attr : allocaOp->getAttrs()) {
+          newOp->setAttr(attr.getName(), attr.getValue());
+        }
         }
         else if (auto allocOp = dyn_cast<memref::AllocOp>(op)) {
-          newOpRes = builder.create<memref::AllocOp>(callee.getLoc(), allocOp.getType());
+          newOp = builder.create<memref::AllocOp>(callee.getLoc(),
+                                                  allocOp.getType());
+          for (auto attr : allocOp->getAttrs()) {
+            newOp->setAttr(attr.getName(), attr.getValue());
+          }
         } else if (auto getGlobalOp = dyn_cast<memref::GetGlobalOp>(op)) {
-          newOpRes = builder.create<memref::GetGlobalOp>(caller.getLoc(), getGlobalOp.getType(), getGlobalOp.getName());
+          newOp = builder.create<memref::GetGlobalOp>(
+              caller.getLoc(), getGlobalOp.getType(),
+              getGlobalOp.getNameAttr());
+          for (auto attr : getGlobalOp->getAttrs()) {
+            if (attr.getName() != getGlobalOp.getNameAttrName()) {
+              newOp->setAttr(attr.getName(), attr.getValue());
+            }
+          }
         }
-        extraMemRefOperands.push_back(newOpRes); 
+        assert(newOp);
+        extraMemRefOperands.push_back(newOp->getResult(0));
 
-        calleeFnBody->addArgument(newOpRes.getType(), callee.getLoc());
+        calleeFnBody->addArgument(newOp->getResult(0).getType(),
+                                  callee.getLoc());
         BlockArgument newBodyArg = calleeFnBody->getArguments().back();
         op->getResult(0).replaceAllUsesWith(newBodyArg);
         op->erase();
