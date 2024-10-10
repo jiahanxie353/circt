@@ -362,7 +362,6 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
       llvm::errs() << "Unable to open file for writing\n";
     }
 
-    getState<ComponentLoweringState>().getComponentOp().dump();
     return success(opBuiltSuccessfully);
   }
 
@@ -517,8 +516,6 @@ private:
   template <typename TOpType, typename TSrcOp>
   LogicalResult buildLibraryBinaryPipeOp(PatternRewriter &rewriter, TSrcOp op,
                                          TOpType opPipe, Value out) const {
-    llvm::errs() << "before building:\n";
-    getState<ComponentLoweringState>().getComponentOp().dump();
     StringRef opName = TSrcOp::getOperationName().split(".").second;
     Location loc = op.getLoc();
     Type width = op.getResult().getType();
@@ -2277,7 +2274,6 @@ class BuildSwitchGroups : public calyx::FuncOpPartialLoweringPattern {
 
       return WalkResult::advance();
     });
-    funcOp.dump();
     return res;
   }
 };
@@ -2386,6 +2382,7 @@ private:
         FlatSymbolRefAttr symbolAttr = nullptr;
         auto condReg = getState<ComponentLoweringState>().getCondReg(ifOp);
         if (!condReg) {
+
           auto condGroup = getState<ComponentLoweringState>()
                                .getEvaluatingGroup<calyx::CombGroupOp>(cond);
 
@@ -2438,8 +2435,6 @@ private:
                                              elseGroup.getName());
           }
         }
-
-        getState<ComponentLoweringState>().getComponentOp().dump();
       } else if (auto *callSchedPtr = std::get_if<CallScheduleable>(&group)) {
         auto instanceOp = callSchedPtr->instanceOp;
         auto callBody = rewriter.create<calyx::SeqOp>(instanceOp.getLoc());
