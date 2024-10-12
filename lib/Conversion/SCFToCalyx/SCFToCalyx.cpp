@@ -2336,7 +2336,6 @@ class BuildSwitchGroups : public calyx::FuncOpPartialLoweringPattern {
       if (constOp) {
         // Extract the constant value
         int64_t constValue = cast<IntegerAttr>(constOp.getValue()).getInt();
-        llvm::errs() << "is const: " << constValue << "\n";
 
         // Determine which case to select
         size_t selectedCase = switchOp.getCases().size(); // Default case index
@@ -2438,6 +2437,91 @@ class BuildSwitchGroups : public calyx::FuncOpPartialLoweringPattern {
 
       return WalkResult::advance();
     });
+
+    return res;
+  }
+};
+
+class ParLICM : public calyx::FuncOpPartialLoweringPattern {
+  using FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern;
+
+  LogicalResult
+  partiallyLowerFuncToComp(FuncOp funcOp,
+                           PatternRewriter &rewriter) const override {
+    LogicalResult res = success();
+
+    funcOp.walk([&](Operation *op) {
+      if (!isa<scf::ParallelOp>(op))
+        return WalkResult::advance();
+
+      auto scfParOp = cast<scf::ParallelOp>(op);
+
+      llvm::errs() << "before LICM:\n";
+      scfParOp.dump();
+
+      DenseMap<std::pair<Value, Value>, Value> hoistedLoads;
+      DenseSet<std::pair<Value, Value>> nonHoistable;
+
+      scfParOp.walk([&](Operation *innerOp) {
+        if (!isa<memref::LoadOp>(innerOp) && !isa<memref::StoreOp>(innerOp))
+          return WalkResult::advance();
+
+        if (auto storeOp = dyn_cast<memref::StoreOp>(innerOp)) {
+          Value memref = storeOp.getMemRef();
+          Value index = storeOp.getIndices()[0];
+
+          // If a store operation exists, remove any existing hoisting for this
+          // memory
+          llvm::errs() << "removing from hoistedLoads\n";
+          memref.dump();
+          hoistedLoads.erase(std::make_pair(memref, index));
+          nonHoistable.insert(std::make_pair(memref, index));
+          return WalkResult::advance();
+        }
+
+        if (auto loadOp = dyn_cast<memref::LoadOp>(innerOp)) {
+          Value memref = loadOp.getMemRef();
+          Value index = loadOp.getIndices()[0];
+
+          if (auto constantIndex = index.getDefiningOp<arith::ConstantOp>()) {
+            llvm::errs() << "is constantIndex\n";
+            // If this memref + index has been hoisted, reuse the hoisted value
+            auto key = std::make_pair(memref, index);
+
+            if (nonHoistable.count(key)) {
+              return WalkResult::advance(); // Don't hoist, just leave the load
+                                            // as is
+            }
+
+            if (hoistedLoads.count(key)) {
+              // Replace the load operation with the hoisted value
+              loadOp.replaceAllUsesWith(hoistedLoads.at(key));
+              loadOp.erase();
+            } else {
+              // Hoist this load operation
+              rewriter.setInsertionPoint(scfParOp);
+              auto hoistedLoad = rewriter.create<memref::LoadOp>(
+                  scfParOp.getLoc(), memref, index);
+              llvm::errs() << "hoisted:\n";
+              hoistedLoad.dump();
+              hoistedLoads[key] = hoistedLoad.getResult();
+
+              // Replace the current load with the hoisted load value
+              loadOp.replaceAllUsesWith(hoistedLoad.getResult());
+              loadOp.erase();
+            }
+          }
+          return WalkResult::advance();
+        }
+
+        return WalkResult::advance();
+      });
+
+      return WalkResult::advance();
+    });
+
+    llvm::errs() << "after LICM:\n";
+    funcOp.dump();
 
     return res;
   }
@@ -3155,11 +3239,13 @@ private:
          enumerate(callee.getArguments().take_front(originalCalleeArgNum))) {
       if (isa<MemRefType>(arg.value().getType())) {
         auto argAttrs = callee.getArgAttrDict(arg.index());
-        auto bankAttr = argAttrs.getNamed("calyx.num_banks");
         auto memrefType = cast<MemRefType>(arg.value().getType());
         auto allocOp = builder.create<memref::AllocOp>(callee.getLoc(), memrefType);
-        if (bankAttr.has_value())
-          allocOp->setAttr(bankAttr->getName(), bankAttr->getValue());
+        if (argAttrs) {
+          auto bankAttr = argAttrs.getNamed("calyx.num_banks");
+          if (bankAttr.has_value())
+            allocOp->setAttr(bankAttr->getName(), bankAttr->getValue());
+        }
         calleeArgFnOperands.push_back(allocOp);
       } else {
         auto callerArg = callerEntryBlock->getArgument(otherArgsCount++);
@@ -3298,6 +3384,9 @@ void SCFToCalyxPass::runOnOperation() {
 
   addOncePattern<BuildIfGroups>(loweringPatterns, patternState, funcMap,
                                 *loweringState);
+
+  addOncePattern<ParLICM>(loweringPatterns, patternState, funcMap,
+                          *loweringState);
 
   /// This pattern converts operations within basic blocks to Calyx library
   /// operators. Combinational operations are assigned inside a
