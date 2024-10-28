@@ -1924,12 +1924,39 @@ class BuildParGroups : public calyx::FuncOpPartialLoweringPattern {
     funcOp.walk([&](Operation *op) {
       if (!isa<scf::ParallelOp>(op))
         return WalkResult::advance();
+
       auto scfParOp = cast<scf::ParallelOp>(op);
+      llvm::errs() << "par loop attrs:\n";
+      for (auto attr : scfParOp->getAttrs()) {
+        llvm::errs() << attr.getName() << "\n";
+        attr.getValue().dump();
+      }
+      int unrollFactor = 0;
+      auto attrDict = scfParOp->getAttrDictionary();
+      if (attrDict) {
+        auto unrollAttr = attrDict.getNamed("calyx.unroll");
+        if (unrollAttr.has_value()) {
+          auto intUnroll = dyn_cast<IntegerAttr>(unrollAttr->getValue());
+          unrollFactor = intUnroll.getInt();
+        }
+      }
+
+      llvm::errs() << "unroll factor: " << unrollFactor << "\n";
+
       IRMapping cloningMap;
       if (failed(processParLoop(scfParOp, cloningMap, rewriter))) {
         res = failure();
         return WalkResult::interrupt();
       }
+
+      if (failed(groupBlocks(rewriter, scfParOp, unrollFactor, cloningMap))) {
+        res = failure();
+        return WalkResult::interrupt();
+      }
+
+      llvm::errs() << "after grouping the blocks:\n";
+      funcOp.dump();
+
       return WalkResult::advance();
     });
 
@@ -1997,6 +2024,54 @@ private:
     // Because of the assumption that `scf::ParallelOp` has only one region
     // capturing the loop body
     body->erase();
+    return success();
+  }
+
+  LogicalResult groupBlocks(PatternRewriter &rewriter,
+                            scf::ParallelOp parallelOp, uint unrollFactor,
+                            IRMapping mapping) const {
+    Region &region = parallelOp.getRegion();
+    if (region.empty())
+      return success();
+
+    // Get the list of blocks to group
+    SmallVector<Block *, 8> blocks;
+    for (Block &block : region.getBlocks()) {
+      blocks.push_back(&block);
+    }
+
+    // Check if there are enough blocks for grouping
+    if (blocks.size() <= unrollFactor)
+      return failure();
+
+    OpBuilder builder(parallelOp);
+
+    // Create new blocks to merge into
+    SmallVector<Block *, 2> newBlocks;
+    for (uint i = 0; i < unrollFactor; ++i) {
+      newBlocks.push_back(new Block);
+      region.push_back(newBlocks[i]); // Insert new block into the region
+    }
+
+    // Group blocks in a round-robin fashion based on the unroll factor
+    for (uint i = 0; i < blocks.size(); ++i) {
+      Block *sourceBlock = blocks[i];
+      Block *targetBlock =
+          newBlocks[i % unrollFactor]; // Select the round-robin target block
+
+      // Move operations from the source block to the target block
+      builder.setInsertionPointToEnd(targetBlock);
+      for (Operation &op : sourceBlock->getOperations()) {
+        builder.clone(op, mapping); // Clone the operation with remapping
+      }
+    }
+
+    // After moving operations, erase the source block (except the first one)
+    for (Block *block : blocks) {
+      block
+          ->erase(); // Remove the original block after its operations are moved
+    }
+
     return success();
   }
 };
