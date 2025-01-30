@@ -1,4 +1,4 @@
-// RUN: circt-opt %s -memory-banking="factor=3 dimension=1"
+// RUN: circt-opt %s -memory-banking="factors=3 dimensions=1"
 
 // CHECK: #[[$ATTR_0:.+]] = affine_map<(d0, d1) -> (d1 mod 5)>
 // CHECK: #[[$ATTR_1:.+]] = affine_map<(d0, d1) -> (d1 floordiv 5)>
