@@ -206,16 +206,12 @@ SmallVector<Value, 4> handleGetGlobalOp(memref::GetGlobalOp getGlobalOp,
 }
 
 SmallVector<unsigned>
-getSpecifiedOrDefaultBankingDim(SmallVector<unsigned> &bankingDimensions,
-                                int64_t rank, ArrayRef<int64_t> shape) {
-  // If the banking dimension is already specified, return it.
-  // Note, the banking dimension will always be nonempty because TableGen will
-  // assign it with a default value -1 if it's not specified by the user. Thus,
-  // -1 is the sentinel value to indicate the default behavior, which is the
-  // innermost dimension with shape greater than 1.
-  if (!bankingDimensions.empty()) {
-    return bankingDimensions;
-  }
+getSpecifiedOrDefaultBankingDims(ArrayRef<unsigned> bankingDimensions,
+                                 int64_t rank, ArrayRef<int64_t> shape) {
+  // If the banking dimensions are already specified, return it.
+  if (!bankingDimensions.empty())
+    return SmallVector<unsigned>{bankingDimensions.begin(),
+                                 bankingDimensions.end()};
 
   // Otherwise, find the innermost dimension with size > 1.
   // For example, [[1], [2], [3], [4]] with `bankingFactor`=2 will be banked to
@@ -235,8 +231,8 @@ getSpecifiedOrDefaultBankingDim(SmallVector<unsigned> &bankingDimensions,
 // Retrieve potentially specified banking factor/dimension attributes and
 // overwrite the command line or the default ones.
 void resolveBankingAttributes(Value originalMem,
-                              SmallVectorImpl<unsigned> &bankingFactors,
-                              SmallVectorImpl<unsigned> &bankingDimensions) {
+                              MutableArrayRef<unsigned> bankingFactors,
+                              MutableArrayRef<unsigned> bankingDimensions) {
   if (auto *originalDef = originalMem.getDefiningOp()) {
     if (auto attrFactor = dyn_cast_if_present<IntegerAttr>(
             originalDef->getAttr("banking.factor")))
@@ -329,14 +325,14 @@ void updateFuncOpArgAttrs(func::FuncOp funcOp, unsigned argIndex,
 }
 
 SmallVector<Value, 4> createBanks(Value originalMem,
-                                  SmallVector<unsigned> bankingFactors,
-                                  SmallVector<unsigned> &bankingDimensions) {
+                                  MutableArrayRef<unsigned> bankingFactors,
+                                  MutableArrayRef<unsigned> bankingDimensions) {
   MemRefType originalMemRefType = cast<MemRefType>(originalMem.getType());
   unsigned rank = originalMemRefType.getRank();
   ArrayRef<int64_t> shape = originalMemRefType.getShape();
 
   SmallVector<unsigned> updatedBankingDims =
-      getSpecifiedOrDefaultBankingDim(bankingDimensions, rank, shape);
+      getSpecifiedOrDefaultBankingDims(bankingDimensions, rank, shape);
 
   resolveBankingAttributes(originalMem, bankingFactors, updatedBankingDims);
 
@@ -404,8 +400,8 @@ SmallVector<Value, 4> createBanks(Value originalMem,
 struct BankAffineLoadPattern
     : public OpRewritePattern<mlir::affine::AffineLoadOp> {
   BankAffineLoadPattern(MLIRContext *context,
-                        SmallVector<unsigned> &bankingFactors,
-                        SmallVector<unsigned> &bankingDimensions,
+                        MutableArrayRef<unsigned> bankingFactors,
+                        MutableArrayRef<unsigned> bankingDimensions,
                         DenseMap<Value, SmallVector<Value>> &memoryToBanks,
                         DenseSet<Value> &oldMemRefVals)
       : OpRewritePattern<mlir::affine::AffineLoadOp>(context),
@@ -423,7 +419,7 @@ struct BankAffineLoadPattern
     ArrayRef<int64_t> shape = originalMemRefType.getShape();
 
     SmallVector<unsigned> updatedBankingDims =
-        getSpecifiedOrDefaultBankingDim(bankingDimensions, memrefRank, shape);
+        getSpecifiedOrDefaultBankingDims(bankingDimensions, memrefRank, shape);
 
     resolveBankingAttributes(originalMem, bankingFactors, updatedBankingDims);
 
@@ -483,8 +479,8 @@ struct BankAffineLoadPattern
   }
 
 private:
-  SmallVector<unsigned> &bankingFactors;
-  SmallVector<unsigned> &bankingDimensions;
+  MutableArrayRef<unsigned> bankingFactors;
+  MutableArrayRef<unsigned> bankingDimensions;
   DenseMap<Value, SmallVector<Value>> &memoryToBanks;
   DenseSet<Value> &oldMemRefVals;
 };
@@ -493,8 +489,8 @@ private:
 struct BankAffineStorePattern
     : public OpRewritePattern<mlir::affine::AffineStoreOp> {
   BankAffineStorePattern(MLIRContext *context,
-                         SmallVector<unsigned> &bankingFactors,
-                         SmallVector<unsigned> &bankingDimensions,
+                         MutableArrayRef<unsigned> bankingFactors,
+                         MutableArrayRef<unsigned> bankingDimensions,
                          DenseMap<Value, SmallVector<Value>> &memoryToBanks,
                          DenseSet<Operation *> &opsToErase,
                          DenseSet<Operation *> &processedOps,
@@ -518,7 +514,7 @@ struct BankAffineStorePattern
     ArrayRef<int64_t> shape = originalMemRefType.getShape();
 
     SmallVector<unsigned> updatedBankingDims =
-        getSpecifiedOrDefaultBankingDim(bankingDimensions, memrefRank, shape);
+        getSpecifiedOrDefaultBankingDims(bankingDimensions, memrefRank, shape);
 
     resolveBankingAttributes(originalMem, bankingFactors, updatedBankingDims);
 
@@ -573,8 +569,8 @@ struct BankAffineStorePattern
   }
 
 private:
-  SmallVector<unsigned> &bankingFactors;
-  SmallVector<unsigned> &bankingDimensions;
+  MutableArrayRef<unsigned> bankingFactors;
+  MutableArrayRef<unsigned> bankingDimensions;
   DenseMap<Value, SmallVector<Value>> &memoryToBanks;
   DenseSet<Operation *> &opsToErase;
   DenseSet<Operation *> &processedOps;
@@ -706,17 +702,11 @@ void MemoryBankingPass::runOnOperation() {
     return;
   }
 
-  if (bankingDimensions.empty()) {
-    // If there is only one banking factor specified, we'll leave it with the
-    // default behavior; otherwise, it's an error.
-    if (bankingFactors.size() >= 2) {
-      getOperation().emitError("the number of banking factors must be equal to "
-                               "the number of banking dimensions");
-      signalPassFailure();
-      return;
-    }
-  } else {
-    if (bankingFactors.size() != bankingDimensions.size()) {
+  if (bankingFactors.size() != bankingDimensions.size()) {
+    // For the second check, if banking dimensions are not specified and there
+    // is only one banking factor specified, we'll leave it with the default
+    // behavior; otherwise, it's an error.
+    if (!bankingDimensions.empty() || bankingFactors.size() >= 2) {
       getOperation().emitError("the number of banking factors must be equal to "
                                "the number of banking dimensions");
       signalPassFailure();
