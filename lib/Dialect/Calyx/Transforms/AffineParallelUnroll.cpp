@@ -14,12 +14,14 @@
 #include "circt/Dialect/Calyx/CalyxPasses.h"
 #include "circt/Support/LLVM.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 namespace circt {
 namespace calyx {
@@ -35,12 +37,14 @@ using namespace mlir::arith;
 
 namespace {
 
-struct AffineParallelUnroll : public OpConversionPattern<AffineParallelOp> {
-  using OpConversionPattern::OpConversionPattern;
+struct AffineParallelUnroll : public OpRewritePattern<AffineParallelOp> {
+  using OpRewritePattern::OpRewritePattern;
 
-  LogicalResult
-  matchAndRewrite(AffineParallelOp affineParallelOp, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
+  LogicalResult matchAndRewrite(AffineParallelOp affineParallelOp,
+                                PatternRewriter &rewriter) const override {
+    if (affineParallelOp->hasAttr("calyx.parallel"))
+      return failure();
+
     if (!affineParallelOp.getResults().empty()) {
       affineParallelOp.emitError(
           "affine.parallel with reductions is not supported yet");
@@ -50,10 +54,19 @@ struct AffineParallelUnroll : public OpConversionPattern<AffineParallelOp> {
     Location loc = affineParallelOp.getLoc();
 
     rewriter.setInsertionPointAfter(affineParallelOp);
-    // Create a single-iteration for loop op and mark its specialty by setting
-    // the attribute.
-    AffineForOp affineForOp = rewriter.create<AffineForOp>(loc, 0, 1, 1);
-    affineForOp->setAttr("calyx.parallel", rewriter.getBoolAttr(true));
+    // Create a single-iteration parallel loop op and mark its special by
+    // setting the attribute.
+    AffineMap lbMap = AffineMap::get(0, 0, rewriter.getAffineConstantExpr(0),
+                                     rewriter.getContext());
+    AffineMap ubMap = AffineMap::get(0, 0, rewriter.getAffineConstantExpr(1),
+                                     rewriter.getContext());
+    auto newParallelOp = rewriter.create<AffineParallelOp>(
+        loc, /*resultTypes=*/TypeRange(),
+        /*reductions=*/SmallVector<arith::AtomicRMWKind>(),
+        /*lowerBoundsMap=*/lbMap, /*lowerBoundsOperands=*/SmallVector<Value>(),
+        /*upperBoundsMap=*/ubMap, /*upperBoundsOperands=*/SmallVector<Value>(),
+        /*steps=*/SmallVector<int64_t>({1}));
+    newParallelOp->setAttr("calyx.parallel", rewriter.getBoolAttr(true));
 
     SmallVector<int64_t> pLoopLowerBounds =
         affineParallelOp.getLowerBoundsMap().getConstantResults();
@@ -74,10 +87,10 @@ struct AffineParallelUnroll : public OpConversionPattern<AffineParallelOp> {
     Block *pLoopBody = affineParallelOp.getBody();
     MutableArrayRef<BlockArgument> pLoopIVs = affineParallelOp.getIVs();
 
-    OpBuilder insideBuilder(affineForOp);
+    OpBuilder insideBuilder(newParallelOp);
     SmallVector<int64_t> indices = pLoopLowerBounds;
     while (true) {
-      insideBuilder.setInsertionPointToStart(affineForOp.getBody());
+      insideBuilder.setInsertionPointToStart(newParallelOp.getBody());
       // Create an `scf.execute_region` to wrap each unrolled block since
       // `affine.parallel` requires only one block in the body region.
       auto executeRegionOp =
@@ -120,7 +133,7 @@ struct AffineParallelUnroll : public OpConversionPattern<AffineParallelOp> {
         break;
     }
 
-    rewriter.replaceOp(affineParallelOp, affineForOp);
+    rewriter.replaceOp(affineParallelOp, newParallelOp);
 
     return success();
   }
@@ -144,13 +157,11 @@ void AffineParallelUnrollPass::runOnOperation() {
   target.addLegalDialect<scf::SCFDialect>();
   target.addLegalDialect<arith::ArithDialect>();
   target.addLegalOp<ModuleOp, func::FuncOp, func::ReturnOp>();
-  target.addIllegalOp<AffineParallelOp>();
 
   RewritePatternSet patterns(ctx);
   patterns.add<AffineParallelUnroll>(ctx);
 
-  if (failed(
-          applyPartialConversion(getOperation(), target, std::move(patterns))))
+  if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
     signalPassFailure();
 }
 
