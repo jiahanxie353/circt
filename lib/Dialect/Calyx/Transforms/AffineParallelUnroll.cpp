@@ -36,6 +36,145 @@ using namespace mlir::affine;
 using namespace mlir::arith;
 
 namespace {
+// This pass hoists redundant memory loads *after* AffineParallelUnroll. It only
+// hoists memory accesses that occur *more than once* inside
+// `scf.execute_region` to prevent memory contention. Since AffineParallelUnroll
+// converts loop indices to constants, we can safely analyze and remove
+// redundant accesses.
+struct CalyxParLICM {
+  void run(AffineParallelOp parOp);
+};
+} // end anonymous namespace
+
+namespace llvm {
+template <>
+struct DenseMapInfo<std::pair<Value, SmallVector<int64_t, 4>>> {
+  using PairType = std::pair<Value, SmallVector<int64_t, 4>>;
+
+  static inline PairType getEmptyKey() {
+    return {DenseMapInfo<Value>::getEmptyKey(), {}};
+  }
+
+  static inline PairType getTombstoneKey() {
+    return {DenseMapInfo<Value>::getTombstoneKey(), {}};
+  }
+
+  static unsigned getHashValue(const PairType &pair) {
+    unsigned hash = DenseMapInfo<Value>::getHashValue(pair.first);
+    for (const auto &v : pair.second)
+      hash = llvm::hash_combine(hash, DenseMapInfo<int64_t>::getHashValue(v));
+    return hash;
+  }
+
+  static bool isEqual(const PairType &lhs, const PairType &rhs) {
+    return lhs.first == rhs.first && lhs.second == rhs.second;
+  }
+};
+} // namespace llvm
+
+static DenseMap<Operation *, SmallVector<int64_t, 4>> affineLoadIndexCache;
+
+template <typename AffineMemOp>
+static SmallVector<int64_t, 4> evaluateAffineOperandsOrFail(AffineMemOp memOp) {
+  static_assert(std::is_same_v<AffineLoadOp, AffineMemOp> ||
+                    std::is_same_v<AffineStoreOp, AffineMemOp>,
+                "Function only supports AffineLoadOp and AffineStoreOp");
+
+  auto it = affineLoadIndexCache.find(memOp);
+  if (it != affineLoadIndexCache.end())
+    return it->second;
+
+  MLIRContext *ctx = memOp->getContext();
+  AffineMap map = memOp.getAffineMap();
+
+  // AffineStoreOp has an extra operand (the value being stored), so get only
+  // index operands
+  ValueRange operands = memOp.getMapOperands();
+
+  SmallVector<Attribute> operandConsts;
+  for (Value operand : operands) {
+    if (auto constOp =
+            operand.template getDefiningOp<arith::ConstantIndexOp>()) {
+      operandConsts.push_back(
+          IntegerAttr::get(IndexType::get(ctx), constOp.value()));
+    } else {
+      memOp.emitError("Affine load/store index must be fully constant.");
+      llvm_unreachable("Non-constant affine expression found in index!");
+    }
+  }
+
+  SmallVector<int64_t, 4> evaluatedIndices, foldedResults;
+  bool hasPoison = false;
+  map.partialConstantFold(operandConsts, &foldedResults, &hasPoison);
+
+  if (hasPoison || foldedResults.empty()) {
+    memOp.emitError("Failed to fully evaluate affine expression.");
+    llvm_unreachable("Unexpected non-constant affine index!");
+  }
+
+  return foldedResults;
+}
+
+void CalyxParLICM::run(AffineParallelOp parOp) {
+  DenseSet<std::pair<Value, SmallVector<int64_t, 4>>> storeIndices;
+  parOp.walk([&](AffineStoreOp storeOp) {
+    SmallVector<int64_t, 4> evaluatedIndices =
+        evaluateAffineOperandsOrFail(storeOp);
+    storeIndices.insert(std::make_pair(storeOp.getMemref(), evaluatedIndices));
+  });
+
+  DenseMap<std::pair<Value, SmallVector<int64_t, 4>>, int> loadCounts;
+  parOp.walk([&](AffineLoadOp loadOp) {
+    SmallVector<int64_t, 4> evaluatedIndices =
+        evaluateAffineOperandsOrFail(loadOp);
+    auto key = std::make_pair(loadOp.getMemref(), evaluatedIndices);
+    if (storeIndices.contains(key)) {
+      return;
+    }
+    loadCounts[key]++;
+  });
+
+  bool shouldHoist = llvm::any_of(
+      loadCounts, [](const auto &entry) { return entry.second > 1; });
+
+  if (!shouldHoist)
+    return;
+
+  OpBuilder builder(parOp);
+
+  // Given a memory reference and the access indices, retrieve the result of the
+  // corresponding, shared load operation.
+  DenseMap<std::pair<Value, SmallVector<int64_t, 4>>, Value> hoistedLoads;
+  SmallVector<AffineLoadOp> loadOps;
+  // Collect all `affine.load` ops in `scf.execute_region`.
+  parOp.walk([&](AffineLoadOp loadOp) {
+    SmallVector<int64_t, 4> evaluatedIndices =
+        evaluateAffineOperandsOrFail(loadOp);
+    auto key = std::make_pair(loadOp.getMemref(), evaluatedIndices);
+    if (loadCounts[key] > 1) {
+      // Hoist unique loads outside parallel loop.
+      if (hoistedLoads.find(key) == hoistedLoads.end()) {
+        builder.setInsertionPoint(parOp);
+        Value hoistedLoad = builder.create<AffineLoadOp>(
+            loadOp.getLoc(), loadOp.getMemref(), loadOp.getAffineMap(),
+            loadOp.getMapOperands());
+        hoistedLoads[key] = hoistedLoad;
+      }
+      loadOps.push_back(loadOp);
+    }
+  });
+
+  for (AffineLoadOp loadOp : loadOps) {
+    SmallVector<int64_t, 4> evaluatedIndices =
+        evaluateAffineOperandsOrFail(loadOp);
+    auto key = std::make_pair(loadOp.getMemref(), evaluatedIndices);
+    if (hoistedLoads.count(key)) {
+      loadOp.replaceAllUsesWith(hoistedLoads[key]);
+    }
+  }
+}
+
+namespace {
 
 struct AffineParallelUnroll : public OpRewritePattern<AffineParallelOp> {
   using OpRewritePattern::OpRewritePattern;
@@ -161,8 +300,26 @@ void AffineParallelUnrollPass::runOnOperation() {
   RewritePatternSet patterns(ctx);
   patterns.add<AffineParallelUnroll>(ctx);
 
-  if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
+  if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
+    getOperation()->emitError("Failed to unroll affine.parallel");
     signalPassFailure();
+  }
+
+  getOperation()->walk([&](AffineParallelOp parOp) {
+    if (parOp->hasAttr("calyx.parallel")) {
+      CalyxParLICM().run(parOp);
+    }
+  });
+
+  RewritePatternSet canonicalizePatterns(ctx);
+  scf::IndexSwitchOp::getCanonicalizationPatterns(canonicalizePatterns, ctx);
+  scf::IfOp::getCanonicalizationPatterns(canonicalizePatterns, ctx);
+
+  if (failed(applyPatternsGreedily(getOperation(),
+                                   std::move(canonicalizePatterns)))) {
+    getOperation()->emitError("Failed to apply canonicalization.");
+    signalPassFailure();
+  }
 }
 
 std::unique_ptr<mlir::Pass> circt::calyx::createAffineParallelUnrollPass() {
