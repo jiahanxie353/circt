@@ -234,4 +234,9 @@ def AffineParallelUnroll : Pass<"affine-parallel-unroll", "::mlir::func::FuncOp"
   let constructor = "circt::calyx::createAffineParallelUnrollPass()";
 }
 
+def PreSCFToCalyxCanonicalize : Pass<"pre-scf-to-calyx-canonicalize", "::mlir::func::FuncOp"> {
+  let dependentDialects = ["mlir::memref::MemRefDialect", "mlir::scf::SCFDialect", "mlir::arith::ArithDialect"];
+  let constructor = "circt::calyx::createPreSCFToCalyxCanonicalizePass()";
+}
+
 #endif // CIRCT_DIALECT_CALYX_CALYXPASSES_TD
