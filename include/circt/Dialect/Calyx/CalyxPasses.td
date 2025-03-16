@@ -287,4 +287,13 @@ def AffinePloopUnparallelize : Pass<"affine-ploop-unparallelize", "::mlir::func:
       ```
   }];
 }
+
+def PreSCFToCalyxCanonicalize : Pass<"pre-scf-to-calyx-canonicalize", "::mlir::func::FuncOp"> {
+  let dependentDialects = [
+    "mlir::memref::MemRefDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::arith::ArithDialect"];
+  let constructor = "circt::calyx::createPreSCFToCalyxCanonicalizePass()";
+}
+
 #endif // CIRCT_DIALECT_CALYX_CALYXPASSES_TD
