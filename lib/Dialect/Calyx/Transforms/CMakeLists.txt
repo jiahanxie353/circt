@@ -11,6 +11,7 @@ add_circt_dialect_library(CIRCTCalyxTransforms
   AffineToSCF.cpp
   AffinePloopUnparallelize.cpp
   PreSCFToCalyxCanonicalize.cpp
+  AffinePloopUnparallelize.cpp
 
   DEPENDS
   CIRCTCalyxTransformsIncGen
