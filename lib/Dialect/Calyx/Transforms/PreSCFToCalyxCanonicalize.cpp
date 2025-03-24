@@ -8,6 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Dialect/Calyx/CalyxPasses.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
@@ -67,6 +68,12 @@ void PreSCFToCalyxCanonicalizePass::runOnOperation() {
   arith::ConstantFloatOp::getCanonicalizationPatterns(patterns, ctx);
   arith::ExtSIOp::getCanonicalizationPatterns(patterns, ctx);
 
+  affine::AffineIfOp::getCanonicalizationPatterns(patterns, ctx);
+  affine::AffineStoreOp::getCanonicalizationPatterns(patterns, ctx);
+  affine::AffineLoadOp::getCanonicalizationPatterns(patterns, ctx);
+  affine::AffineForOp::getCanonicalizationPatterns(patterns, ctx);
+  affine::AffineApplyOp::getCanonicalizationPatterns(patterns, ctx);
+
   if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
     getOperation()->emitError("Failed to apply canonicalization.");
     signalPassFailure();
@@ -74,7 +81,7 @@ void PreSCFToCalyxCanonicalizePass::runOnOperation() {
 
   ConversionTarget target(*ctx);
   target.addLegalDialect<arith::ArithDialect, memref::MemRefDialect,
-                         scf::SCFDialect>();
+                         scf::SCFDialect, affine::AffineDialect>();
 }
 
 std::unique_ptr<mlir::Pass>
