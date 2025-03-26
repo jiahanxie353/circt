@@ -26,6 +26,7 @@
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -2883,7 +2884,157 @@ private:
       topLevelFunction = "main";
     }
 
+    auto newTopLevelFunc =
+        cast<FuncOp>(SymbolTable::lookupSymbolIn(moduleOp, topLevelFunction));
+    hoistAllocsToEntryPoint(moduleOp, newTopLevelFunc);
+
     return success();
+  }
+
+  // Collects all non-top-level functions that have memory allocations in
+  // `callerFunc`.
+  std::optional<SmallVector<FuncOp>>
+  nonTopLevelFuncsWithMemAlloc(StringRef topLevelFunction, ModuleOp moduleOp) {
+    SmallVector<FuncOp> funcsWithMemAlloc;
+    for (auto funcOp : moduleOp.getOps<FuncOp>()) {
+      if (funcOp.getSymName().str() == topLevelFunction.str())
+        continue;
+      if (auto allocs = funcOp.getOps<memref::AllocOp>(); !allocs.empty()) {
+        funcsWithMemAlloc.push_back(funcOp);
+        continue;
+      }
+    }
+
+    return funcsWithMemAlloc.empty()
+               ? std::nullopt
+               : std::optional<SmallVector<FuncOp>>(funcsWithMemAlloc);
+  }
+
+  OpBuilder::InsertPoint getInsertionPointBeforeCallOp(CallOp callOp) {
+    Operation *lastAllocOp = nullptr;
+
+    // Walk backward in the block until we find the CallOp
+    for (Operation &op : callOp->getBlock()->getOperations()) {
+      if (&op == callOp.getOperation())
+        break; // Found the CallOp — stop iterating
+
+      if (isa<memref::AllocOp>(&op))
+        lastAllocOp = &op; // Track the most recent AllocOp
+    }
+
+    if (lastAllocOp)
+      return OpBuilder::InsertPoint(lastAllocOp->getBlock(),
+                                    std::next(lastAllocOp->getIterator()));
+
+    // If no alloc is found, insert at the start of the block
+    return OpBuilder::InsertPoint(callOp->getBlock(),
+                                  callOp->getBlock()->begin());
+  }
+
+  void hoistAllocsToEntryPoint(ModuleOp moduleOp, FuncOp topLevelFunc) {
+    OpBuilder builder(moduleOp.getContext());
+
+    // Recursive function to propagate alloc requirements upward
+    std::function<void(FuncOp)> propagateAllocToTopLevel;
+    propagateAllocToTopLevel = [&](FuncOp currentFunc) {
+      llvm::errs() << "propagateAllocToTopLevel with: "
+                   << currentFunc.getSymName() << "\n";
+      DenseMap<FuncOp, SmallVector<CallOp>> callerCallOps;
+      // If any of the FuncOp inside moduleOp calls `currentFunc`, we propagate
+      // it up.
+      for (auto funcOp : moduleOp.getOps<FuncOp>()) {
+        if (auto callOps = funcOp.getOps<CallOp>();
+            callOps.empty() ||
+            std::none_of(callOps.begin(), callOps.end(),
+                         [&currentFunc](CallOp callOp) {
+                           return callOp.getCallee().str() ==
+                                  currentFunc.getSymName().str();
+                         })) {
+          llvm::errs()
+              << "funcOp: " << funcOp.getSymName()
+              << " does not have callOp or does not call current func\n";
+          continue;
+        }
+        llvm::errs() << funcOp.getSymName() << " calls it\n";
+        SmallVector<CallOp> callOpsWithCurrFuncAsCallee;
+        for (auto callOp : funcOp.getOps<CallOp>()) {
+          if (callOp.getCallee().str() == currentFunc.getSymName().str()) {
+            callOpsWithCurrFuncAsCallee.push_back(callOp);
+          }
+        }
+        callerCallOps[funcOp] = callOpsWithCurrFuncAsCallee;
+      }
+      assert(!callerCallOps.empty() &&
+             "There must be at least one caller that calls current function. "
+             "Otherwise, current function should be removed by the dead-code "
+             "removal pass.");
+
+      currentFunc.walk([&](memref::AllocOp allocOp) {
+        llvm::errs() << "allocOp:\n";
+        allocOp.dump();
+
+        auto memrefType = allocOp.getMemref().getType();
+        // propagate `allocOp` to the function argument of all `callers`
+        for (auto callerCallOp : callerCallOps) {
+          FuncOp caller = callerCallOp.getFirst();
+          SmallVector<CallOp> callOps = callerCallOp.getSecond();
+          // If the caller is not top-level, we create a new BlockArgument and
+          // modify the calling operations to this `caller`, and append an
+          // arugment to `callOps` with the newly created BlockArgument.
+          if (caller.getSymName().str() != topLevelFunc.getSymName().str()) {
+            Block *entryBlock = &caller.getBody().front();
+            Value allocArg =
+                entryBlock->addArgument(memrefType, caller.getLoc());
+            for (auto callOp : callOps) {
+              SmallVector<Value> newOperands(callOp.getOperands().begin(),
+                                             callOp.getOperands().end());
+              newOperands.push_back(allocArg);
+              callOp.getOperation()->setOperands(newOperands);
+            }
+
+            propagateAllocToTopLevel(caller);
+          }
+
+          auto insertionPoint = getInsertionPointBeforeCallOp(callOps.front());
+          builder.restoreInsertionPoint(insertionPoint);
+
+          Value newAlloc =
+              builder.create<memref::AllocOp>(caller.getLoc(), memrefType);
+          for (auto callOp : callOps) {
+            SmallVector<Value> newOperands(callOp.getOperands().begin(),
+                                           callOp.getOperands().end());
+            newOperands.push_back(newAlloc);
+            callOp.getOperation()->setOperands(newOperands);
+          }
+
+          Block *calleeEntry = &currentFunc.getBody().front();
+          Value calleeBlockArg =
+              calleeEntry->addArgument(memrefType, currentFunc.getLoc());
+          allocOp.replaceAllUsesWith(calleeBlockArg);
+          allocOp.erase();
+
+          SmallVector<Type, 4> updatedCalleeArgTypes(
+              currentFunc.getFunctionType().getInputs());
+          updatedCalleeArgTypes.push_back(calleeBlockArg.getType());
+          currentFunc.setType(
+              FunctionType::get(currentFunc.getContext(), updatedCalleeArgTypes,
+                                currentFunc.getFunctionType().getResults()));
+        }
+      });
+
+      llvm::errs() << "finish walking\n";
+      moduleOp.dump();
+    };
+
+    // Hoist allocs
+    auto funcsWithMemAlloc =
+        nonTopLevelFuncsWithMemAlloc(topLevelFunc.getSymName(), moduleOp);
+    if (!funcsWithMemAlloc)
+      return;
+
+    for (FuncOp funcWithMemAlloc : *funcsWithMemAlloc) {
+      propagateAllocToTopLevel(funcWithMemAlloc);
+    }
   }
 };
 
@@ -2903,6 +3054,7 @@ void SCFToCalyxPass::runOnOperation() {
     signalPassFailure();
     return;
   }
+
   loweringState = std::make_shared<calyx::CalyxLoweringState>(getOperation(),
                                                               topLevelFunction);
 
