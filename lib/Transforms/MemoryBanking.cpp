@@ -520,6 +520,7 @@ struct BankAffineLoadPattern
     scf::IndexSwitchOp switchOp = rewriter.create<scf::IndexSwitchOp>(
         loc, resultTypes, bankIndex, caseValues,
         /*numRegions=*/currFactor);
+    switchOp->setAttr("banked", rewriter.getUnitAttr());
 
     for (unsigned i = 0; i < currFactor; ++i) {
       Region &caseRegion = switchOp.getCaseRegions()[i];
@@ -616,6 +617,7 @@ struct BankAffineStorePattern
     scf::IndexSwitchOp switchOp = rewriter.create<scf::IndexSwitchOp>(
         loc, resultTypes, bankIndex, caseValues,
         /*numRegions=*/currFactor);
+    switchOp->setAttr("banked", rewriter.getUnitAttr());
 
     for (unsigned i = 0; i < currFactor; ++i) {
       Region &caseRegion = switchOp.getCaseRegions()[i];

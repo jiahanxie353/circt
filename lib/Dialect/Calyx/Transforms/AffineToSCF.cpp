@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Dialect/Calyx/CalyxPasses.h"
+#include "circt/Support/LLVM.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -18,6 +19,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include <cassert>
 
 namespace circt {
 namespace calyx {
@@ -86,6 +88,60 @@ public:
   }
 };
 
+class AffineForOpLowering : public OpConversionPattern<affine::AffineForOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+public:
+  LogicalResult
+  matchAndRewrite(affine::AffineForOp affineForOp, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (!affineForOp->getAttr("unparallelized") ||
+        !containsBankedSwitch(affineForOp))
+      return success();
+
+    SmallVector<scf::IndexSwitchOp> indexSwitchOps;
+    affineForOp->walk([&](scf::IndexSwitchOp indexSwitchOp) {
+      indexSwitchOps.push_back(indexSwitchOp);
+    });
+
+    for (auto indexSwitchOp : indexSwitchOps) {
+      int64_t numSwitchCases = indexSwitchOp.getNumCases();
+      auto parentForOp = indexSwitchOp->getParentOfType<affine::AffineForOp>();
+      if (!parentForOp)
+        return rewriter.notifyMatchFailure(
+            affineForOp,
+            "The affine-ploop-unparallelize pass should be run first");
+      auto parentParOp =
+          indexSwitchOp->getParentOfType<affine::AffineParallelOp>();
+      if (!parentParOp)
+        return rewriter.notifyMatchFailure(
+            affineForOp, "scf.index_switch with 'banked' attribute should be "
+                         "the result of memory banking in parallel loops");
+      if (parentParOp.getIVs().size() != 1)
+        return rewriter.notifyMatchFailure(
+            parentParOp,
+            "The parallel loop must only contain one induction variable");
+
+      if (numSwitchCases == parentParOp.getConstantRanges()->front() &&
+          numSwitchCases == parentForOp.getStepAsInt()) {
+        indexSwitchOp.setOperand(parentParOp.getIVs().front());
+      }
+    }
+
+    return success();
+  }
+
+private:
+  bool containsBankedSwitch(affine::AffineForOp affineForOp) const {
+    auto walkResult = affineForOp->walk([&](scf::IndexSwitchOp indexSwitchOp) {
+      if (indexSwitchOp->hasAttr("banked"))
+        return WalkResult::interrupt();
+      return WalkResult::advance();
+    });
+    return walkResult.wasInterrupted();
+  }
+};
+
 namespace {
 class AffineToSCFPass
     : public circt::calyx::impl::AffineToSCFBase<AffineToSCFPass> {
@@ -102,6 +158,7 @@ void AffineToSCFPass::runOnOperation() {
 
   RewritePatternSet patterns(ctx);
   patterns.add<AffineParallelOpLowering>(ctx);
+  patterns.add<AffineForOpLowering>(ctx);
   if (failed(applyPartialConversion(getOperation(), target,
                                     std::move(patterns)))) {
     signalPassFailure();
